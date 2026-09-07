@@ -140,6 +140,7 @@ impl KcsdiApp {
 fn cartesian_series(
     display: S11Display,
     trace: Option<&kcsdi_core::data::SweepData>,
+    impedance_visible: [bool; 3],
 ) -> Vec<widgets::plot::Series<'static>> {
     let Some(trace) = trace else {
         return Vec::new();
@@ -152,6 +153,7 @@ fn cartesian_series(
     let column = |name: &'static str, i: usize, color: egui::Color32| widgets::plot::Series {
         name,
         color,
+        visible: display != S11Display::Impedance || impedance_visible[i],
         points: trace
             .points
             .iter()
@@ -208,6 +210,7 @@ impl eframe::App for KcsdiApp {
                     .map(|t| widgets::plot::Series {
                         name: "Level",
                         color: theme::TRACE_COLORS[0],
+                        visible: true,
                         points: t
                             .points
                             .iter()
@@ -216,7 +219,7 @@ impl eframe::App for KcsdiApp {
                     })
                     .into_iter()
                     .collect();
-                let opts = widgets::plot::PlotOptions {
+                let mut opts = widgets::plot::PlotOptions {
                     y_label: "dBm",
                     log_x: spec.log_x,
                     series,
@@ -225,7 +228,7 @@ impl eframe::App for KcsdiApp {
                     widgets::plot::fit_view(&mut spec.view, &opts);
                     spec.needs_fit = false;
                 }
-                match widgets::plot::show(ui, &mut spec.view, &opts) {
+                match widgets::plot::show(ui, &mut spec.view, &mut opts) {
                     widgets::plot::ViewLock::Locked => spec.view_locked = true,
                     widgets::plot::ViewLock::Unlocked => spec.view_locked = false,
                     widgets::plot::ViewLock::Unchanged => {}
@@ -238,8 +241,9 @@ impl eframe::App for KcsdiApp {
                         widgets::smith::show(ui, &mut s11.smith, s11.trace.as_ref());
                     }
                     display => {
-                        let series = cartesian_series(display, s11.trace.as_ref());
-                        let opts = widgets::plot::PlotOptions {
+                        let series =
+                            cartesian_series(display, s11.trace.as_ref(), s11.impedance_visible);
+                        let mut opts = widgets::plot::PlotOptions {
                             y_label: display.y_label(),
                             log_x: s11.log_x,
                             series,
@@ -248,10 +252,18 @@ impl eframe::App for KcsdiApp {
                             widgets::plot::fit_view(&mut s11.view, &opts);
                             s11.needs_fit = false;
                         }
-                        match widgets::plot::show(ui, &mut s11.view, &opts) {
+                        match widgets::plot::show(ui, &mut s11.view, &mut opts) {
                             widgets::plot::ViewLock::Locked => s11.view_locked = true,
                             widgets::plot::ViewLock::Unlocked => s11.view_locked = false,
                             widgets::plot::ViewLock::Unchanged => {}
+                        }
+                        if display == S11Display::Impedance && opts.series.len() == 3 {
+                            let visible = std::array::from_fn(|i| opts.series[i].visible);
+                            if s11.impedance_visible != visible {
+                                s11.impedance_visible = visible;
+                                s11.needs_fit = true;
+                                ctx.request_repaint();
+                            }
                         }
                     }
                 }
@@ -284,14 +296,43 @@ mod tests {
                 values: vec![50.0, 30.0, -40.0],
             }],
         };
-        let series = cartesian_series(S11Display::Impedance, Some(&data));
+        let series = cartesian_series(S11Display::Impedance, Some(&data), [true; 3]);
         assert_eq!(series.len(), 3);
         assert_eq!(series[2].points, vec![(1e6, -40.0)]);
         for display in [S11Display::Phase, S11Display::ReturnLoss, S11Display::Vswr] {
-            assert!(cartesian_series(display, Some(&data)).is_empty());
+            assert!(cartesian_series(display, Some(&data), [true; 3]).is_empty());
         }
         data.mode = StreamMode::S21;
-        assert!(cartesian_series(S11Display::Impedance, Some(&data)).is_empty());
+        assert!(cartesian_series(S11Display::Impedance, Some(&data), [true; 3]).is_empty());
+    }
+
+    #[test]
+    fn impedance_visibility_defaults_to_all_and_survives_new_traces() {
+        let mut state = crate::state::S11State::default();
+        assert_eq!(state.impedance_visible, [true; 3]);
+        let mut data = SweepData {
+            mode: StreamMode::S11,
+            format: "z".to_string(),
+            points: vec![SweepPoint {
+                freq_hz: 100_000.0,
+                values: vec![50.0, 30.0, -40.0],
+            }],
+        };
+        state.impedance_visible = [false, true, false];
+        for magnitude in [50.0, 100.0] {
+            data.points[0].values[0] = magnitude;
+            let series =
+                cartesian_series(S11Display::Impedance, Some(&data), state.impedance_visible);
+            assert_eq!(
+                series.iter().map(|s| s.visible).collect::<Vec<_>>(),
+                [false, true, false]
+            );
+            assert_eq!(series[0].points, [(100_000.0, magnitude)]);
+            assert_eq!(series[2].points, [(100_000.0, -40.0)]);
+        }
+        data.format = "ma".to_string();
+        let series = cartesian_series(S11Display::Phase, Some(&data), [false; 3]);
+        assert!(series[0].visible);
     }
 
     #[test]
@@ -308,7 +349,7 @@ mod tests {
                     values,
                 }],
             };
-            let series = cartesian_series(display, Some(&data));
+            let series = cartesian_series(display, Some(&data), [true; 3]);
             assert_eq!(series[0].points, vec![(1e6, expected)]);
         }
     }

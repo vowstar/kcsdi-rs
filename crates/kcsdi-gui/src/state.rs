@@ -231,6 +231,8 @@ pub struct S11State {
     pub display: S11Display,
     /// Logarithmic frequency axis for cartesian displays.
     pub log_x: bool,
+    /// Session-only visibility for |Z|, R, X. New sweeps keep this choice.
+    pub impedance_visible: [bool; 3],
     /// Optional RBW pushed before the run (`$bw`).
     pub rbw: Option<Rbw>,
     /// True while repeating sweeps are requested.
@@ -263,6 +265,7 @@ impl Default for S11State {
             cal: Cal::CalOff,
             display,
             log_x: false,
+            impedance_visible: [true; 3],
             rbw: None,
             running: false,
             trace: None,

@@ -51,8 +51,10 @@ const ARC_SEGMENTS: usize = 256;
 const LABEL_FONT_SIZE: f32 = 11.0;
 const MIN_ZOOM: f64 = 0.2;
 const MAX_ZOOM: f64 = 200.0;
-/// Gap between the unit circle and the plot edge at zoom = 1.
-const FIT_MARGIN: f32 = 0.95;
+/// Space for labels outside the unit circle at zoom = 1.
+const GRID_LABEL_MARGIN: f32 = 36.0;
+const HEADER_HEIGHT: f32 = 38.0;
+const FOOTER_HEIGHT: f32 = 22.0;
 
 // Chart chrome colors from reference UI analysis section 4.3 (dark theme).
 const BG_COLOR: Color32 = Color32::from_rgb(0x18, 0x18, 0x18);
@@ -112,7 +114,8 @@ impl Mapping {
     fn new(rect: Rect, view: &SmithView) -> Self {
         Self {
             center: rect.center(),
-            scale: rect.width().min(rect.height()) / 2.0 * FIT_MARGIN * view.zoom as f32,
+            scale: (rect.width().min(rect.height()) / 2.0 - GRID_LABEL_MARGIN).max(1.0)
+                * view.zoom as f32,
             dx: view.dx,
             dy: view.dy,
         }
@@ -138,30 +141,49 @@ impl Mapping {
 pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
 
-    handle_input(ui, view, rect, &response);
-
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, BG_COLOR);
-    if rect.width() < 2.0 || rect.height() < 2.0 {
+    let chart_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top() + HEADER_HEIGHT),
+        Pos2::new(rect.right(), rect.bottom() - FOOTER_HEIGHT),
+    );
+    if chart_rect.width() < 2.0 || chart_rect.height() < 2.0 {
         return;
     }
 
-    let mapping = Mapping::new(rect, view);
-    let clipped = painter.with_clip_rect(rect);
+    handle_input(ui, view, chart_rect, &response);
+    let mapping = Mapping::new(chart_rect, view);
+    let clipped = painter.with_clip_rect(chart_rect);
     draw_grid(&clipped, &mapping);
+    draw_grid_labels(&clipped, &mapping, chart_rect);
+    for (row, text) in [
+        format!("Smith | Z0 = {Z0} ohm"),
+        "r = R/Z0   x = X/Z0".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 4.0 + row as f32 * 15.0),
+            Align2::LEFT_TOP,
+            text,
+            FontId::monospace(LABEL_FONT_SIZE),
+            TEXT_COLOR,
+        );
+    }
 
     let points = trace_points(trace);
     if !points.iter().any(|p| p.3.is_finite() && p.4.is_finite()) {
         painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+            Align2::LEFT_BOTTOM,
             "No data",
             FontId::monospace(14.0),
             TEXT_COLOR,
         );
     } else {
         draw_trace(&clipped, &mapping, &points);
-        draw_hover(&clipped, &mapping, &points, rect, &response);
+        draw_hover(painter, &mapping, &points, rect, chart_rect, &response);
     }
 }
 
@@ -274,6 +296,77 @@ fn draw_grid(painter: &egui::Painter, mapping: &Mapping) {
     );
 }
 
+/// Normalized resistance labels sit on the real axis. Reactance labels
+/// sit at the unit-circle ends of their arcs, positive above the axis.
+fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
+    let font = FontId::monospace(LABEL_FONT_SIZE);
+    let mut occupied: Vec<Rect> = Vec::new();
+    let mut label = |text: String, at: Pos2, align: Align2| {
+        let galley = painter.layout_no_wrap(text, font.clone(), TEXT_COLOR);
+        let bounds = align.anchor_size(at, galley.size());
+        // Never pin an off-screen label to the edge, where it would no
+        // longer identify its grid line. Suppress collisions when zoomed out.
+        if rect.contains_rect(bounds)
+            && occupied
+                .iter()
+                .all(|other| !other.expand(2.0).intersects(bounds))
+        {
+            painter.rect_filled(bounds.expand(1.0), 0.0, BG_COLOR);
+            painter.galley(bounds.min, galley, TEXT_COLOR);
+            occupied.push(bounds);
+        }
+    };
+
+    // Give the matched-load label priority in a crowded view.
+    for r in [1.0]
+        .into_iter()
+        .chain(RESISTANCE_GRID.into_iter().filter(|r| *r != 1.0))
+    {
+        let (u, v) = gamma_of(r, 0.0, 1.0);
+        label(
+            r.to_string(),
+            mapping.to_screen(u, v) + egui::vec2(0.0, -3.0),
+            Align2::CENTER_BOTTOM,
+        );
+    }
+    label(
+        "0".to_string(),
+        mapping.to_screen(-1.0, 0.0) + egui::vec2(-4.0, -3.0),
+        Align2::RIGHT_BOTTOM,
+    );
+    label(
+        "inf".to_string(),
+        mapping.to_screen(1.0, 0.0) + egui::vec2(4.0, -3.0),
+        Align2::LEFT_BOTTOM,
+    );
+
+    for x in REACTANCE_GRID {
+        for sign in [1.0, -1.0] {
+            let (u, v) = gamma_of(0.0, sign * x, 1.0);
+            let at = mapping.to_screen(u, v) + egui::vec2(u as f32 * 5.0, -v as f32 * 5.0);
+            let align = Align2([
+                if u < -0.01 {
+                    egui::Align::RIGHT
+                } else if u > 0.01 {
+                    egui::Align::LEFT
+                } else {
+                    egui::Align::Center
+                },
+                if v > 0.0 {
+                    egui::Align::BOTTOM
+                } else {
+                    egui::Align::TOP
+                },
+            ]);
+            label(
+                format!("{}j{x}", if sign > 0.0 { "+" } else { "-" }),
+                at,
+                align,
+            );
+        }
+    }
+}
+
 /// Gamma polyline of the sweep. Uncalibrated data can exceed |gamma| =
 /// 1; such points are drawn as-is (the clip rect bounds them).
 fn draw_trace(painter: &egui::Painter, mapping: &Mapping, points: &[(f64, f64, f64, f64, f64)]) {
@@ -300,12 +393,13 @@ fn draw_hover(
     mapping: &Mapping,
     points: &[(f64, f64, f64, f64, f64)],
     rect: Rect,
+    chart_rect: Rect,
     response: &egui::Response,
 ) {
     let Some(pos) = response.hover_pos() else {
         return;
     };
-    if !rect.contains(pos) {
+    if !chart_rect.contains(pos) {
         return;
     }
     let (gu, gv) = mapping.to_gamma(pos);
@@ -322,11 +416,13 @@ fn draw_hover(
     };
 
     let at = mapping.to_screen(u, v);
-    painter.circle_stroke(at, 4.0, Stroke::new(1.0, TEXT_COLOR));
+    painter
+        .with_clip_rect(chart_rect)
+        .circle_stroke(at, 4.0, Stroke::new(1.0, TEXT_COLOR));
     painter.text(
-        Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
-        Align2::LEFT_TOP,
-        format!("{}  {:.2} {:+.2} j ohm", format_hz(freq), r, x),
+        Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+        Align2::LEFT_BOTTOM,
+        format!("{}  R = {:.2} ohm  X = {:+.2} ohm", format_hz(freq), r, x),
         FontId::monospace(LABEL_FONT_SIZE),
         TEXT_COLOR,
     );
@@ -442,8 +538,202 @@ mod tests {
         let mapping = Mapping::new(rect, &view);
         let pos = mapping.to_screen(0.3, -0.4);
         let (u, v) = mapping.to_gamma(pos);
-        assert!(approx(u, 0.3));
-        assert!(approx(v, -0.4));
+        // Screen coordinates are f32, unlike the impedance calculations.
+        assert!((u - 0.3).abs() < 1e-6);
+        assert!((v + 0.4).abs() < 1e-6);
+    }
+
+    fn text_shapes(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rendered_labels(rect: Rect, view: SmithView) -> Vec<(String, Rect)> {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_grid_labels(ui.painter(), &Mapping::new(rect, &view), rect);
+            },
+        );
+        let labels = text_shapes(&output);
+        output.drop_without_applying_deltas();
+        labels
+    }
+
+    #[test]
+    fn grid_labels_identify_normalized_resistance_and_signed_reactance() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        let mapping = Mapping::new(rect, &SmithView::default());
+        let labels = rendered_labels(rect, SmithView::default());
+        assert_eq!(
+            labels.len(),
+            RESISTANCE_GRID.len() + 2 * REACTANCE_GRID.len() + 2
+        );
+        for r in RESISTANCE_GRID {
+            let (_, bounds) = labels
+                .iter()
+                .find(|(text, _)| text == &r.to_string())
+                .unwrap();
+            let (u, v) = gamma_of(r, 0.0, 1.0);
+            let at = mapping.to_screen(u, v);
+            assert!((bounds.center().x - at.x).abs() < 1e-4);
+            assert!((bounds.bottom() - (at.y - 3.0)).abs() < 1e-4);
+        }
+        for x in REACTANCE_GRID {
+            for (prefix, sign) in [("+", 1.0), ("-", -1.0)] {
+                let (_, bounds) = labels
+                    .iter()
+                    .find(|(text, _)| text == &format!("{prefix}j{x}"))
+                    .unwrap();
+                let (u, v) = gamma_of(0.0, sign * x, 1.0);
+                let at = mapping.to_screen(u, v);
+                if sign > 0.0 {
+                    assert!(bounds.bottom() < at.y && at.y < rect.center().y);
+                } else {
+                    assert!(bounds.top() > at.y && at.y > rect.center().y);
+                }
+            }
+        }
+        assert!(labels.iter().any(|(text, _)| text == "0"));
+        assert!(labels.iter().any(|(text, _)| text == "inf"));
+    }
+
+    #[test]
+    fn grid_labels_follow_pan_and_zoom_without_growing_the_font() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        let original = rendered_labels(rect, SmithView::default());
+        let bounds_of = |labels: &[(String, Rect)], key: &str| {
+            labels.iter().find(|(text, _)| text == key).unwrap().1
+        };
+        let before = bounds_of(&original, "1");
+        let view = SmithView {
+            dx: 0.1,
+            dy: -0.2,
+            ..Default::default()
+        };
+        let panned = rendered_labels(rect, view);
+        let after = bounds_of(&panned, "1");
+        let scale = Mapping::new(rect, &view).scale;
+        assert!((after.center().x - before.center().x + 0.1 * scale).abs() < 1e-4);
+        assert!((after.center().y - before.center().y + 0.2 * scale).abs() < 1e-4);
+        let zoomed = rendered_labels(
+            rect,
+            SmithView {
+                zoom: 2.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(bounds_of(&zoomed, "1").size(), before.size());
+        assert!(
+            !zoomed
+                .iter()
+                .any(|(text, _)| text == "+j1" || text == "-j1")
+        );
+    }
+
+    #[test]
+    fn crowded_grid_labels_stay_inside_the_chart_without_overlaps() {
+        for size in [
+            egui::vec2(600.0, 600.0),
+            egui::vec2(220.0, 180.0),
+            egui::vec2(80.0, 60.0),
+        ] {
+            for zoom in [MIN_ZOOM, 1.0, 2.0, MAX_ZOOM] {
+                let rect = Rect::from_min_size(Pos2::ZERO, size);
+                let labels = rendered_labels(
+                    rect,
+                    SmithView {
+                        zoom,
+                        ..Default::default()
+                    },
+                );
+                for (i, (_, bounds)) in labels.iter().enumerate() {
+                    assert!(rect.contains_rect(*bounds));
+                    assert!(
+                        labels[i + 1..]
+                            .iter()
+                            .all(|(_, other)| !bounds.intersects(*other))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chart_shows_reference_and_normalization_without_a_sweep() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, &mut SmithView::default(), None);
+            },
+        );
+        let labels = text_shapes(&output);
+        assert!(labels.iter().any(|(text, _)| text == "Smith | Z0 = 50 ohm"));
+        assert!(labels.iter().any(|(text, _)| text == "r = R/Z0   x = X/Z0"));
+        assert!(labels.iter().any(|(text, _)| text == "+j1"));
+        assert!(labels.iter().any(|(text, _)| text == "-j1"));
+        let (_, no_data) = labels.iter().find(|(text, _)| text == "No data").unwrap();
+        assert!(no_data.top() >= rect.bottom() - FOOTER_HEIGHT);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn hover_readout_uses_actual_ohms_below_the_grid() {
+        let data = SweepData {
+            mode: kcsdi_core::protocol::StreamMode::S11,
+            format: "z".to_string(),
+            points: vec![kcsdi_core::data::SweepPoint {
+                freq_hz: 433e6,
+                values: vec![25f64.hypot(-10.0), 25.0, -10.0],
+            }],
+        };
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        for events in [vec![], vec![egui::Event::PointerMoved(rect.center())]] {
+            let hovering = !events.is_empty();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    show(ui, &mut SmithView::default(), Some(&data));
+                },
+            );
+            if hovering {
+                let labels = text_shapes(&output);
+                let (_, readout) = labels
+                    .iter()
+                    .find(|(text, _)| text == "433.00 MHz  R = 25.00 ohm  X = -10.00 ohm")
+                    .unwrap();
+                assert!(readout.top() >= rect.bottom() - FOOTER_HEIGHT);
+                let (_, header) = labels
+                    .iter()
+                    .find(|(text, _)| text.starts_with("Smith |"))
+                    .unwrap();
+                assert!(header.bottom() < HEADER_HEIGHT);
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

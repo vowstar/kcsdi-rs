@@ -15,17 +15,26 @@ pub struct Series<'a> {
     /// Trace name, shown in the legend when several series share a plot.
     pub name: &'a str,
     pub color: Color32,
+    /// Session visibility, toggled by clicking the legend entry.
+    pub visible: bool,
     /// (frequency in Hz, value) points. Non-finite values break the polyline.
     /// Log X additionally excludes non-positive frequencies, never signed Y.
     pub points: Vec<(f64, f64)>,
 }
 
 /// What to draw, prepared by the caller each frame.
+#[derive(Clone)]
 pub struct PlotOptions<'a> {
     /// Y axis unit label (e.g. "dBm", "ohm", "deg").
     pub y_label: &'a str,
     pub log_x: bool,
     pub series: Vec<Series<'a>>,
+}
+
+impl<'a> PlotOptions<'a> {
+    fn visible_series(&self) -> impl Iterator<Item = &Series<'a>> {
+        self.series.iter().filter(|series| series.visible)
+    }
 }
 
 /// What the user did to the view during one [`show`] frame. Reports
@@ -294,7 +303,7 @@ fn frequency_ticks(log_x: bool, min: f64, max: f64) -> Vec<f64> {
 /// Full data extent over all drawable series, with 5% linear Y headroom.
 fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
     let mut range: Option<(f64, f64, f64, f64)> = None;
-    for &(x, y) in opts.series.iter().flat_map(|s| &s.points) {
+    for &(x, y) in opts.visible_series().flat_map(|s| &s.points) {
         if !usable_x(opts.log_x, x) || !y.is_finite() {
             continue;
         }
@@ -348,7 +357,7 @@ fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
 }
 
 /// Draw the plot and report whether the user locked or reset the view.
-pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewLock {
+pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> ViewLock {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_LEFT, rect.top() + MARGIN_TOP),
@@ -360,28 +369,34 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewL
     }
 
     ensure_x_view(view, opts);
-    let lock = handle_input(ui, view, opts, plot_rect, &response);
+    let legend = legend_rect(ui.painter(), opts, plot_rect);
+    let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
+    let lock = if over_legend {
+        ViewLock::Unchanged
+    } else {
+        handle_input(ui, view, opts, plot_rect, &response)
+    };
     let mapping = Mapping::new(view, opts.log_x, plot_rect);
     let painter = ui.painter();
     draw_grid(painter, view, opts, &mapping);
 
     if opts
-        .series
-        .iter()
+        .visible_series()
         .flat_map(|s| &s.points)
         .any(|&(x, y)| usable_x(opts.log_x, x) && y.is_finite())
     {
         let clipped = painter.with_clip_rect(plot_rect);
-        for series in &opts.series {
+        for series in opts.visible_series() {
             draw_series(&clipped, &mapping, series);
         }
-        draw_legend(painter, opts, plot_rect);
     } else {
-        let has_samples = opts.series.iter().any(|s| !s.points.is_empty());
+        let has_samples = opts.visible_series().any(|s| !s.points.is_empty());
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            if opts.log_x && has_samples {
+            if !opts.series.is_empty() && opts.visible_series().next().is_none() {
+                "All traces hidden"
+            } else if opts.log_x && has_samples {
                 "No data at positive frequencies"
             } else {
                 "No data"
@@ -390,7 +405,10 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewL
             TEXT_COLOR,
         );
     }
-    draw_cursor(painter, opts, &mapping, &response);
+    if !over_legend {
+        draw_cursor(painter, opts, &mapping, &response);
+    }
+    draw_legend(ui, opts, legend);
     lock
 }
 
@@ -560,37 +578,112 @@ fn draw_series(painter: &egui::Painter, mapping: &Mapping, series: &Series) {
     }
 }
 
-/// Series key: with a single series the shared y_label at the top left
-/// is enough; with several series this draws one row per series at the
-/// top right (color swatch plus name).
-fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
+const LEGEND_ROW_HEIGHT: f32 = LABEL_FONT_SIZE + 8.0;
+
+fn series_label(name: &str, unit: &str) -> String {
+    if unit.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {unit}")
+    }
+}
+
+/// Reserve the same rectangle for painting and hit-testing.
+fn legend_rect(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) -> Rect {
     if opts.series.len() < 2 {
-        return;
+        return Rect::NOTHING;
     }
     let font = FontId::monospace(LABEL_FONT_SIZE);
-    let mut y = plot_rect.top() + 2.0;
-    for series in &opts.series {
-        let label = if opts.y_label.is_empty() {
-            series.name.to_string()
+    let width = opts
+        .series
+        .iter()
+        .map(|series| {
+            painter
+                .layout_no_wrap(
+                    series_label(series.name, opts.y_label),
+                    font.clone(),
+                    TEXT_COLOR,
+                )
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+        + 28.0;
+    Rect::from_min_max(
+        Pos2::new(
+            (plot_rect.right() - width).max(plot_rect.left()),
+            plot_rect.top() + 2.0,
+        ),
+        Pos2::new(
+            plot_rect.right(),
+            plot_rect.top() + 10.0 + LEGEND_ROW_HEIGHT * opts.series.len() as f32,
+        ),
+    )
+    .intersect(plot_rect)
+}
+
+/// Keep every legend entry reachable, including when all traces are hidden.
+fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
+    if opts.series.len() < 2 || !rect.is_positive() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 2.0, BG_COLOR);
+    let font = FontId::monospace(LABEL_FONT_SIZE);
+    for (index, series) in opts.series.iter_mut().enumerate() {
+        let top = rect.top() + 4.0 + index as f32 * LEGEND_ROW_HEIGHT;
+        let row = Rect::from_min_max(
+            Pos2::new(rect.left(), top),
+            Pos2::new(rect.right(), top + LEGEND_ROW_HEIGHT),
+        )
+        .intersect(rect);
+        if !row.is_positive() {
+            continue;
+        }
+        let response = ui
+            .interact(
+                row,
+                ui.id().with(("trace_legend", index, series.name)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if series.visible {
+                "Click to hide this trace"
+            } else {
+                "Click to show this trace"
+            });
+        if response.clicked() {
+            series.visible = !series.visible;
+        }
+        if response.hovered() {
+            painter.rect_filled(row, 2.0, GRID_COLOR);
+        }
+        let color = if series.visible {
+            series.color
         } else {
-            format!("{} {}", series.name, opts.y_label)
+            Color32::from_gray(100)
         };
-        painter.text(
-            Pos2::new(plot_rect.right() - 18.0, y),
-            Align2::RIGHT_TOP,
-            label,
+        let text_color = if series.visible { TEXT_COLOR } else { color };
+        let bounds = painter.text(
+            Pos2::new(rect.right() - 18.0, row.center().y),
+            Align2::RIGHT_CENTER,
+            series_label(series.name, opts.y_label),
             font.clone(),
-            TEXT_COLOR,
+            text_color,
         );
-        let cy = y + LABEL_FONT_SIZE / 2.0 + 1.0;
         painter.line_segment(
             [
-                Pos2::new(plot_rect.right() - 14.0, cy),
-                Pos2::new(plot_rect.right() - 4.0, cy),
+                Pos2::new(rect.right() - 14.0, row.center().y),
+                Pos2::new(rect.right() - 4.0, row.center().y),
             ],
-            Stroke::new(2.0, series.color),
+            Stroke::new(2.0, color),
         );
-        y += LABEL_FONT_SIZE + 4.0;
+        if !series.visible {
+            painter.line_segment(
+                [bounds.left_center(), bounds.right_center()],
+                Stroke::new(1.0, color),
+            );
+        }
     }
 }
 
@@ -645,8 +738,7 @@ fn draw_cursor(
 
     if opts.series.len() >= 2 {
         let rows: Vec<_> = opts
-            .series
-            .iter()
+            .visible_series()
             .filter_map(|s| {
                 let value = nearest_y(&s.points, freq, opts.log_x)?;
                 Some((
@@ -806,6 +898,7 @@ mod tests {
             series: vec![Series {
                 name: "X",
                 color: Color32::WHITE,
+                visible: true,
                 points: points.to_vec(),
             }],
         }
@@ -903,6 +996,7 @@ mod tests {
         opts.series.push(Series {
             name: "T1",
             color: Color32::WHITE,
+            visible: true,
             points: vec![(0.0, -60.0), (f64::NAN, -200.0), (3e6, f64::NAN)],
         });
         let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
@@ -969,13 +1063,13 @@ mod tests {
         assert_eq!(nearest_y(&points, f64::NAN, false), None);
     }
 
-    fn frame(
+    fn widget_frame(
         ctx: &egui::Context,
         view: &mut PlotView,
-        opts: &PlotOptions,
+        opts: &mut PlotOptions,
         events: Vec<egui::Event>,
         time: f64,
-    ) -> (ViewLock, Vec<Vec<Pos2>>) {
+    ) -> (ViewLock, egui::FullOutput) {
         let mut lock = ViewLock::Unchanged;
         let output = ctx.run_ui(
             egui::RawInput {
@@ -988,6 +1082,17 @@ mod tests {
                 lock = show(ui, view, opts);
             },
         );
+        (lock, output)
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut PlotView,
+        opts: &PlotOptions,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (ViewLock, Vec<Vec<Pos2>>) {
+        let (lock, output) = widget_frame(ctx, view, &mut opts.clone(), events, time);
         let paths = output
             .shapes
             .iter()
@@ -1086,6 +1191,229 @@ mod tests {
                 near(after.value_at(cursor.y), before.value_at(cursor.y));
             }
         }
+    }
+
+    #[test]
+    fn hidden_series_do_not_affect_fit_and_all_hidden_keeps_the_view() {
+        let mut opts = impedance_options();
+        opts.series[0].visible = false;
+        opts.series[1].visible = false;
+        let mut view = PlotView::new(1.0, 2.0, -1.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!(view, PlotView::new(1e6, 1e9, -21.0, -9.0));
+        let before = view;
+        opts.series[2].visible = false;
+        fit_view(&mut view, &opts);
+        assert_eq!(view, before);
+    }
+
+    fn impedance_options() -> PlotOptions<'static> {
+        PlotOptions {
+            y_label: "ohm",
+            log_x: true,
+            series: [
+                ("|Z|", 1000.0, 2000.0),
+                ("R", 20.0, 40.0),
+                ("X", -10.0, -20.0),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, a, b))| Series {
+                name,
+                color: crate::theme::TRACE_COLORS[i],
+                visible: true,
+                points: vec![(1e6, a), (1e9, b)],
+            })
+            .collect(),
+        }
+    }
+
+    fn text_shapes(output: &egui::FullOutput) -> Vec<(String, Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(text) => Some((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()).center(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn click_legend(
+        ctx: &egui::Context,
+        view: &mut PlotView,
+        opts: &mut PlotOptions,
+        name: &str,
+        time: f64,
+    ) -> ViewLock {
+        let (_, output) = widget_frame(ctx, view, opts, vec![], time);
+        let texts = text_shapes(&output);
+        let pos = texts
+            .iter()
+            .find(|(text, _)| text == &series_label(name, opts.y_label))
+            .unwrap()
+            .1;
+        output.drop_without_applying_deltas();
+        let mut lock = ViewLock::Unchanged;
+        for (i, events) in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (frame_lock, output) =
+                widget_frame(ctx, view, opts, events, time + (i + 1) as f64 * 0.02);
+            lock = lock.merge(frame_lock);
+            output.drop_without_applying_deltas();
+        }
+        lock
+    }
+
+    #[test]
+    fn legend_toggles_each_trace_and_can_recover_after_hiding_all() {
+        let ctx = egui::Context::default();
+        let mut opts = impedance_options();
+        let original_points: Vec<_> = opts.series.iter().map(|s| s.points.clone()).collect();
+        let original_view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        let mut view = original_view;
+        for (i, name) in ["|Z|", "R", "X"].into_iter().enumerate() {
+            assert_eq!(
+                click_legend(&ctx, &mut view, &mut opts, name, 1.0 + i as f64),
+                ViewLock::Unchanged
+            );
+            for (j, series) in opts.series.iter().enumerate() {
+                assert_eq!(series.visible, j > i);
+            }
+            let (_, paths) = frame(&ctx, &mut view, &opts, vec![], 1.2 + i as f64);
+            assert_eq!(paths.len(), 2 - i);
+        }
+        let (_, output) = widget_frame(&ctx, &mut view, &mut opts, vec![], 4.0);
+        let texts = text_shapes(&output);
+        assert!(texts.iter().any(|(text, _)| text == "All traces hidden"));
+        for name in ["|Z|", "R", "X"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, _)| text == &series_label(name, "ohm"))
+            );
+        }
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            click_legend(&ctx, &mut view, &mut opts, "X", 5.0),
+            ViewLock::Unchanged
+        );
+        assert_eq!(
+            opts.series.iter().map(|s| s.visible).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        let (_, paths) = frame(&ctx, &mut view, &opts, vec![], 5.2);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(view, original_view);
+        assert_eq!(
+            opts.series
+                .iter()
+                .map(|s| s.points.clone())
+                .collect::<Vec<_>>(),
+            original_points
+        );
+    }
+
+    #[test]
+    fn double_clicking_legend_does_not_reset_or_lock_the_view() {
+        let ctx = egui::Context::default();
+        let mut opts = impedance_options();
+        let original = PlotView::new(1e7, 1e8, -5.0, 5.0);
+        let mut view = original;
+        assert_eq!(
+            click_legend(&ctx, &mut view, &mut opts, "R", 1.0),
+            ViewLock::Unchanged
+        );
+        assert!(!opts.series[1].visible);
+        assert_eq!(
+            click_legend(&ctx, &mut view, &mut opts, "R", 1.1),
+            ViewLock::Unchanged
+        );
+        assert!(opts.series[1].visible);
+        assert_eq!(view, original);
+    }
+
+    #[test]
+    fn wheel_over_legend_does_not_zoom_the_plot() {
+        let ctx = egui::Context::default();
+        let mut opts = impedance_options();
+        let original = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        let mut view = original;
+        let (_, output) = widget_frame(&ctx, &mut view, &mut opts, vec![], 0.0);
+        let pos = text_shapes(&output)
+            .into_iter()
+            .find(|(text, _)| text == "R ohm")
+            .unwrap()
+            .1;
+        output.drop_without_applying_deltas();
+        let (_, output) = widget_frame(
+            &ctx,
+            &mut view,
+            &mut opts,
+            vec![egui::Event::PointerMoved(pos)],
+            0.02,
+        );
+        output.drop_without_applying_deltas();
+        let (lock, output) = widget_frame(
+            &ctx,
+            &mut view,
+            &mut opts,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 3.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            0.04,
+        );
+        assert_eq!(lock, ViewLock::Unchanged);
+        assert_eq!(view, original);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn hidden_series_are_omitted_from_cursor_readouts() {
+        let ctx = egui::Context::default();
+        let mut opts = impedance_options();
+        opts.series[0].visible = false;
+        opts.series[1].visible = false;
+        let mut view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        let (_, output) = widget_frame(&ctx, &mut view, &mut opts, vec![], 0.0);
+        output.drop_without_applying_deltas();
+        let (_, output) = widget_frame(
+            &ctx,
+            &mut view,
+            &mut opts,
+            vec![egui::Event::PointerMoved(Pos2::new(300.0, 200.0))],
+            0.02,
+        );
+        let texts = text_shapes(&output);
+        assert!(texts.iter().any(|(text, _)| text == "X -10 ohm"));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text == "|Z| 1000 ohm" || text == "R 20 ohm")
+        );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
