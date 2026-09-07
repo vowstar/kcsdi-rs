@@ -200,6 +200,7 @@ impl eframe::App for KcsdiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         i18n::set_language(&ctx, self.state.language);
+        self.state.export.poll();
 
         // Drain all pending events from the device worker.
         while let Ok(evt) = self.evt_rx.try_recv() {

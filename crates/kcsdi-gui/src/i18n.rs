@@ -111,6 +111,22 @@ catalog! {
     NoData => ("No data", "暂无数据"),
     HideTrace => ("Click to hide this trace", "点击隐藏此曲线"),
     ShowTrace => ("Click to show this trace", "点击显示此曲线"),
+    ExportS1p => ("Export .s1p", "导出 .s1p"),
+    ExportBusy => ("Export in progress", "正在导出"),
+    ExportSaved => ("Saved", "已保存"),
+    ExportCancelled => ("Export cancelled", "已取消导出"),
+    ExportFailed => ("Export failed", "导出失败"),
+    ExportNeedsComplex => (
+        "Run Phase, Smith or Impedance to capture complex S11 data.",
+        "请在相位、史密斯图或阻抗视图运行扫描，以获取完整复数 S11 数据。"
+    ),
+    ExportSnapshot => ("Last completed sweep", "最近完成的扫描"),
+    ExportHelp => (
+        "Exports all samples from the last completed sweep as Hz / RI / 50 ohms. Zoom, LOG X and hidden traces do not change the file. Source calibration is unchanged. Two-port export requires four complete CSVs via CLI export s2p.",
+        "导出最近完成扫描的全部采样点，格式为 Hz / RI / 50 欧姆。缩放、X 对数和曲线隐藏不影响文件，不改变原有校准。两端口导出需通过 CLI export s2p 提供四份完整 CSV。"
+    ),
+    ReplaceFile => ("Replace existing file?", "替换已有文件？"),
+    WrongExportExtension => ("Choose a .s1p destination", "请选择 .s1p 目标文件"),
 }
 
 /// Typed UI messages update immediately when switching languages. Raw

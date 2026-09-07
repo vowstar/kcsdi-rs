@@ -14,7 +14,7 @@ use crate::i18n::{Text, language};
 use crate::theme::TRACE_COLORS;
 
 /// Nominal system impedance in ohms.
-pub const Z0: f64 = 50.0;
+pub const Z0: f64 = kcsdi_core::touchstone::REFERENCE_OHMS;
 
 /// Viewport of the Smith chart: zoom around the center.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,16 +63,10 @@ const GRID_COLOR: Color32 = Color32::from_rgb(0x42, 0x42, 0x42);
 const OUTLINE_COLOR: Color32 = Color32::from_rgb(0x5a, 0x5a, 0x5a);
 const TEXT_COLOR: Color32 = Color32::from_rgb(0xd5, 0xd5, 0xd5);
 
-/// (a + jb) / (c + jd).
-fn cdiv(a: f64, b: f64, c: f64, d: f64) -> (f64, f64) {
-    let m = c * c + d * d;
-    ((a * c + b * d) / m, (b * c - a * d) / m)
-}
-
 /// Reflection coefficient of Z = r + jx ohms against `z0`:
 /// gamma = (Z - z0) / (Z + z0).
 fn gamma_of(r: f64, x: f64, z0: f64) -> (f64, f64) {
-    cdiv(r - z0, x, r + z0, x)
+    kcsdi_core::touchstone::reflection_coefficient(r, x, z0).unwrap_or((f64::NAN, f64::NAN))
 }
 
 /// Circle of constant normalized resistance `r`: center on the real
@@ -486,11 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn cdiv_divides_complex_numbers() {
-        // (1 + 2j) / (3 + 4j) = (11 + 2j) / 25
-        let (re, im) = cdiv(1.0, 2.0, 3.0, 4.0);
-        assert!(approx(re, 11.0 / 25.0));
-        assert!(approx(im, 2.0 / 25.0));
+    fn gamma_conversion_handles_large_values_and_rejects_singularities() {
+        let (re, im) = gamma_of(1e300, 1e300, Z0);
+        assert!(approx(re, 1.0));
+        assert!(im.is_finite());
+        let (re, im) = gamma_of(-Z0, 0.0, Z0);
+        assert!(re.is_nan() && im.is_nan());
     }
 
     #[test]

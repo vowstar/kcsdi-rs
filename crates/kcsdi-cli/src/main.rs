@@ -3,6 +3,8 @@
 
 //! kcsdi: command-line interface for KC901 instruments.
 
+mod export;
+
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,7 +33,12 @@ enum Command {
     },
     /// Query device identity, temperature and voltages
     Info(ConnArgs),
-    /// Run a measurement sweep and write the data to CSV
+    /// Export complete complex CSV data to Touchstone without a connection
+    Export {
+        #[command(subcommand)]
+        format: export::ExportCommand,
+    },
+    /// Run a measurement sweep and write CSV or S11 Touchstone
     Sweep {
         #[command(subcommand)]
         mode: SweepCommand,
@@ -63,9 +70,9 @@ struct S11Args {
     /// Instrument model, used for range validation
     #[arg(long, default_value = "kc901v")]
     model: Model,
-    /// Data format returned by the instrument
-    #[arg(long, default_value = "loss")]
-    format: Format,
+    /// Instrument format (default: loss for CSV, ri for .s1p)
+    #[arg(long)]
+    format: Option<Format>,
     /// Start frequency in Hz
     #[arg(long)]
     start: u64,
@@ -81,9 +88,11 @@ struct S11Args {
     /// Sampling bandwidth; when given, $bw is pushed before the run
     #[arg(long)]
     rbw: Option<Rbw>,
-    /// Output CSV file
+    /// Output .csv or .s1p file
     #[arg(long)]
     out: PathBuf,
+    #[command(flatten)]
+    touchstone: export::TouchstoneOptions,
 }
 
 #[derive(Args)]
@@ -137,6 +146,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Info(args) => info(&args),
+        Command::Export { format } => export::run(format),
         Command::Sweep { mode } => match mode {
             SweepCommand::S11(args) => sweep_s11(&args),
             SweepCommand::Spec(args) => sweep_spec(&args),
@@ -222,10 +232,11 @@ fn info(args: &ConnArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn sweep_s11(args: &S11Args) -> Result<(), Box<dyn Error>> {
+    let format = export::sweep_format(&args.out, args.format, args.touchstone.overwrite)?;
     let caps = args.model.capabilities();
     let params = S11Params {
         cal: args.cal,
-        format: args.format,
+        format,
         points: args.points,
         start_hz: args.start,
         stop_hz: args.stop,
@@ -237,7 +248,12 @@ fn sweep_s11(args: &S11Args) -> Result<(), Box<dyn Error>> {
     let data = dev.sweep_s11(&params)?;
     dev.close();
 
-    write_csv(&args.out, s11_headers(args.format), &data)?;
+    if export::is_s1p(&args.out) {
+        kcsdi_core::touchstone::Document::s1p(&data, args.touchstone.touchstone_version.into())?
+            .save(&args.out, args.touchstone.overwrite)?;
+    } else {
+        write_csv(&args.out, s11_headers(format), &data)?;
+    }
     println!(
         "{} points written to {}",
         data.points.len(),
@@ -365,5 +381,50 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn incomplete_touchstone_requests_fail_before_connecting() {
+        for (output, format, expected) in [
+            ("unused.s1p", "loss", "needs complex data"),
+            ("unused.s1p", "vswr", "needs complex data"),
+            ("unused.s2p", "ri", "all four S-parameters"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "kcsdi",
+                "sweep",
+                "s11",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--start",
+                "5000",
+                "--stop",
+                "1000000",
+                "--points",
+                "201",
+                "--out",
+                output,
+                "--format",
+                format,
+            ])
+            .unwrap();
+            assert!(run(cli).unwrap_err().to_string().contains(expected));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "kcsdi",
+                "export",
+                "s2p",
+                "--s11",
+                "a.csv",
+                "--s21",
+                "b.csv",
+                "--out",
+                "unused.s2p",
+            ])
+            .is_err()
+        );
     }
 }

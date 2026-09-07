@@ -9,6 +9,7 @@
 mod app;
 mod config;
 mod device_worker;
+mod export;
 mod i18n;
 mod panels;
 mod state;

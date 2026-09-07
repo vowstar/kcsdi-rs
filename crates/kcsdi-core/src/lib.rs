@@ -20,6 +20,7 @@ pub mod device;
 pub mod error;
 pub mod model;
 pub mod protocol;
+pub mod touchstone;
 pub mod transport;
 pub mod validation;
 

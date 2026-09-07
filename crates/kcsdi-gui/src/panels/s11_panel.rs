@@ -28,6 +28,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let connected = state.connection == ConnectionState::Connected;
     let running = state.s11.running;
 
+    // Keep the last completed sweep exportable after disconnecting, and
+    // reserve space even when the parameter controls need scrolling.
+    egui::Panel::bottom("s11_export").show(ui, |ui| {
+        crate::export::show(ui, &mut state.export, &state.s11, state.language);
+    });
+
     ui.add_enabled_ui(connected, |ui| {
         display_tabs(ui, state);
         ui.separator();

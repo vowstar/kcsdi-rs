@@ -17,6 +17,8 @@ V1.6.1).
 - TCP/IP transport (single-connection discipline, clean `$local` exit)
 - KC901 text protocol: handshake, identity, temperature, voltage
 - S11 and spectrum sweeps with CSV export (CLI)
+- Touchstone 1.0/2.0 export: `.s1p` in the GUI and CLI, `.s2p` from four
+  complete complex CSVs in the CLI
 - Spectrum analyzer GUI: live trace plot with cursor-anchored zoom and
   pan, linear/log frequency axis, sweep parameters, RBW and reference
   level control
@@ -76,6 +78,35 @@ shows the allowed frequency range and disables RUN until invalid settings
 are corrected. Unsupported values from older config files remain visible
 instead of being silently changed. Frequency input supports whole-Hz
 precision. LOG X affects display only and cannot show the 0 Hz sample.
+
+### Touchstone export
+
+In the GUI, run an S11 sweep in Phase, Smith or Impedance, then click
+**Export .s1p**. The last completed sweep is saved in full, independent of
+zoom and trace visibility. Return Loss and VSWR alone lack phase and
+cannot be exported as complex S-parameters.
+
+```sh
+# Direct S11 acquisition. A .s1p destination defaults to complex RI data.
+kcsdi sweep s11 --host 192.0.2.10 --port 901 \
+    --start 5000 --stop 100000000 --points 201 --out s11.s1p
+
+# Offline conversion of an existing complex CSV
+kcsdi export s1p --input s11.csv --out s11.s1p
+
+# Offline assembly, with all four measured S-parameters supplied explicitly
+kcsdi export s2p --s11 s11.csv --s21 s21.csv \
+    --s12 s12.csv --s22 s22.csv --out network.s2p
+```
+
+Output uses Hz, real/imaginary pairs and a 50 ohm reference. The default
+syntax is Touchstone 2.0. Use `--touchstone-version 1` for older readers.
+Existing Touchstone files require `--overwrite` in the CLI or confirmation
+in the GUI. Full two-port acquisition is not implemented. The `.s2p`
+assembler requires compatible measurements on exactly the same frequency
+grid and never invents missing parameters. See
+[Touchstone export and verification](docs/touchstone.md) for input formats,
+limitations and independent validation commands.
 
 ## Protocol References
 

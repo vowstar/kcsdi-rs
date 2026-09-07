@@ -314,6 +314,8 @@ pub struct AppState {
     pub mode: AppMode,
     pub spec: SpecState,
     pub s11: S11State,
+    /// Export jobs never share the instrument command channel.
+    pub export: crate::export::ExportState,
     /// Transient message for the status bar.
     pub status_message: Option<StatusMessage>,
     /// Command channel to the device worker thread.
@@ -333,6 +335,7 @@ impl Default for AppState {
             mode: AppMode::Spec,
             spec: SpecState::default(),
             s11: S11State::default(),
+            export: crate::export::ExportState::default(),
             status_message: None,
             cmd_tx: None,
         }
