@@ -3,11 +3,9 @@
 
 //! Cartesian trace plot, custom-drawn with `egui::Painter`.
 //!
-//! Deliberately not egui_plot: the reference interface uses per-axis
-//! strips and cursor-anchored zoom that do not fit owned axes
-//! (reference UI analysis section 6). Supports multiple series and
-//! an optional logarithmic Y axis (extension over the reference
-//! interface).
+//! Supports multiple series, a linear or base-10 logarithmic frequency
+//! axis, and cursor-anchored zoom (reference UI analysis section 6).
+//! Y always uses the original signed measurement units.
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind};
 
@@ -16,9 +14,9 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind
 pub struct Series<'a> {
     /// Trace name, shown in the legend when several series share a plot.
     pub name: &'a str,
-    pub color: egui::Color32,
-    /// (x, y) data points; non-finite values break the polyline. In
-    /// log-Y mode non-positive values also break it.
+    pub color: Color32,
+    /// (frequency in Hz, value) points. Non-finite values break the polyline.
+    /// Log X additionally excludes non-positive frequencies, never signed Y.
     pub points: Vec<(f64, f64)>,
 }
 
@@ -26,8 +24,7 @@ pub struct Series<'a> {
 pub struct PlotOptions<'a> {
     /// Y axis unit label (e.g. "dBm", "ohm", "deg").
     pub y_label: &'a str,
-    /// Logarithmic Y axis (base 10). Non-positive values are skipped.
-    pub log_y: bool,
+    pub log_x: bool,
     pub series: Vec<Series<'a>>,
 }
 
@@ -56,11 +53,8 @@ impl ViewLock {
     }
 }
 
-/// Visible data range of the plot (x x y, in data units).
-///
-/// In log-Y mode (`PlotOptions::log_y`) `y_min`/`y_max` still hold raw
-/// data values, not log10 of them; the widget maps to log space
-/// internally for layout, zoom, and pan. Keep both positive there.
+/// Visible range in original data units. X is always in Hz, including
+/// in log mode. Y remains linear for layout, readout, zoom, and pan.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlotView {
     pub x_min: f64,
@@ -95,9 +89,6 @@ const MARGIN_TOP: f32 = 8.0;
 const MARGIN_BOTTOM: f32 = 20.0;
 const LABEL_FONT_SIZE: f32 = 11.0;
 const MIN_SPAN: f64 = 1e-9;
-/// Floor for raw Y values before the log10 mapping, so a view that
-/// drifted to zero or below still maps to something finite.
-const MIN_POSITIVE: f64 = 1e-300;
 
 // Chart chrome colors from reference UI analysis section 4.3 (dark theme).
 const BG_COLOR: Color32 = Color32::from_rgb(0x18, 0x18, 0x18);
@@ -105,19 +96,79 @@ const GRID_COLOR: Color32 = Color32::from_rgb(0x42, 0x42, 0x42);
 const TEXT_COLOR: Color32 = Color32::from_rgb(0xd5, 0xd5, 0xd5);
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0x90, 0x90, 0x90);
 
-/// Map a raw Y value into axis space: identity in linear mode, log10 in
-/// log mode (clamped away from zero so the mapping stays finite).
-fn to_axis(log_y: bool, v: f64) -> f64 {
-    if log_y {
-        v.max(MIN_POSITIVE).log10()
-    } else {
-        v
+/// Shared frequency-axis control for SPEC and S11 cartesian displays.
+pub fn log_x_control(ui: &mut egui::Ui, log_x: &mut bool) -> bool {
+    ui.checkbox(log_x, "LOG X")
+        .on_hover_text(
+            "Base-10 frequency axis. Only positive frequencies can be shown. Changes the display, not sweep sampling. Y remains linear.",
+        )
+        .changed()
+}
+
+fn usable_x(log_x: bool, x: f64) -> bool {
+    x.is_finite() && (!log_x || x > 0.0)
+}
+
+fn x_to_axis(log_x: bool, x: f64) -> f64 {
+    if log_x { x.log10() } else { x }
+}
+
+fn x_from_axis(log_x: bool, x: f64) -> f64 {
+    if log_x { 10f64.powf(x) } else { x }
+}
+
+/// One mapping shared by curves, grid, cursor, zoom, and pan.
+struct Mapping {
+    rect: Rect,
+    log_x: bool,
+    x_min: f64,
+    x_span: f64,
+    y_min: f64,
+    y_span: f64,
+}
+
+impl Mapping {
+    fn new(view: &PlotView, log_x: bool, rect: Rect) -> Self {
+        let x_min = x_to_axis(log_x, view.x_min);
+        Self {
+            rect,
+            log_x,
+            x_min,
+            x_span: (x_to_axis(log_x, view.x_max) - x_min).max(MIN_SPAN),
+            y_min: view.y_min,
+            y_span: (view.y_max - view.y_min).max(MIN_SPAN),
+        }
+    }
+
+    fn to_screen(&self, x: f64, y: f64) -> Pos2 {
+        Pos2::new(
+            self.rect.left()
+                + ((x_to_axis(self.log_x, x) - self.x_min) / self.x_span) as f32
+                    * self.rect.width(),
+            self.rect.bottom() - ((y - self.y_min) / self.y_span) as f32 * self.rect.height(),
+        )
+    }
+
+    fn frequency_at(&self, screen_x: f32) -> f64 {
+        x_from_axis(
+            self.log_x,
+            self.x_min + ((screen_x - self.rect.left()) / self.rect.width()) as f64 * self.x_span,
+        )
+    }
+
+    fn value_at(&self, screen_y: f32) -> f64 {
+        self.y_min + ((self.rect.bottom() - screen_y) / self.rect.height()) as f64 * self.y_span
     }
 }
 
-/// Inverse of [`to_axis`].
-fn from_axis(log_y: bool, a: f64) -> f64 {
-    if log_y { 10f64.powf(a) } else { a }
+/// Refuse zoom/pan bounds that overflow, underflow, or collapse.
+fn set_x_bounds(view: &mut PlotView, log_x: bool, axis_min: f64, axis_max: f64) {
+    let min = x_from_axis(log_x, axis_min);
+    let max = x_from_axis(log_x, axis_max);
+    if usable_x(log_x, min) && usable_x(log_x, max) && min < max {
+        view.x_min = min;
+        view.x_max = max;
+    }
 }
 
 /// Pick a 1-2-5 step so `span / step` lands near `target_divs`.
@@ -166,32 +217,15 @@ fn decimals(step: f64) -> usize {
     6
 }
 
-/// First tick value at or above `min` on a grid of `step`.
-fn first_tick(min: f64, step: f64) -> f64 {
-    (min / step).ceil() * step
-}
-
-fn format_freq(hz: f64, unit: &str, scale: f64, decimals: usize) -> String {
-    format!("{:.*} {}", decimals, hz / scale, unit)
-}
-
-/// Label for 10^exp on a log axis: plain up to 100, then k/M/G.
-fn format_pow10(exp: i32) -> String {
-    const SUFFIX: [&str; 3] = ["k", "M", "G"];
-    match exp {
-        0 => "1".to_string(),
-        1 => "10".to_string(),
-        2 => "100".to_string(),
-        -1 => "0.1".to_string(),
-        -2 => "0.01".to_string(),
-        -3 => "0.001".to_string(),
-        e if e > 2 && e <= 11 => {
-            let suffix = SUFFIX[(e as usize - 3) / 3];
-            let mantissa = 10u64.pow((e as u32 - 3) % 3);
-            format!("{}{}", mantissa, suffix)
-        }
-        e => format!("1e{}", e),
-    }
+fn format_freq(hz: f64) -> String {
+    let (unit, scale) = si_unit(hz);
+    // Retain Hz resolution even with GHz units when zoomed in closely.
+    let value = format!("{:.9}", hz / scale);
+    format!(
+        "{} {}",
+        value.trim_end_matches('0').trim_end_matches('.'),
+        unit
+    )
 }
 
 /// Compact number for tick labels and readouts: fixed point inside a
@@ -209,63 +243,160 @@ fn format_value(v: f64) -> String {
     }
 }
 
-/// Reset `view` to cover all series data, with the same headroom rules
-/// as the double-click reset (5% of the span in linear mode, 5% of the
-/// decade span in log mode, positive values only there). Does nothing
-/// when there is no usable data.
+/// Raw 1-2-5 ticks, also useful when zoomed inside one log decade.
+fn linear_ticks(min: f64, max: f64) -> Vec<f64> {
+    let step = nice_step(max - min, TARGET_DIVISIONS);
+    if !step.is_finite() || step <= 0.0 {
+        return Vec::new();
+    }
+    let first = (min / step).ceil();
+    let mut ticks = Vec::new();
+    // Bound iteration even when floating-point precision cannot advance a tick.
+    for i in 0..=TARGET_DIVISIONS * 2 {
+        let index = first + i as f64;
+        let value = if index == 0.0 { 0.0 } else { index * step };
+        if value > max + step * 1e-6 {
+            break;
+        }
+        if value.is_finite() && ticks.last() != Some(&value) {
+            ticks.push(value);
+        }
+    }
+    ticks
+}
+
+/// Log ticks follow 1, 2, 5 per decade, with labels in actual Hz units.
+fn frequency_ticks(log_x: bool, min: f64, max: f64) -> Vec<f64> {
+    if !log_x {
+        return linear_ticks(min, max);
+    }
+    if !usable_x(true, min) || !usable_x(true, max) || min >= max {
+        return Vec::new();
+    }
+    let mut ticks = Vec::new();
+    for exponent in (min.log10().floor() as i32)..=(max.log10().ceil() as i32) {
+        for multiple in [1.0, 2.0, 5.0] {
+            let frequency = multiple * 10f64.powi(exponent);
+            if frequency >= min && frequency <= max && frequency.is_finite() {
+                ticks.push(frequency);
+            }
+        }
+    }
+    if ticks.len() < 2 {
+        ticks = linear_ticks(min, max)
+            .into_iter()
+            .filter(|x| usable_x(true, *x))
+            .collect();
+    }
+    ticks
+}
+
+/// Full data extent over all drawable series, with 5% linear Y headroom.
+fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
+    let mut range: Option<(f64, f64, f64, f64)> = None;
+    for &(x, y) in opts.series.iter().flat_map(|s| &s.points) {
+        if !usable_x(opts.log_x, x) || !y.is_finite() {
+            continue;
+        }
+        range = Some(match range {
+            None => (x, x, y, y),
+            Some((x0, x1, y0, y1)) => (x0.min(x), x1.max(x), y0.min(y), y1.max(y)),
+        });
+    }
+    range.map(|(mut x0, mut x1, y0, y1)| {
+        if x0 == x1 {
+            let axis = x_to_axis(opts.log_x, x0);
+            let pad = if opts.log_x {
+                0.05
+            } else {
+                (x0.abs() * 0.05).max(1.0)
+            };
+            x0 = x_from_axis(opts.log_x, axis - pad);
+            x1 = x_from_axis(opts.log_x, axis + pad);
+        }
+        let pad = ((y1 - y0) * 0.05).max(1.0);
+        (x0, x1, y0 - pad, y1 + pad)
+    })
+}
+
+/// Reset to all drawable data. Does nothing when no valid data exists.
 pub fn fit_view(view: &mut PlotView, opts: &PlotOptions) {
     if let Some((x_min, x_max, y_min, y_max)) = data_range(opts) {
         view.reset(x_min, x_max, y_min, y_max);
     }
 }
 
-/// Draw the plot into the available space and report how the user
-/// interacted with the view this frame. Signature is a module contract;
-/// do not change it.
+/// A linear view may include DC. Choose valid log bounds on mode change,
+/// without shifting or clamping any measured frequency.
+fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
+    let valid = |v: &PlotView| {
+        usable_x(opts.log_x, v.x_min) && usable_x(opts.log_x, v.x_max) && v.x_min < v.x_max
+    };
+    if valid(view) {
+        return;
+    }
+    fit_view(view, opts);
+    if !valid(view) {
+        let max = if view.x_max.is_finite() {
+            view.x_max.max(10.0)
+        } else {
+            10.0
+        };
+        view.x_min = if opts.log_x { max / 10.0 } else { 0.0 };
+        view.x_max = max;
+    }
+}
+
+/// Draw the plot and report whether the user locked or reset the view.
 pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewLock {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_LEFT, rect.top() + MARGIN_TOP),
         Pos2::new(rect.right() - MARGIN_RIGHT, rect.bottom() - MARGIN_BOTTOM),
     );
-
-    let lock = handle_input(ui, view, opts, plot_rect, &response);
-
-    let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, BG_COLOR);
+    ui.painter().rect_filled(rect, 0.0, BG_COLOR);
     if plot_rect.width() < 2.0 || plot_rect.height() < 2.0 {
-        return lock;
+        return ViewLock::Unchanged;
     }
 
-    draw_grid(painter, view, opts, plot_rect);
+    ensure_x_view(view, opts);
+    let lock = handle_input(ui, view, opts, plot_rect, &response);
+    let mapping = Mapping::new(view, opts.log_x, plot_rect);
+    let painter = ui.painter();
+    draw_grid(painter, view, opts, &mapping);
 
-    if opts.series.iter().any(|s| !s.points.is_empty()) {
+    if opts
+        .series
+        .iter()
+        .flat_map(|s| &s.points)
+        .any(|&(x, y)| usable_x(opts.log_x, x) && y.is_finite())
+    {
         let clipped = painter.with_clip_rect(plot_rect);
         for series in &opts.series {
-            draw_series(&clipped, view, opts.log_y, series);
+            draw_series(&clipped, &mapping, series);
         }
         draw_legend(painter, opts, plot_rect);
     } else {
+        let has_samples = opts.series.iter().any(|s| !s.points.is_empty());
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "No data",
+            if opts.log_x && has_samples {
+                "No data at positive frequencies"
+            } else {
+                "No data"
+            },
             FontId::monospace(14.0),
             TEXT_COLOR,
         );
     }
-
-    draw_cursor(painter, view, opts, plot_rect, &response);
+    draw_cursor(painter, opts, &mapping, &response);
     lock
 }
 
-/// Wheel zoom (10% per step, anchored at the cursor): plain wheel zooms
-/// X, Shift+wheel zooms Y, Ctrl+wheel zooms both axes (Steinberg-style
-/// analyzer convention). Shift+wheel arrives as a horizontal scroll
-/// delta on most platforms, so the dominant component is used when a
-/// modifier is held. Drag pans, double-click resets, per reference UI
-/// analysis section 5. Y math happens in axis space so log mode
-/// zooms/pans by decades. Returns the frame's [`ViewLock`] report.
+/// Plain wheel zooms X, Shift+wheel zooms Y, Ctrl/Command+wheel zooms
+/// both. Drag pans and double-click fits, per reference UI analysis
+/// section 5. Only X uses logarithmic axis space.
 fn handle_input(
     ui: &egui::Ui,
     view: &mut PlotView,
@@ -274,16 +405,16 @@ fn handle_input(
     response: &egui::Response,
 ) -> ViewLock {
     let mut lock = ViewLock::Unchanged;
-    let (delta, modifiers) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.modifiers));
-    let zoom_y_only = modifiers.shift;
+    let (delta, modifiers, zoom_delta) = ui
+        .ctx()
+        .input(|i| (i.smooth_scroll_delta, i.modifiers, i.zoom_delta()));
     let zoom_both = modifiers.ctrl || modifiers.command;
-    let scroll = if zoom_y_only || zoom_both {
-        // Modifier-held wheel often arrives as horizontal scroll.
-        if delta.x.abs() > delta.y.abs() {
-            delta.x
-        } else {
-            delta.y
-        }
+    let zoom_y_only = modifiers.shift && !zoom_both;
+    let scroll = if zoom_both && zoom_delta != 1.0 {
+        // egui converts Ctrl/Command-wheel to zoom and clears scroll deltas.
+        zoom_delta.ln()
+    } else if (zoom_y_only || zoom_both) && delta.x.abs() > delta.y.abs() {
+        delta.x
     } else {
         delta.y
     };
@@ -292,205 +423,132 @@ fn handle_input(
         && let Some(pos) = response.hover_pos()
         && plot_rect.contains(pos)
     {
+        let mapping = Mapping::new(view, opts.log_x, plot_rect);
         let factor = if scroll > 0.0 { 0.9 } else { 1.0 / 0.9 };
         if zoom_y_only || zoom_both {
-            let (mut a_min, mut a_max) = (
-                to_axis(opts.log_y, view.y_min),
-                to_axis(opts.log_y, view.y_max),
+            zoom_axis(
+                &mut view.y_min,
+                &mut view.y_max,
+                mapping.value_at(pos.y),
+                factor,
             );
-            let anchor =
-                a_max - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64 * (a_max - a_min);
-            zoom_axis(&mut a_min, &mut a_max, anchor, factor);
-            view.y_min = from_axis(opts.log_y, a_min);
-            view.y_max = from_axis(opts.log_y, a_max);
         }
         if !zoom_y_only {
-            let anchor = view.x_min
-                + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64
-                    * (view.x_max - view.x_min);
-            zoom_axis(&mut view.x_min, &mut view.x_max, anchor, factor);
+            let (mut min, mut max) = (mapping.x_min, mapping.x_min + mapping.x_span);
+            let anchor = x_to_axis(opts.log_x, mapping.frequency_at(pos.x));
+            zoom_axis(&mut min, &mut max, anchor, factor);
+            set_x_bounds(view, opts.log_x, min, max);
         }
         lock = lock.merge(ViewLock::Locked);
     }
 
     if response.dragged() {
-        let d = response.drag_delta();
-        if plot_rect.width() > 0.0 && plot_rect.height() > 0.0 {
-            let dx = -(d.x as f64 / plot_rect.width() as f64) * (view.x_max - view.x_min);
-            view.x_min += dx;
-            view.x_max += dx;
-            let (mut a_min, mut a_max) = (
-                to_axis(opts.log_y, view.y_min),
-                to_axis(opts.log_y, view.y_max),
-            );
-            let dy = (d.y as f64 / plot_rect.height() as f64) * (a_max - a_min);
-            a_min += dy;
-            a_max += dy;
-            view.y_min = from_axis(opts.log_y, a_min);
-            view.y_max = from_axis(opts.log_y, a_max);
-        }
+        pan_view(view, opts.log_x, plot_rect, response.drag_delta());
         lock = lock.merge(ViewLock::Locked);
     }
 
-    if response.double_clicked() && data_range(opts).is_some() {
+    if response.double_clicked() {
         fit_view(view, opts);
         lock = lock.merge(ViewLock::Unlocked);
     }
     lock
 }
 
-/// Zoom one axis around `anchor`, refusing to collapse below MIN_SPAN.
+fn pan_view(view: &mut PlotView, log_x: bool, rect: Rect, delta: egui::Vec2) {
+    let mapping = Mapping::new(view, log_x, rect);
+    let dx = -(delta.x as f64 / rect.width() as f64) * mapping.x_span;
+    set_x_bounds(
+        view,
+        log_x,
+        mapping.x_min + dx,
+        mapping.x_min + mapping.x_span + dx,
+    );
+    let dy = (delta.y as f64 / rect.height() as f64) * mapping.y_span;
+    let (min, max) = (view.y_min + dy, view.y_max + dy);
+    if min.is_finite() && max.is_finite() && min < max {
+        view.y_min = min;
+        view.y_max = max;
+    }
+}
+
+/// Zoom one axis around the cursor, refusing collapsed or infinite bounds.
 fn zoom_axis(min: &mut f64, max: &mut f64, anchor: f64, factor: f64) {
-    if (*max - *min).abs() * factor < MIN_SPAN {
+    if (*max - *min) * factor < MIN_SPAN {
         return;
     }
-    *min = anchor - (anchor - *min) * factor;
-    *max = anchor + (*max - anchor) * factor;
+    let new_min = anchor - (anchor - *min) * factor;
+    let new_max = anchor + (*max - anchor) * factor;
+    if new_min.is_finite() && new_max.is_finite() && new_min < new_max {
+        *min = new_min;
+        *max = new_max;
+    }
 }
 
-/// Full data extent over all series, with 5% Y headroom (5% of the
-/// decade span in log mode), for the double-click reset. In log mode
-/// only positive Y values count.
-fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
-    let mut range: Option<(f64, f64, f64, f64)> = None;
-    for series in &opts.series {
-        for &(x, y) in &series.points {
-            if !x.is_finite() || !y.is_finite() || (opts.log_y && y <= 0.0) {
-                continue;
-            }
-            range = Some(match range {
-                None => (x, x, y, y),
-                Some((x0, x1, y0, y1)) => (x0.min(x), x1.max(x), y0.min(y), y1.max(y)),
-            });
+fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, mapping: &Mapping) {
+    let rect = mapping.rect;
+    let font = FontId::monospace(LABEL_FONT_SIZE);
+    let (unit, scale) = si_unit(view.x_min.abs().max(view.x_max.abs()));
+    let x_dec = decimals(nice_step(view.x_max - view.x_min, TARGET_DIVISIONS) / scale);
+    let mut label_right = f32::NEG_INFINITY;
+    for x in frequency_ticks(opts.log_x, view.x_min, view.x_max) {
+        let sx = mapping.to_screen(x, view.y_min).x;
+        painter.line_segment(
+            [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
+            Stroke::new(1.0, GRID_COLOR),
+        );
+        // Broad log views label decades only, with 2/5 minor grid lines.
+        let exponent = x_to_axis(opts.log_x, x);
+        if opts.log_x && mapping.x_span > 2.0 && (exponent - exponent.round()).abs() > 1e-9 {
+            continue;
+        }
+        let text = if opts.log_x {
+            format_freq(x)
+        } else {
+            format!("{:.*} {}", x_dec, x / scale, unit)
+        };
+        let galley = painter.layout_no_wrap(text, font.clone(), TEXT_COLOR);
+        let left = (sx - galley.size().x / 2.0).clamp(
+            rect.left(),
+            (rect.right() - galley.size().x).max(rect.left()),
+        );
+        if left >= label_right + 8.0 {
+            label_right = left + galley.size().x;
+            painter.galley(Pos2::new(left, rect.bottom() + 3.0), galley, TEXT_COLOR);
         }
     }
-    range.map(|(x0, x1, y0, y1)| {
-        if opts.log_y {
-            let (a0, a1) = (y0.log10(), y1.log10());
-            let pad = ((a1 - a0) * 0.05).max(0.05);
-            (x0, x1, 10f64.powf(a0 - pad), 10f64.powf(a1 + pad))
-        } else {
-            let pad = ((y1 - y0) * 0.05).max(1.0);
-            (x0, x1, y0 - pad, y1 + pad)
-        }
-    })
-}
 
-fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, plot_rect: Rect) {
-    let font = FontId::monospace(LABEL_FONT_SIZE);
-    let x_span = view.x_max - view.x_min;
-    let (a_min, a_max) = (
-        to_axis(opts.log_y, view.y_min),
-        to_axis(opts.log_y, view.y_max),
-    );
-    let a_span = a_max - a_min;
-    let y_to_screen =
-        |a: f64| plot_rect.bottom() - ((a - a_min) / a_span) as f32 * plot_rect.height();
-
-    // X axis: frequency with an SI prefix chosen from the visible range.
-    let (unit, scale) = si_unit(view.x_min.abs().max(view.x_max.abs()));
-    let x_step = nice_step(x_span, TARGET_DIVISIONS);
-    let x_dec = decimals(x_step / scale);
-    let mut x = first_tick(view.x_min, x_step);
-    while x <= view.x_max + x_step * 1e-6 {
-        let sx = plot_rect.left() + ((x - view.x_min) / x_span) as f32 * plot_rect.width();
+    let y_dec = decimals(nice_step(view.y_max - view.y_min, TARGET_DIVISIONS));
+    for y in linear_ticks(view.y_min, view.y_max) {
+        let sy = mapping.to_screen(view.x_min, y).y;
         painter.line_segment(
-            [
-                Pos2::new(sx, plot_rect.top()),
-                Pos2::new(sx, plot_rect.bottom()),
-            ],
+            [Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)],
             Stroke::new(1.0, GRID_COLOR),
         );
         painter.text(
-            Pos2::new(sx, plot_rect.bottom() + 3.0),
-            Align2::CENTER_TOP,
-            format_freq(x, unit, scale, x_dec),
+            Pos2::new(rect.left() - 4.0, sy),
+            Align2::RIGHT_CENTER,
+            format!("{:.*}", y_dec, y),
             font.clone(),
             TEXT_COLOR,
         );
-        x += x_step;
-    }
-
-    // Y axis: powers of ten in log mode, 1-2-5 steps in linear mode.
-    if opts.log_y {
-        let mut exp = a_min.ceil() as i32;
-        while (exp as f64) <= a_max + 1e-9 {
-            let sy = y_to_screen(exp as f64);
-            painter.line_segment(
-                [
-                    Pos2::new(plot_rect.left(), sy),
-                    Pos2::new(plot_rect.right(), sy),
-                ],
-                Stroke::new(1.0, GRID_COLOR),
-            );
-            painter.text(
-                Pos2::new(plot_rect.left() - 4.0, sy),
-                Align2::RIGHT_CENTER,
-                format_pow10(exp),
-                font.clone(),
-                TEXT_COLOR,
-            );
-            exp += 1;
-        }
-    } else {
-        let y_step = nice_step(a_span, TARGET_DIVISIONS);
-        let y_dec = decimals(y_step);
-        let mut y = first_tick(a_min, y_step);
-        while y <= a_max + y_step * 1e-6 {
-            let sy = y_to_screen(y);
-            painter.line_segment(
-                [
-                    Pos2::new(plot_rect.left(), sy),
-                    Pos2::new(plot_rect.right(), sy),
-                ],
-                Stroke::new(1.0, GRID_COLOR),
-            );
-            painter.text(
-                Pos2::new(plot_rect.left() - 4.0, sy),
-                Align2::RIGHT_CENTER,
-                format!("{:.*}", y_dec, y),
-                font.clone(),
-                TEXT_COLOR,
-            );
-            y += y_step;
-        }
     }
     painter.text(
-        Pos2::new(plot_rect.left() + 4.0, plot_rect.top() + 2.0),
+        Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
         Align2::LEFT_TOP,
         opts.y_label,
-        font.clone(),
+        font,
         TEXT_COLOR,
     );
-
-    painter.rect_stroke(
-        plot_rect,
-        0.0,
-        Stroke::new(1.0, GRID_COLOR),
-        StrokeKind::Inside,
-    );
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
 }
 
-/// Draw one series polyline. Runs break at non-finite points and, in log
-/// mode, at non-positive Y values, so a gap does not smear a line
-/// across the plot.
-fn draw_series(painter: &egui::Painter, view: &PlotView, log_y: bool, series: &Series) {
+/// Invalid samples break runs. Negative and zero Y values remain valid.
+fn draw_series(painter: &egui::Painter, mapping: &Mapping, series: &Series) {
     let stroke = Stroke::new(1.5, series.color);
-    let x_span = (view.x_max - view.x_min).max(MIN_SPAN);
-    let (a_min, a_max) = (to_axis(log_y, view.y_min), to_axis(log_y, view.y_max));
-    let a_span = (a_max - a_min).max(MIN_SPAN);
-    let rect = painter.clip_rect();
-    let to_screen = |x: f64, y: f64| {
-        Pos2::new(
-            rect.left() + ((x - view.x_min) / x_span) as f32 * rect.width(),
-            rect.bottom() - ((to_axis(log_y, y) - a_min) / a_span) as f32 * rect.height(),
-        )
-    };
-
-    let mut run: Vec<Pos2> = Vec::new();
+    let mut run = Vec::new();
     for &(x, y) in &series.points {
-        if x.is_finite() && y.is_finite() && (!log_y || y > 0.0) {
-            run.push(to_screen(x, y));
+        if usable_x(mapping.log_x, x) && y.is_finite() {
+            run.push(mapping.to_screen(x, y));
         } else if run.len() >= 2 {
             painter.add(Shape::line(std::mem::take(&mut run), stroke));
         } else {
@@ -536,118 +594,99 @@ fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
     }
 }
 
-/// Y of the drawable point whose x is closest to `x`. `points` must be
-/// sorted by x (sweep data always is). Points that would not be drawn
-/// (non-finite x/y, non-positive y in log mode) are skipped. An `x`
-/// outside the data range snaps to the nearest drawable end point;
-/// returns None only when no drawable point exists. Ties prefer the
-/// point left of `x`.
-fn nearest_y(points: &[(f64, f64)], x: f64, log_y: bool) -> Option<f64> {
-    let usable = |p: &&(f64, f64)| p.0.is_finite() && p.1.is_finite() && (!log_y || p.1 > 0.0);
-    let pos = points.partition_point(|p| p.0 < x);
-    let left = points[..pos].iter().rev().find(usable);
-    let right = points[pos..].iter().find(usable);
-    match (left, right) {
-        (Some(l), Some(r)) => {
-            if (x - l.0).abs() <= (r.0 - x).abs() {
-                Some(l.1)
-            } else {
-                Some(r.1)
-            }
-        }
-        (Some(l), None) => Some(l.1),
-        (None, Some(r)) => Some(r.1),
-        (None, None) => None,
+/// Choose the sample nearest to the cursor in screen frequency space.
+/// Values remain in original signed Y units. Ties prefer the first sample.
+fn nearest_y(points: &[(f64, f64)], x: f64, log_x: bool) -> Option<f64> {
+    if !usable_x(log_x, x) {
+        return None;
     }
+    let axis = x_to_axis(log_x, x);
+    points
+        .iter()
+        .filter(|&&(x, y)| usable_x(log_x, x) && y.is_finite())
+        .min_by(|a, b| {
+            (x_to_axis(log_x, a.0) - axis)
+                .abs()
+                .total_cmp(&(x_to_axis(log_x, b.0) - axis).abs())
+        })
+        .map(|p| p.1)
 }
 
-/// Crosshair lines and readouts of the data under the mouse. With a
-/// single series this shows the (frequency, value) coordinates of the
-/// cursor; with several series it shows one row per series at the
-/// bottom right, in the series color, holding the value of the point
-/// nearest to the cursor x. Log mode reports the raw value.
+/// Crosshair readouts always report actual frequency and raw Y values.
 fn draw_cursor(
     painter: &egui::Painter,
-    view: &PlotView,
     opts: &PlotOptions,
-    plot_rect: Rect,
+    mapping: &Mapping,
     response: &egui::Response,
 ) {
     let Some(pos) = response.hover_pos() else {
         return;
     };
-    if !plot_rect.contains(pos) {
+    let rect = mapping.rect;
+    if !rect.contains(pos) {
         return;
     }
     painter.line_segment(
         [
-            Pos2::new(pos.x, plot_rect.top()),
-            Pos2::new(pos.x, plot_rect.bottom()),
+            Pos2::new(pos.x, rect.top()),
+            Pos2::new(pos.x, rect.bottom()),
         ],
         Stroke::new(0.5, CURSOR_COLOR),
     );
     painter.line_segment(
         [
-            Pos2::new(plot_rect.left(), pos.y),
-            Pos2::new(plot_rect.right(), pos.y),
+            Pos2::new(rect.left(), pos.y),
+            Pos2::new(rect.right(), pos.y),
         ],
         Stroke::new(0.5, CURSOR_COLOR),
     );
-
-    let freq = view.x_min
-        + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64 * (view.x_max - view.x_min);
+    let freq = mapping.frequency_at(pos.x);
     let font = FontId::monospace(LABEL_FONT_SIZE);
 
     if opts.series.len() >= 2 {
-        // One row per series with a drawable point near the cursor x,
-        // stacked upward from the bottom right corner in series order.
-        let rows: Vec<(Color32, String)> = opts
+        let rows: Vec<_> = opts
             .series
             .iter()
             .filter_map(|s| {
-                let value = nearest_y(&s.points, freq, opts.log_y)?;
-                let text = if opts.y_label.is_empty() {
-                    format!("{} {}", s.name, format_value(value))
-                } else {
-                    format!("{} {} {}", s.name, format_value(value), opts.y_label)
-                };
-                Some((s.color, text))
+                let value = nearest_y(&s.points, freq, opts.log_x)?;
+                Some((
+                    s.color,
+                    format!("{} {} {}", s.name, format_value(value), opts.y_label),
+                ))
             })
             .collect();
         let row_h = LABEL_FONT_SIZE + 3.0;
         for (i, (color, text)) in rows.iter().enumerate() {
-            let y = plot_rect.bottom() - 4.0 - (rows.len() - 1 - i) as f32 * row_h;
+            let y = rect.bottom() - 4.0 - (rows.len() - 1 - i) as f32 * row_h;
             painter.text(
-                Pos2::new(plot_rect.right() - 4.0, y),
+                Pos2::new(rect.right() - 4.0, y),
                 Align2::RIGHT_BOTTOM,
                 text,
                 font.clone(),
                 *color,
             );
         }
-        return;
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+            Align2::LEFT_BOTTOM,
+            format_freq(freq),
+            font,
+            TEXT_COLOR,
+        );
+    } else {
+        painter.text(
+            Pos2::new(rect.right() - 4.0, rect.bottom() - 4.0),
+            Align2::RIGHT_BOTTOM,
+            format!(
+                "{}  {} {}",
+                format_freq(freq),
+                format_value(mapping.value_at(pos.y)),
+                opts.y_label
+            ),
+            font,
+            TEXT_COLOR,
+        );
     }
-
-    let (a_min, a_max) = (
-        to_axis(opts.log_y, view.y_min),
-        to_axis(opts.log_y, view.y_max),
-    );
-    let a = a_max - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64 * (a_max - a_min);
-    let value = from_axis(opts.log_y, a);
-    let (unit, scale) = si_unit(freq.abs());
-    painter.text(
-        Pos2::new(plot_rect.right() - 4.0, plot_rect.bottom() - 4.0),
-        Align2::RIGHT_BOTTOM,
-        format!(
-            "{:.3} {}  {} {}",
-            freq / scale,
-            unit,
-            format_value(value),
-            opts.y_label
-        ),
-        font,
-        TEXT_COLOR,
-    );
 }
 
 #[cfg(test)]
@@ -688,47 +727,12 @@ mod tests {
     }
 
     #[test]
-    fn first_tick_lands_on_grid() {
-        assert_eq!(first_tick(0.0, 10.0), 0.0);
-        assert_eq!(first_tick(3.0, 10.0), 10.0);
-        assert_eq!(first_tick(-25.0, 10.0), -20.0);
-    }
-
-    #[test]
-    fn format_freq_scales_and_decorates() {
-        assert_eq!(format_freq(2.4e9, "GHz", 1e9, 2), "2.40 GHz");
-        assert_eq!(format_freq(433e6, "MHz", 1e6, 0), "433 MHz");
-    }
-
-    #[test]
-    fn format_pow10_labels_decades() {
-        assert_eq!(format_pow10(0), "1");
-        assert_eq!(format_pow10(1), "10");
-        assert_eq!(format_pow10(2), "100");
-        assert_eq!(format_pow10(3), "1k");
-        assert_eq!(format_pow10(5), "100k");
-        assert_eq!(format_pow10(6), "1M");
-        assert_eq!(format_pow10(-2), "0.01");
-        assert_eq!(format_pow10(12), "1e12");
-    }
-
-    #[test]
     fn format_value_trims_and_switches_to_scientific() {
         assert_eq!(format_value(-50.0), "-50");
         assert_eq!(format_value(2.5), "2.5");
         assert_eq!(format_value(0.0), "0");
         assert_eq!(format_value(1.5e7), "1.500e7");
         assert_eq!(format_value(2.0e-4), "2.000e-4");
-    }
-
-    #[test]
-    fn axis_mapping_roundtrips() {
-        assert_eq!(to_axis(false, 42.0), 42.0);
-        assert_eq!(from_axis(false, 42.0), 42.0);
-        assert!((to_axis(true, 100.0) - 2.0).abs() < 1e-12);
-        assert!((from_axis(true, 2.0) - 100.0).abs() < 1e-9);
-        assert!(to_axis(true, 0.0).is_finite());
-        assert!(to_axis(true, -5.0).is_finite());
     }
 
     #[test]
@@ -740,89 +744,6 @@ mod tests {
         zoom_axis(&mut min, &mut max, 50.0, 1.0 / 0.9);
         assert!((min - 0.0).abs() < 1e-9);
         assert!((max - 100.0).abs() < 1e-9);
-    }
-
-    fn opts_with_points(points: &[(f64, f64)], log_y: bool) -> PlotOptions<'static> {
-        PlotOptions {
-            y_label: "dBm",
-            log_y,
-            series: vec![Series {
-                name: "T0",
-                color: Color32::WHITE,
-                points: points.to_vec(),
-            }],
-        }
-    }
-
-    #[test]
-    fn data_range_covers_points_with_headroom() {
-        let opts = opts_with_points(&[(1e6, -80.0), (2e6, -20.0)], false);
-        let (x0, x1, y0, y1) = data_range(&opts).unwrap();
-        assert_eq!((x0, x1), (1e6, 2e6));
-        assert_eq!(y0, -83.0);
-        assert_eq!(y1, -17.0);
-        assert!(data_range(&opts_with_points(&[], false)).is_none());
-    }
-
-    #[test]
-    fn data_range_skips_non_finite_samples() {
-        let opts = opts_with_points(&[(1e6, f64::NAN), (3e6, -50.0)], false);
-        let (x0, x1, _, _) = data_range(&opts).unwrap();
-        assert_eq!((x0, x1), (3e6, 3e6));
-    }
-
-    #[test]
-    fn data_range_log_mode_skips_non_positive_and_pads_decades() {
-        let opts = opts_with_points(&[(1e6, -5.0), (2e6, 0.0), (3e6, 10.0), (4e6, 1000.0)], true);
-        let (x0, x1, y0, y1) = data_range(&opts).unwrap();
-        assert_eq!((x0, x1), (3e6, 4e6));
-        assert!((y0.log10() - (1.0 - 0.1)).abs() < 1e-9);
-        assert!((y1.log10() - (3.0 + 0.1)).abs() < 1e-9);
-        assert!(data_range(&opts_with_points(&[(1e6, 0.0)], true)).is_none());
-    }
-
-    #[test]
-    fn fit_view_linear_covers_all_series_with_headroom() {
-        let opts = PlotOptions {
-            y_label: "dBm",
-            log_y: false,
-            series: vec![
-                Series {
-                    name: "T0",
-                    color: Color32::WHITE,
-                    points: vec![(1e6, -80.0), (2e6, -20.0)],
-                },
-                Series {
-                    name: "T1",
-                    color: Color32::WHITE,
-                    points: vec![(0.5e6, -60.0), (3e6, -40.0)],
-                },
-            ],
-        };
-        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
-        fit_view(&mut view, &opts);
-        assert_eq!((view.x_min, view.x_max), (0.5e6, 3e6));
-        assert_eq!(view.y_min, -83.0);
-        assert_eq!(view.y_max, -17.0);
-    }
-
-    #[test]
-    fn fit_view_log_pads_by_decades() {
-        let opts = opts_with_points(&[(1e6, 10.0), (2e6, 1000.0)], true);
-        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
-        fit_view(&mut view, &opts);
-        assert_eq!((view.x_min, view.x_max), (1e6, 2e6));
-        assert!((view.y_min.log10() - 0.9).abs() < 1e-9);
-        assert!((view.y_max.log10() - 3.1).abs() < 1e-9);
-    }
-
-    #[test]
-    fn fit_view_without_data_leaves_view_alone() {
-        let mut view = PlotView::new(1.0, 2.0, 3.0, 4.0);
-        fit_view(&mut view, &opts_with_points(&[], false));
-        assert_eq!(view, PlotView::new(1.0, 2.0, 3.0, 4.0));
-        fit_view(&mut view, &opts_with_points(&[(1e6, 0.0)], true));
-        assert_eq!(view, PlotView::new(1.0, 2.0, 3.0, 4.0));
     }
 
     #[test]
@@ -878,12 +799,325 @@ mod tests {
         assert_eq!(nearest_y(&all_bad, 1.0, false), None);
     }
 
+    fn options(points: &[(f64, f64)], log_x: bool) -> PlotOptions<'static> {
+        PlotOptions {
+            y_label: "ohm",
+            log_x,
+            series: vec![Series {
+                name: "X",
+                color: Color32::WHITE,
+                points: points.to_vec(),
+            }],
+        }
+    }
+
+    fn rect() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 400.0))
+    }
+
+    fn near(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= expected.abs().max(1.0) * 1e-6,
+            "{actual} != {expected}"
+        );
+    }
+
     #[test]
-    fn nearest_y_log_mode_skips_non_positive_points() {
-        let points = [(1.0, -10.0), (2.0, 0.0), (3.0, 30.0)];
-        assert_eq!(nearest_y(&points, 1.0, true), Some(30.0));
-        assert_eq!(nearest_y(&points, 2.0, true), Some(30.0));
-        // Linear mode keeps them drawable.
-        assert_eq!(nearest_y(&points, 1.0, false), Some(-10.0));
+    fn log_x_spaces_decades_equally_and_keeps_y_linear() {
+        let view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        let mapping = Mapping::new(&view, true, rect());
+        for (x, screen) in [(1e6, 0.0), (1e7, 200.0), (1e8, 400.0), (1e9, 600.0)] {
+            near(mapping.to_screen(x, 0.0).x as f64, screen);
+            near(mapping.frequency_at(screen as f32), x);
+        }
+        for (y, screen) in [(-100.0, 400.0), (0.0, 200.0), (100.0, 0.0)] {
+            near(mapping.to_screen(1e6, y).y as f64, screen);
+            near(mapping.value_at(screen as f32), y);
+        }
+        let view = PlotView::new(1e6, 1e8, -100.0, 100.0);
+        near(Mapping::new(&view, true, rect()).frequency_at(300.0), 1e7);
+        near(
+            Mapping::new(&view, false, rect()).frequency_at(300.0),
+            50.5e6,
+        );
+    }
+
+    #[test]
+    fn frequency_ticks_use_decades_and_actual_si_units() {
+        assert_eq!(
+            frequency_ticks(true, 1e6, 1e9),
+            [1e6, 2e6, 5e6, 1e7, 2e7, 5e7, 1e8, 2e8, 5e8, 1e9],
+        );
+        assert_eq!(format_freq(1e6), "1 MHz");
+        assert_eq!(format_freq(1e9), "1 GHz");
+        assert_eq!(format_freq(433.125e6), "433.125 MHz");
+        assert_eq!(frequency_ticks(false, 0.0, 100.0), linear_ticks(0.0, 100.0));
+        assert!(frequency_ticks(true, 0.0, 1e9).is_empty());
+    }
+
+    #[test]
+    fn narrow_log_zoom_still_has_distinct_frequency_ticks() {
+        for (min, max) in [
+            (433e6, 434e6),
+            (433e6, 433e6 + 10.0),
+            (6.8e9, 6.8e9 + 100.0),
+        ] {
+            let ticks = frequency_ticks(true, min, max);
+            assert!(ticks.len() >= 2);
+            assert!(ticks.iter().all(|x| (min..=max).contains(x)));
+            assert!(ticks.windows(2).all(|p| p[0] < p[1]));
+            let labels: Vec<_> = ticks.iter().map(|&x| format_freq(x)).collect();
+            assert!(labels.windows(2).all(|p| p[0] != p[1]));
+        }
+    }
+
+    #[test]
+    fn linear_ticks_normalize_zero_and_bound_iteration() {
+        let ticks = linear_ticks(-0.3, 0.3);
+        assert!(ticks.iter().any(|&x| x == 0.0 && !x.is_sign_negative()));
+        assert!(linear_ticks(1e20, 1e20 + 2e4).len() <= TARGET_DIVISIONS * 2 + 1);
+    }
+
+    #[test]
+    fn log_fit_keeps_signed_y_and_excludes_invalid_frequencies() {
+        let opts = options(
+            &[
+                (0.0, -900.0),
+                (-1.0, 900.0),
+                (1e6, -100.0),
+                (1e7, 0.0),
+                (1e8, 100.0),
+                (f64::NAN, 800.0),
+                (1e9, f64::NAN),
+            ],
+            true,
+        );
+        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!(view, PlotView::new(1e6, 1e8, -110.0, 110.0));
+    }
+
+    #[test]
+    fn linear_fit_keeps_dc_and_covers_all_series() {
+        let mut opts = options(&[(1e6, -80.0), (2e6, -20.0)], false);
+        opts.series.push(Series {
+            name: "T1",
+            color: Color32::WHITE,
+            points: vec![(0.0, -60.0), (f64::NAN, -200.0), (3e6, f64::NAN)],
+        });
+        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!(view, PlotView::new(0.0, 2e6, -83.0, -17.0));
+    }
+
+    #[test]
+    fn fit_handles_empty_zero_y_and_single_frequency_traces() {
+        let initial = PlotView::new(1.0, 2.0, 3.0, 4.0);
+        let mut view = initial;
+        fit_view(&mut view, &options(&[], false));
+        assert_eq!(view, initial);
+        fit_view(&mut view, &options(&[(0.0, 3.0), (-1.0, 2.0)], true));
+        assert_eq!(view, initial);
+        for log_x in [false, true] {
+            fit_view(&mut view, &options(&[(1e6, 0.0)], log_x));
+            assert!(view.x_min < 1e6 && view.x_max > 1e6);
+            assert_eq!((view.y_min, view.y_max), (-1.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn log_pan_is_multiplicative_in_x_and_additive_in_y() {
+        let mut view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        pan_view(&mut view, true, rect(), egui::vec2(-200.0, 100.0));
+        near(view.x_min, 1e7);
+        near(view.x_max, 1e10);
+        assert_eq!((view.y_min, view.y_max), (-50.0, 150.0));
+        pan_view(&mut view, true, rect(), egui::vec2(200.0, -100.0));
+        near(view.x_min, 1e6);
+        near(view.x_max, 1e9);
+        assert_eq!((view.y_min, view.y_max), (-100.0, 100.0));
+    }
+
+    #[test]
+    fn log_bounds_refuse_overflow_underflow_and_repair_dc_view() {
+        let initial = PlotView::new(1e6, 1e9, -100.0, 100.0);
+        let mut view = initial;
+        for (min, max) in [(-400.0, -350.0), (308.0, 310.0), (7.0, 7.0)] {
+            set_x_bounds(&mut view, true, min, max);
+            assert_eq!(view, initial);
+        }
+        view.x_min = 0.0;
+        ensure_x_view(
+            &mut view,
+            &options(&[(0.0, -100.0), (1e6, -50.0), (1e9, 0.0)], true),
+        );
+        assert_eq!((view.x_min, view.x_max), (1e6, 1e9));
+        view.x_min = 0.0;
+        view.x_max = 0.0;
+        ensure_x_view(&mut view, &options(&[], true));
+        assert!(view.x_min > 0.0 && view.x_max > view.x_min);
+    }
+
+    #[test]
+    fn nearest_y_uses_screen_distance_and_retains_negative_and_zero_y() {
+        let points = [(0.0, 300.0), (1e6, -100.0), (1e7, 0.0), (f64::NAN, 2.0)];
+        assert_eq!(nearest_y(&points, 5e6, true), Some(0.0));
+        assert_eq!(nearest_y(&points, 5e6, false), Some(-100.0));
+        assert_eq!(nearest_y(&points, 1e6, true), Some(-100.0));
+        assert_eq!(nearest_y(&points, 1e7, true), Some(0.0));
+        assert_eq!(nearest_y(&points, 0.0, true), None);
+        assert_eq!(nearest_y(&points, f64::NAN, false), None);
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut PlotView,
+        opts: &PlotOptions,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (ViewLock, Vec<Vec<Pos2>>) {
+        let mut lock = ViewLock::Unchanged;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect()),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| {
+                lock = show(ui, view, opts);
+            },
+        );
+        let paths = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Path(path) => Some(path.points.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        (lock, paths)
+    }
+
+    #[test]
+    fn rendered_log_trace_is_continuous_across_zero_y() {
+        let opts = options(&[(1e6, -100.0), (1e7, 0.0), (1e8, 100.0)], true);
+        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
+        fit_view(&mut view, &opts);
+        let (_, paths) = frame(&egui::Context::default(), &mut view, &opts, vec![], 0.0);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.len(), 3);
+        assert!(path.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+        near(path[1].x as f64, ((path[0].x + path[2].x) / 2.0) as f64);
+        near(path[1].y as f64, ((path[0].y + path[2].y) / 2.0) as f64);
+        assert!(path.windows(2).all(|p| p[0].y > p[1].y));
+    }
+
+    #[test]
+    fn invalid_samples_break_paths_without_clamping_frequencies() {
+        for invalid in [(0.0, 0.0), (-1.0, 0.0), (f64::NAN, 0.0), (3e6, f64::NAN)] {
+            let opts = options(
+                &[(1e6, -10.0), (2e6, 0.0), invalid, (4e6, 0.0), (5e6, 10.0)],
+                true,
+            );
+            let mut view = PlotView::new(1e6, 5e6, -10.0, 10.0);
+            let (_, paths) = frame(&egui::Context::default(), &mut view, &opts, vec![], 0.0);
+            assert_eq!(paths.len(), 2);
+            assert!(paths.iter().all(|p| p.len() == 2));
+        }
+    }
+
+    #[test]
+    fn wheel_modifiers_zoom_the_expected_axes_at_the_cursor() {
+        for log_x in [false, true] {
+            for modifiers in [
+                egui::Modifiers::NONE,
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::CTRL,
+                egui::Modifiers::COMMAND,
+            ] {
+                let opts = options(&[(1e6, -100.0), (1e9, 100.0)], log_x);
+                let original = PlotView::new(1e6, 1e9, -100.0, 100.0);
+                let mut view = original;
+                let ctx = egui::Context::default();
+                let cursor = Pos2::new(300.0, 200.0);
+                frame(&ctx, &mut view, &opts, vec![], 0.0);
+                frame(
+                    &ctx,
+                    &mut view,
+                    &opts,
+                    vec![egui::Event::PointerMoved(cursor)],
+                    0.02,
+                );
+                let (lock, _) = frame(
+                    &ctx,
+                    &mut view,
+                    &opts,
+                    vec![
+                        egui::Event::ModifiersChanged(modifiers),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: egui::vec2(0.0, 3.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers,
+                        },
+                    ],
+                    0.04,
+                );
+                assert_eq!(
+                    lock,
+                    ViewLock::Locked,
+                    "log_x={log_x}, modifiers={modifiers:?}"
+                );
+                assert_eq!(view.x_min != original.x_min, !modifiers.shift);
+                assert_eq!(
+                    view.y_min != original.y_min,
+                    modifiers.shift || modifiers.ctrl || modifiers.command
+                );
+                let plot_rect = Rect::from_min_max(
+                    Pos2::new(MARGIN_LEFT, MARGIN_TOP),
+                    Pos2::new(600.0 - MARGIN_RIGHT, 400.0 - MARGIN_BOTTOM),
+                );
+                let before = Mapping::new(&original, log_x, plot_rect);
+                let after = Mapping::new(&view, log_x, plot_rect);
+                near(after.frequency_at(cursor.x), before.frequency_at(cursor.x));
+                near(after.value_at(cursor.y), before.value_at(cursor.y));
+            }
+        }
+    }
+
+    #[test]
+    fn double_click_unlocks_and_fits_full_signed_trace() {
+        let opts = options(&[(1e6, -100.0), (1e9, 100.0)], true);
+        let mut view = PlotView::new(1e7, 1e8, -10.0, 10.0);
+        let ctx = egui::Context::default();
+        let cursor = Pos2::new(300.0, 200.0);
+        frame(&ctx, &mut view, &opts, vec![], 0.0);
+        frame(
+            &ctx,
+            &mut view,
+            &opts,
+            vec![egui::Event::PointerMoved(cursor)],
+            0.02,
+        );
+        let mut lock = ViewLock::Unchanged;
+        for (i, pressed) in [true, false, true, false].into_iter().enumerate() {
+            (lock, _) = frame(
+                &ctx,
+                &mut view,
+                &opts,
+                vec![egui::Event::PointerButton {
+                    pos: cursor,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                0.04 + i as f64 * 0.02,
+            );
+        }
+        assert_eq!(lock, ViewLock::Unlocked);
+        assert_eq!(view, PlotView::new(1e6, 1e9, -110.0, 110.0));
     }
 }

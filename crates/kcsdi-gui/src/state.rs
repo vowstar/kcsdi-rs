@@ -167,6 +167,8 @@ pub struct SpecState {
     pub points: u32,
     pub rbw: Rbw,
     pub ref_level_dbm: i32,
+    /// Logarithmic frequency axis for the spectrum plot.
+    pub log_x: bool,
     /// True while repeating sweeps are requested.
     pub running: bool,
     /// Latest completed sweep.
@@ -191,6 +193,7 @@ impl Default for SpecState {
             points: 201,
             rbw: Rbw::R10k,
             ref_level_dbm: -10,
+            log_x: false,
             running: false,
             trace: None,
             view: PlotView::new(start_hz, stop_hz, -100.0, 0.0),
@@ -226,9 +229,8 @@ pub struct S11State {
     pub points: u32,
     pub cal: Cal,
     pub display: S11Display,
-    /// Logarithmic Y axis for cartesian displays (extension over the
-    /// reference interface).
-    pub log_y: bool,
+    /// Logarithmic frequency axis for cartesian displays.
+    pub log_x: bool,
     /// Optional RBW pushed before the run (`$bw`).
     pub rbw: Option<Rbw>,
     /// True while repeating sweeps are requested.
@@ -260,7 +262,7 @@ impl Default for S11State {
             points: 201,
             cal: Cal::CalOff,
             display,
-            log_y: false,
+            log_x: false,
             rbw: None,
             running: false,
             trace: None,

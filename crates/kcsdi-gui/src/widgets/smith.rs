@@ -151,7 +151,7 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
     draw_grid(&clipped, &mapping);
 
     let points = trace_points(trace);
-    if points.is_empty() {
+    if !points.iter().any(|p| p.3.is_finite() && p.4.is_finite()) {
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -215,21 +215,24 @@ fn handle_input(ui: &egui::Ui, view: &mut SmithView, rect: Rect, response: &egui
     }
 }
 
-/// (freq_hz, R, X, gamma_u, gamma_v) for every usable sweep point.
+/// (freq_hz, R, X, gamma_u, gamma_v) for each sweep point. Invalid
+/// samples retain a non-finite gamma so the trace keeps its gaps.
 fn trace_points(trace: Option<&SweepData>) -> Vec<(f64, f64, f64, f64, f64)> {
     let mut out = Vec::new();
     let Some(data) = trace else {
         return out;
     };
+    if data.mode != kcsdi_core::protocol::StreamMode::S11 || data.format != "z" {
+        return out;
+    }
     for p in &data.points {
-        let [r, x] = match p.values.as_slice() {
-            [_, r, x, ..] => [*r, *x],
-            _ => continue,
+        let r = p.values.get(1).copied().unwrap_or(f64::NAN);
+        let x = p.values.get(2).copied().unwrap_or(f64::NAN);
+        let (u, v) = if p.freq_hz.is_finite() && r.is_finite() && x.is_finite() {
+            gamma_of(r, x, Z0)
+        } else {
+            (f64::NAN, f64::NAN)
         };
-        if !p.freq_hz.is_finite() || !r.is_finite() || !x.is_finite() {
-            continue;
-        }
-        let (u, v) = gamma_of(r, x, Z0);
         out.push((p.freq_hz, r, x, u, v));
     }
     out
@@ -306,11 +309,15 @@ fn draw_hover(
         return;
     }
     let (gu, gv) = mapping.to_gamma(pos);
-    let Some(&(freq, r, x, u, v)) = points.iter().min_by(|a, b| {
-        let da = (a.3 - gu).powi(2) + (a.4 - gv).powi(2);
-        let db = (b.3 - gu).powi(2) + (b.4 - gv).powi(2);
-        da.total_cmp(&db)
-    }) else {
+    let Some(&(freq, r, x, u, v)) = points
+        .iter()
+        .filter(|p| p.3.is_finite() && p.4.is_finite())
+        .min_by(|a, b| {
+            let da = (a.3 - gu).powi(2) + (a.4 - gv).powi(2);
+            let db = (b.3 - gu).powi(2) + (b.4 - gv).powi(2);
+            da.total_cmp(&db)
+        })
+    else {
         return;
     };
 
@@ -451,7 +458,7 @@ mod tests {
                 },
                 kcsdi_core::data::SweepPoint {
                     freq_hz: 2e6,
-                    values: vec![50.0], // too short, skipped
+                    values: vec![50.0], // too short, keeps a gap
                 },
                 kcsdi_core::data::SweepPoint {
                     freq_hz: 3e6,
@@ -460,10 +467,87 @@ mod tests {
             ],
         };
         let points = trace_points(Some(&data));
-        assert_eq!(points.len(), 2);
+        assert_eq!(points.len(), 3);
         assert!(approx(points[0].3, 0.0) && approx(points[0].4, 0.0));
-        assert!(approx(points[1].3, 0.0) && approx(points[1].4, 1.0));
+        assert!(points[1].3.is_nan() && points[1].4.is_nan());
+        assert!(approx(points[2].3, 0.0) && approx(points[2].4, 1.0));
         assert!(trace_points(None).is_empty());
+        let mut wrong_format = data;
+        wrong_format.format = "ma".to_string();
+        assert!(trace_points(Some(&wrong_format)).is_empty());
+    }
+
+    #[test]
+    fn invalid_smith_samples_break_paths_instead_of_joining_neighbors() {
+        use kcsdi_core::data::SweepPoint;
+        for invalid in [
+            SweepPoint {
+                freq_hz: 3e6,
+                values: vec![50.0],
+            },
+            SweepPoint {
+                freq_hz: 3e6,
+                values: vec![50.0, f64::NAN, 0.0],
+            },
+            SweepPoint {
+                freq_hz: f64::NAN,
+                values: vec![50.0, 50.0, 0.0],
+            },
+            SweepPoint {
+                freq_hz: 3e6,
+                values: vec![50.0, -50.0, 0.0],
+            },
+        ] {
+            let data = SweepData {
+                mode: kcsdi_core::protocol::StreamMode::S11,
+                format: "z".to_string(),
+                points: vec![
+                    SweepPoint {
+                        freq_hz: 1e6,
+                        values: vec![50.0, 50.0, -10.0],
+                    },
+                    SweepPoint {
+                        freq_hz: 2e6,
+                        values: vec![50.0, 50.0, 0.0],
+                    },
+                    invalid,
+                    SweepPoint {
+                        freq_hz: 4e6,
+                        values: vec![50.0, 50.0, 10.0],
+                    },
+                    SweepPoint {
+                        freq_hz: 5e6,
+                        values: vec![50.0, 50.0, 20.0],
+                    },
+                ],
+            };
+            let points = trace_points(Some(&data));
+            assert_eq!(points.len(), 5);
+            assert!(!points[2].3.is_finite() && !points[2].4.is_finite());
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    let mapping = Mapping::new(rect, &SmithView::default());
+                    draw_trace(ui.painter(), &mapping, &points);
+                },
+            );
+            let paths: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    Shape::Path(path) => Some(path),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(paths.len(), 2);
+            assert!(paths.iter().all(|path| path.points.len() == 2));
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 receiver_fields(ui, state);
             });
 
+            group_heading(ui, "DISPLAY");
+            if crate::widgets::plot::log_x_control(ui, &mut state.spec.log_x) {
+                state.spec.needs_fit = true;
+                state.spec.view_locked = false;
+            }
+
             ui.add_space(16.0);
             run_button(ui, state, running);
         });

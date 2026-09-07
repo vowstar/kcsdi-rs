@@ -60,6 +60,7 @@ pub struct Spec {
     /// Wire literal of the RBW (`Rbw::as_str`).
     pub rbw: String,
     pub ref_level_dbm: i32,
+    pub log_x: bool,
 }
 
 /// Last-used S11 sweep parameters and display settings.
@@ -74,8 +75,8 @@ pub struct S11 {
     /// Display format key ("phase", "return_loss", "vswr", "smith",
     /// "impedance").
     pub display: String,
-    /// Logarithmic Y axis for cartesian displays.
-    pub log_y: bool,
+    /// Logarithmic frequency axis for cartesian displays.
+    pub log_x: bool,
     /// Wire literal of the RBW (`Rbw::as_str`), or None for device default.
     pub rbw: Option<String>,
 }
@@ -144,6 +145,7 @@ impl Default for Spec {
             points: 201,
             rbw: "10k".to_string(),
             ref_level_dbm: -10,
+            log_x: false,
         }
     }
 }
@@ -156,7 +158,7 @@ impl Default for S11 {
             points: 201,
             cal: Cal::CalOff.as_str().to_string(),
             display: display_as_str(S11Display::default()).to_string(),
-            log_y: false,
+            log_x: false,
             rbw: None,
         }
     }
@@ -178,6 +180,7 @@ impl AppConfig {
                 points: state.spec.points,
                 rbw: state.spec.rbw.as_str().to_string(),
                 ref_level_dbm: state.spec.ref_level_dbm,
+                log_x: state.spec.log_x,
             },
             s11: S11 {
                 start_hz: state.s11.start_hz,
@@ -185,7 +188,7 @@ impl AppConfig {
                 points: state.s11.points,
                 cal: state.s11.cal.as_str().to_string(),
                 display: display_as_str(state.s11.display).to_string(),
-                log_y: state.s11.log_y,
+                log_x: state.s11.log_x,
                 rbw: state.s11.rbw.map(|rbw| rbw.as_str().to_string()),
             },
         }
@@ -204,6 +207,7 @@ impl AppConfig {
             state.spec.rbw = rbw;
         }
         state.spec.ref_level_dbm = self.spec.ref_level_dbm;
+        state.spec.log_x = self.spec.log_x;
         state.spec.start_stop_changed();
         state.s11.start_hz = self.s11.start_hz;
         state.s11.stop_hz = self.s11.stop_hz;
@@ -212,7 +216,7 @@ impl AppConfig {
             state.s11.cal = cal;
         }
         state.s11.display = parse_display(&self.s11.display);
-        state.s11.log_y = self.s11.log_y;
+        state.s11.log_x = self.s11.log_x;
         state.s11.rbw = self.s11.rbw.as_deref().and_then(|s| s.parse::<Rbw>().ok());
         state.s11.start_stop_changed();
     }
@@ -296,7 +300,7 @@ mod tests {
         assert_eq!(cfg.s11.points, 201);
         assert_eq!(cfg.s11.cal, "caloff");
         assert_eq!(cfg.s11.display, "return_loss");
-        assert!(!cfg.s11.log_y);
+        assert!(!cfg.s11.log_x);
         assert_eq!(cfg.s11.rbw, None);
     }
 
@@ -312,7 +316,7 @@ stop_hz = 900000000.0
 points = 401
 cal = "calon"
 display = "smith"
-log_y = true
+log_x = true
 rbw = "30k"
 "#;
         let cfg: AppConfig = toml::from_str(text).unwrap();
@@ -322,7 +326,7 @@ rbw = "30k"
         assert_eq!(cfg.s11.points, 401);
         assert_eq!(cfg.s11.cal, "calon");
         assert_eq!(cfg.s11.display, "smith");
-        assert!(cfg.s11.log_y);
+        assert!(cfg.s11.log_x);
         assert_eq!(cfg.s11.rbw.as_deref(), Some("30k"));
         // Serializing and parsing back preserves every field.
         let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
@@ -347,12 +351,13 @@ rbw = "30k"
         state.host = "analyzer.example.invalid".to_string();
         state.port = 5025;
         state.mode = AppMode::S11;
+        state.spec.log_x = true;
         state.s11.start_hz = 10e6;
         state.s11.stop_hz = 400e6;
         state.s11.points = 101;
         state.s11.cal = Cal::CalUser;
         state.s11.display = S11Display::Vswr;
-        state.s11.log_y = true;
+        state.s11.log_x = true;
         state.s11.rbw = Some(Rbw::R1k);
         state.s11.start_stop_changed();
         let cfg = AppConfig::from_state(&state);
@@ -362,14 +367,26 @@ rbw = "30k"
         assert_eq!(restored.port, 5025);
         assert_eq!(restored.spec.start_hz, state.spec.start_hz);
         assert_eq!(restored.spec.center_hz, state.spec.center_hz);
+        assert!(restored.spec.log_x);
         assert_eq!(restored.mode, AppMode::S11);
         assert_eq!(restored.s11.start_hz, state.s11.start_hz);
         assert_eq!(restored.s11.center_hz, state.s11.center_hz);
         assert_eq!(restored.s11.points, 101);
         assert_eq!(restored.s11.cal, Cal::CalUser);
         assert_eq!(restored.s11.display, S11Display::Vswr);
-        assert!(restored.s11.log_y);
+        assert!(restored.s11.log_x);
         assert_eq!(restored.s11.rbw, Some(Rbw::R1k));
+    }
+
+    #[test]
+    fn legacy_y_log_setting_does_not_enable_frequency_log() {
+        let cfg: AppConfig = toml::from_str("[s11]\nlog_y = true\n").unwrap();
+        assert!(!cfg.spec.log_x);
+        assert!(!cfg.s11.log_x);
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!saved.contains("log_y"));
+        let parsed: AppConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg, parsed);
     }
 
     #[test]

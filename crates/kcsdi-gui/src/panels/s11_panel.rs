@@ -35,9 +35,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 sweep_fields(ui, state);
                 ui.add_space(8.0);
                 receiver_fields(ui, state);
-                ui.add_space(8.0);
-                display_fields(ui, state);
             });
+            ui.add_space(8.0);
+            display_fields(ui, state);
 
             ui.add_space(16.0);
             run_button(ui, state, running);
@@ -48,6 +48,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 /// Segmented display-format selector: Phase / Return Loss / VSWR / Smith /
 /// Impedance. Switching re-fits the view because the Y range changes.
 fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
+    let previous = state.s11.display;
     ui.horizontal_wrapped(|ui| {
         for display in S11Display::ALL {
             if ui
@@ -56,9 +57,21 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
             {
                 state.s11.needs_fit = true;
                 state.s11.view_locked = false;
+                let (y_min, y_max) = display.default_y();
+                state
+                    .s11
+                    .view
+                    .reset(state.s11.start_hz, state.s11.stop_hz, y_min, y_max);
             }
         }
     });
+    if previous.wire_format() != state.s11.display.wire_format() {
+        if state.s11.running {
+            state.send(WorkerCommand::RunS11(state.s11.s11_params()));
+        } else {
+            state.status_message = Some("Run a sweep for this display".to_string());
+        }
+    }
 }
 
 /// START/STOP/CENTER/SPAN frequency fields plus the POINTS count.
@@ -131,12 +144,11 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-/// LOG Y toggle, only meaningful for cartesian formats.
+/// Frequency-axis display control, independent of sweep sampling.
 fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
     group_heading(ui, "DISPLAY");
-    let cartesian = state.s11.display != S11Display::Smith;
-    ui.add_enabled_ui(cartesian, |ui| {
-        if ui.checkbox(&mut state.s11.log_y, "LOG Y").changed() {
+    ui.add_enabled_ui(state.s11.display != S11Display::Smith, |ui| {
+        if crate::widgets::plot::log_x_control(ui, &mut state.s11.log_x) {
             state.s11.needs_fit = true;
             state.s11.view_locked = false;
         }

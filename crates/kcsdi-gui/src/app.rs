@@ -144,6 +144,11 @@ fn cartesian_series(
     let Some(trace) = trace else {
         return Vec::new();
     };
+    if trace.mode != kcsdi_core::protocol::StreamMode::S11
+        || trace.format != display.wire_format().as_str()
+    {
+        return Vec::new();
+    }
     let column = |name: &'static str, i: usize, color: egui::Color32| widgets::plot::Series {
         name,
         color,
@@ -213,7 +218,7 @@ impl eframe::App for KcsdiApp {
                     .collect();
                 let opts = widgets::plot::PlotOptions {
                     y_label: "dBm",
-                    log_y: false,
+                    log_x: spec.log_x,
                     series,
                 };
                 if spec.needs_fit && !spec.view_locked && spec.trace.is_some() {
@@ -236,7 +241,7 @@ impl eframe::App for KcsdiApp {
                         let series = cartesian_series(display, s11.trace.as_ref());
                         let opts = widgets::plot::PlotOptions {
                             y_label: display.y_label(),
-                            log_y: s11.log_y,
+                            log_x: s11.log_x,
                             series,
                         };
                         if s11.needs_fit && !s11.view_locked && s11.trace.is_some() {
@@ -260,5 +265,51 @@ impl eframe::App for KcsdiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_config();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kcsdi_core::data::{SweepData, SweepPoint};
+    use kcsdi_core::protocol::StreamMode;
+
+    #[test]
+    fn format_changes_do_not_reinterpret_old_impedance_columns() {
+        let mut data = SweepData {
+            mode: StreamMode::S11,
+            format: "z".to_string(),
+            points: vec![SweepPoint {
+                freq_hz: 1e6,
+                values: vec![50.0, 30.0, -40.0],
+            }],
+        };
+        let series = cartesian_series(S11Display::Impedance, Some(&data));
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[2].points, vec![(1e6, -40.0)]);
+        for display in [S11Display::Phase, S11Display::ReturnLoss, S11Display::Vswr] {
+            assert!(cartesian_series(display, Some(&data)).is_empty());
+        }
+        data.mode = StreamMode::S21;
+        assert!(cartesian_series(S11Display::Impedance, Some(&data)).is_empty());
+    }
+
+    #[test]
+    fn phase_and_return_loss_keep_signed_measurement_values() {
+        for (display, format, values, expected) in [
+            (S11Display::Phase, "ma", vec![0.5, -90.0], -90.0),
+            (S11Display::ReturnLoss, "loss", vec![-3.0], -3.0),
+        ] {
+            let data = SweepData {
+                mode: StreamMode::S11,
+                format: format.to_string(),
+                points: vec![SweepPoint {
+                    freq_hz: 1e6,
+                    values,
+                }],
+            };
+            let series = cartesian_series(display, Some(&data));
+            assert_eq!(series[0].points, vec![(1e6, expected)]);
+        }
     }
 }
