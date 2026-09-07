@@ -46,7 +46,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Segmented display-format selector: Phase / Return Loss / VSWR / Smith /
-/// Impedance. Switching resets the view because the Y range changes.
+/// Impedance. Switching re-fits the view because the Y range changes.
 fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal_wrapped(|ui| {
         for display in S11Display::ALL {
@@ -54,7 +54,8 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
                 .selectable_value(&mut state.s11.display, display, display.label())
                 .changed()
             {
-                state.s11.reset_view();
+                state.s11.needs_fit = true;
+                state.s11.view_locked = false;
             }
         }
     });
@@ -135,7 +136,10 @@ fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
     group_heading(ui, "DISPLAY");
     let cartesian = state.s11.display != S11Display::Smith;
     ui.add_enabled_ui(cartesian, |ui| {
-        ui.checkbox(&mut state.s11.log_y, "LOG Y");
+        if ui.checkbox(&mut state.s11.log_y, "LOG Y").changed() {
+            state.s11.needs_fit = true;
+            state.s11.view_locked = false;
+        }
     });
 }
 
@@ -153,7 +157,8 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
         if ui.add_sized(size, button).clicked() {
             state.send(WorkerCommand::RunS11(state.s11.s11_params()));
             state.s11.running = true;
-            state.s11.reset_view();
+            state.s11.needs_fit = true;
+            state.s11.view_locked = false;
         }
     }
 }

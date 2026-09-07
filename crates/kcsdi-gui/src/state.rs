@@ -173,6 +173,10 @@ pub struct SpecState {
     pub trace: Option<SweepData>,
     /// Plot viewport (frequency x level), owned by the plot widget.
     pub view: PlotView,
+    /// Fit the view to the next trace (set on run and on new data).
+    pub needs_fit: bool,
+    /// User adjusted the view manually; auto-fit stays off.
+    pub view_locked: bool,
 }
 
 impl Default for SpecState {
@@ -190,6 +194,8 @@ impl Default for SpecState {
             running: false,
             trace: None,
             view: PlotView::new(start_hz, stop_hz, -100.0, 0.0),
+            needs_fit: true,
+            view_locked: false,
         }
     }
 }
@@ -233,6 +239,11 @@ pub struct S11State {
     pub view: PlotView,
     /// Smith chart viewport.
     pub smith: SmithView,
+    /// Fit the view to the next trace (set on run, display change, and
+    /// new data).
+    pub needs_fit: bool,
+    /// User adjusted the view manually; auto-fit stays off.
+    pub view_locked: bool,
 }
 
 impl Default for S11State {
@@ -255,6 +266,8 @@ impl Default for S11State {
             trace: None,
             view: PlotView::new(start_hz, stop_hz, y_min, y_max),
             smith: SmithView::default(),
+            needs_fit: true,
+            view_locked: false,
         }
     }
 }
@@ -272,12 +285,6 @@ impl S11State {
             stop_hz: self.stop_hz as u64,
             rbw: self.rbw,
         }
-    }
-
-    /// Reset the cartesian view to the current sweep and display range.
-    pub fn reset_view(&mut self) {
-        let (y_min, y_max) = self.display.default_y();
-        self.view.reset(self.start_hz, self.stop_hz, y_min, y_max);
     }
 }
 

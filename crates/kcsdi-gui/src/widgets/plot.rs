@@ -13,7 +13,9 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind
 
 /// One drawn trace.
 #[derive(Debug, Clone)]
-pub struct Series {
+pub struct Series<'a> {
+    /// Trace name, shown in the legend when several series share a plot.
+    pub name: &'a str,
     pub color: egui::Color32,
     /// (x, y) data points; non-finite values break the polyline. In
     /// log-Y mode non-positive values also break it.
@@ -26,7 +28,32 @@ pub struct PlotOptions<'a> {
     pub y_label: &'a str,
     /// Logarithmic Y axis (base 10). Non-positive values are skipped.
     pub log_y: bool,
-    pub series: Vec<Series>,
+    pub series: Vec<Series<'a>>,
+}
+
+/// What the user did to the view during one [`show`] frame. Reports
+/// whether the view still tracks the data (auto-fit) or the user took
+/// manual control of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewLock {
+    /// No view interaction happened this frame.
+    Unchanged,
+    /// Wheel zoom or drag pan: the user owns the view now.
+    Locked,
+    /// Double-click reset: the view tracks the full data range again.
+    Unlocked,
+}
+
+impl ViewLock {
+    /// Combine two reports from the same frame, keeping the stronger
+    /// one: Locked > Unlocked > Unchanged.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Locked, _) | (_, Self::Locked) => Self::Locked,
+            (Self::Unlocked, _) | (_, Self::Unlocked) => Self::Unlocked,
+            _ => Self::Unchanged,
+        }
+    }
 }
 
 /// Visible data range of the plot (x x y, in data units).
@@ -182,21 +209,32 @@ fn format_value(v: f64) -> String {
     }
 }
 
-/// Draw the plot into the available space. Signature is a module
-/// contract; do not change it.
-pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) {
+/// Reset `view` to cover all series data, with the same headroom rules
+/// as the double-click reset (5% of the span in linear mode, 5% of the
+/// decade span in log mode, positive values only there). Does nothing
+/// when there is no usable data.
+pub fn fit_view(view: &mut PlotView, opts: &PlotOptions) {
+    if let Some((x_min, x_max, y_min, y_max)) = data_range(opts) {
+        view.reset(x_min, x_max, y_min, y_max);
+    }
+}
+
+/// Draw the plot into the available space and report how the user
+/// interacted with the view this frame. Signature is a module contract;
+/// do not change it.
+pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewLock {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_LEFT, rect.top() + MARGIN_TOP),
         Pos2::new(rect.right() - MARGIN_RIGHT, rect.bottom() - MARGIN_BOTTOM),
     );
 
-    handle_input(ui, view, opts, plot_rect, &response);
+    let lock = handle_input(ui, view, opts, plot_rect, &response);
 
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, BG_COLOR);
     if plot_rect.width() < 2.0 || plot_rect.height() < 2.0 {
-        return;
+        return lock;
     }
 
     draw_grid(painter, view, opts, plot_rect);
@@ -218,18 +256,21 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) {
     }
 
     draw_cursor(painter, view, opts, plot_rect, &response);
+    lock
 }
 
 /// Wheel zoom (10% per step, anchored at the cursor; Shift selects the Y
 /// axis), drag pan, and double-click reset, per reference UI analysis section 5.
 /// Y math happens in axis space so log mode zooms/pans by decades.
+/// Returns the frame's [`ViewLock`] report.
 fn handle_input(
     ui: &egui::Ui,
     view: &mut PlotView,
     opts: &PlotOptions,
     plot_rect: Rect,
     response: &egui::Response,
-) {
+) -> ViewLock {
+    let mut lock = ViewLock::Unchanged;
     let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
     if scroll != 0.0
         && response.hovered()
@@ -254,6 +295,7 @@ fn handle_input(
                     * (view.x_max - view.x_min);
             zoom_axis(&mut view.x_min, &mut view.x_max, anchor, factor);
         }
+        lock = lock.merge(ViewLock::Locked);
     }
 
     if response.dragged() {
@@ -272,13 +314,14 @@ fn handle_input(
             view.y_min = from_axis(opts.log_y, a_min);
             view.y_max = from_axis(opts.log_y, a_max);
         }
+        lock = lock.merge(ViewLock::Locked);
     }
 
-    if response.double_clicked()
-        && let Some((x_min, x_max, y_min, y_max)) = data_range(opts)
-    {
-        view.reset(x_min, x_max, y_min, y_max);
+    if response.double_clicked() && data_range(opts).is_some() {
+        fit_view(view, opts);
+        lock = lock.merge(ViewLock::Unlocked);
     }
+    lock
 }
 
 /// Zoom one axis around `anchor`, refusing to collapse below MIN_SPAN.
@@ -444,21 +487,32 @@ fn draw_series(painter: &egui::Painter, view: &PlotView, log_y: bool, series: &S
     }
 }
 
-/// Series key: the shared y_label sits at the top left already, so this
-/// only draws per-series color swatches at the top right when more than
-/// one series is on screen (series carry no names).
+/// Series key: with a single series the shared y_label at the top left
+/// is enough; with several series this draws one row per series at the
+/// top right (color swatch plus name).
 fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
     if opts.series.len() < 2 {
         return;
     }
-    let mut x = plot_rect.right() - 16.0;
-    let y = plot_rect.top() + 8.0;
-    for series in opts.series.iter().rev() {
+    let font = FontId::monospace(LABEL_FONT_SIZE);
+    let mut y = plot_rect.top() + 2.0;
+    for series in &opts.series {
+        painter.text(
+            Pos2::new(plot_rect.right() - 18.0, y),
+            Align2::RIGHT_TOP,
+            series.name,
+            font.clone(),
+            TEXT_COLOR,
+        );
+        let cy = y + LABEL_FONT_SIZE / 2.0 + 1.0;
         painter.line_segment(
-            [Pos2::new(x - 12.0, y), Pos2::new(x, y)],
+            [
+                Pos2::new(plot_rect.right() - 14.0, cy),
+                Pos2::new(plot_rect.right() - 4.0, cy),
+            ],
             Stroke::new(2.0, series.color),
         );
-        x -= 20.0;
+        y += LABEL_FONT_SIZE + 4.0;
     }
 }
 
@@ -613,6 +667,7 @@ mod tests {
             y_label: "dBm",
             log_y,
             series: vec![Series {
+                name: "T0",
                 color: Color32::WHITE,
                 points: points.to_vec(),
             }],
@@ -644,5 +699,63 @@ mod tests {
         assert!((y0.log10() - (1.0 - 0.1)).abs() < 1e-9);
         assert!((y1.log10() - (3.0 + 0.1)).abs() < 1e-9);
         assert!(data_range(&opts_with_points(&[(1e6, 0.0)], true)).is_none());
+    }
+
+    #[test]
+    fn fit_view_linear_covers_all_series_with_headroom() {
+        let opts = PlotOptions {
+            y_label: "dBm",
+            log_y: false,
+            series: vec![
+                Series {
+                    name: "T0",
+                    color: Color32::WHITE,
+                    points: vec![(1e6, -80.0), (2e6, -20.0)],
+                },
+                Series {
+                    name: "T1",
+                    color: Color32::WHITE,
+                    points: vec![(0.5e6, -60.0), (3e6, -40.0)],
+                },
+            ],
+        };
+        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!((view.x_min, view.x_max), (0.5e6, 3e6));
+        assert_eq!(view.y_min, -83.0);
+        assert_eq!(view.y_max, -17.0);
+    }
+
+    #[test]
+    fn fit_view_log_pads_by_decades() {
+        let opts = opts_with_points(&[(1e6, 10.0), (2e6, 1000.0)], true);
+        let mut view = PlotView::new(0.0, 1.0, 0.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!((view.x_min, view.x_max), (1e6, 2e6));
+        assert!((view.y_min.log10() - 0.9).abs() < 1e-9);
+        assert!((view.y_max.log10() - 3.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_view_without_data_leaves_view_alone() {
+        let mut view = PlotView::new(1.0, 2.0, 3.0, 4.0);
+        fit_view(&mut view, &opts_with_points(&[], false));
+        assert_eq!(view, PlotView::new(1.0, 2.0, 3.0, 4.0));
+        fit_view(&mut view, &opts_with_points(&[(1e6, 0.0)], true));
+        assert_eq!(view, PlotView::new(1.0, 2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn view_lock_merge_keeps_the_stronger_report() {
+        use ViewLock::*;
+        assert_eq!(Unchanged.merge(Unchanged), Unchanged);
+        assert_eq!(Unchanged.merge(Locked), Locked);
+        assert_eq!(Unchanged.merge(Unlocked), Unlocked);
+        assert_eq!(Unlocked.merge(Locked), Locked);
+        // A double-click followed by a drag in one frame stays Locked.
+        assert_eq!(Unchanged.merge(Unlocked).merge(Locked), Locked);
+        // A drag followed by a double-click in one frame stays Locked.
+        assert_eq!(Unchanged.merge(Locked).merge(Unlocked), Locked);
+        assert_eq!(Unlocked.merge(Unlocked), Unlocked);
     }
 }

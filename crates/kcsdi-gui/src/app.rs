@@ -89,8 +89,14 @@ impl KcsdiApp {
             WorkerEvent::SweepTrace(data) => {
                 use kcsdi_core::protocol::StreamMode;
                 match data.mode {
-                    StreamMode::Spec => self.state.spec.trace = Some(data),
-                    StreamMode::S11 => self.state.s11.trace = Some(data),
+                    StreamMode::Spec => {
+                        self.state.spec.needs_fit = true;
+                        self.state.spec.trace = Some(data);
+                    }
+                    StreamMode::S11 => {
+                        self.state.s11.needs_fit = true;
+                        self.state.s11.trace = Some(data);
+                    }
                     _ => {}
                 }
             }
@@ -134,11 +140,12 @@ impl KcsdiApp {
 fn cartesian_series(
     display: S11Display,
     trace: Option<&kcsdi_core::data::SweepData>,
-) -> Vec<widgets::plot::Series> {
+) -> Vec<widgets::plot::Series<'static>> {
     let Some(trace) = trace else {
         return Vec::new();
     };
-    let column = |i: usize, color: egui::Color32| widgets::plot::Series {
+    let column = |name: &'static str, i: usize, color: egui::Color32| widgets::plot::Series {
+        name,
         color,
         points: trace
             .points
@@ -147,12 +154,13 @@ fn cartesian_series(
             .collect(),
     };
     match display {
-        S11Display::Phase => vec![column(1, theme::TRACE_COLORS[0])],
-        S11Display::ReturnLoss | S11Display::Vswr => vec![column(0, theme::TRACE_COLORS[0])],
+        S11Display::Phase => vec![column("Phase", 1, theme::TRACE_COLORS[0])],
+        S11Display::ReturnLoss => vec![column("RL", 0, theme::TRACE_COLORS[0])],
+        S11Display::Vswr => vec![column("VSWR", 0, theme::TRACE_COLORS[0])],
         S11Display::Impedance => vec![
-            column(0, theme::TRACE_COLORS[0]),
-            column(1, theme::TRACE_COLORS[1]),
-            column(2, theme::TRACE_COLORS[2]),
+            column("|Z|", 0, theme::TRACE_COLORS[0]),
+            column("R", 1, theme::TRACE_COLORS[1]),
+            column("X", 2, theme::TRACE_COLORS[2]),
         ],
         S11Display::Smith => Vec::new(),
     }
@@ -193,6 +201,7 @@ impl eframe::App for KcsdiApp {
                     .trace
                     .as_ref()
                     .map(|t| widgets::plot::Series {
+                        name: "Level",
                         color: theme::TRACE_COLORS[0],
                         points: t
                             .points
@@ -207,7 +216,15 @@ impl eframe::App for KcsdiApp {
                     log_y: false,
                     series,
                 };
-                widgets::plot::show(ui, &mut spec.view, &opts);
+                if spec.needs_fit && !spec.view_locked && spec.trace.is_some() {
+                    widgets::plot::fit_view(&mut spec.view, &opts);
+                    spec.needs_fit = false;
+                }
+                match widgets::plot::show(ui, &mut spec.view, &opts) {
+                    widgets::plot::ViewLock::Locked => spec.view_locked = true,
+                    widgets::plot::ViewLock::Unlocked => spec.view_locked = false,
+                    widgets::plot::ViewLock::Unchanged => {}
+                }
             }
             AppMode::S11 => {
                 let s11 = &mut self.state.s11;
@@ -222,7 +239,15 @@ impl eframe::App for KcsdiApp {
                             log_y: s11.log_y,
                             series,
                         };
-                        widgets::plot::show(ui, &mut s11.view, &opts);
+                        if s11.needs_fit && !s11.view_locked && s11.trace.is_some() {
+                            widgets::plot::fit_view(&mut s11.view, &opts);
+                            s11.needs_fit = false;
+                        }
+                        match widgets::plot::show(ui, &mut s11.view, &opts) {
+                            widgets::plot::ViewLock::Locked => s11.view_locked = true,
+                            widgets::plot::ViewLock::Unlocked => s11.view_locked = false,
+                            widgets::plot::ViewLock::Unchanged => {}
+                        }
                     }
                 }
             }

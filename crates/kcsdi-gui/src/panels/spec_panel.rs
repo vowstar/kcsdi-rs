@@ -112,12 +112,9 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
         if ui.add_sized(size, button).clicked() {
             state.send(WorkerCommand::RunSpec(state.spec.spec_params()));
             state.spec.running = true;
-            // Follow the new sweep range; keep the current level range.
-            let (y_min, y_max) = (state.spec.view.y_min, state.spec.view.y_max);
-            state
-                .spec
-                .view
-                .reset(state.spec.start_hz, state.spec.stop_hz, y_min, y_max);
+            // Auto-fit the view to the incoming sweep data.
+            state.spec.needs_fit = true;
+            state.spec.view_locked = false;
         }
     }
 }
