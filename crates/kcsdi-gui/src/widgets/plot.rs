@@ -259,10 +259,13 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) -> ViewL
     lock
 }
 
-/// Wheel zoom (10% per step, anchored at the cursor; Shift selects the Y
-/// axis), drag pan, and double-click reset, per reference UI analysis section 5.
-/// Y math happens in axis space so log mode zooms/pans by decades.
-/// Returns the frame's [`ViewLock`] report.
+/// Wheel zoom (10% per step, anchored at the cursor): plain wheel zooms
+/// X, Shift+wheel zooms Y, Ctrl+wheel zooms both axes (Steinberg-style
+/// analyzer convention). Shift+wheel arrives as a horizontal scroll
+/// delta on most platforms, so the dominant component is used when a
+/// modifier is held. Drag pans, double-click resets, per reference UI
+/// analysis section 5. Y math happens in axis space so log mode
+/// zooms/pans by decades. Returns the frame's [`ViewLock`] report.
 fn handle_input(
     ui: &egui::Ui,
     view: &mut PlotView,
@@ -271,15 +274,26 @@ fn handle_input(
     response: &egui::Response,
 ) -> ViewLock {
     let mut lock = ViewLock::Unchanged;
-    let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+    let (delta, modifiers) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.modifiers));
+    let zoom_y_only = modifiers.shift;
+    let zoom_both = modifiers.ctrl || modifiers.command;
+    let scroll = if zoom_y_only || zoom_both {
+        // Modifier-held wheel often arrives as horizontal scroll.
+        if delta.x.abs() > delta.y.abs() {
+            delta.x
+        } else {
+            delta.y
+        }
+    } else {
+        delta.y
+    };
     if scroll != 0.0
         && response.hovered()
         && let Some(pos) = response.hover_pos()
         && plot_rect.contains(pos)
     {
         let factor = if scroll > 0.0 { 0.9 } else { 1.0 / 0.9 };
-        let shift = ui.ctx().input(|i| i.modifiers.shift);
-        if shift {
+        if zoom_y_only || zoom_both {
             let (mut a_min, mut a_max) = (
                 to_axis(opts.log_y, view.y_min),
                 to_axis(opts.log_y, view.y_max),
@@ -289,7 +303,8 @@ fn handle_input(
             zoom_axis(&mut a_min, &mut a_max, anchor, factor);
             view.y_min = from_axis(opts.log_y, a_min);
             view.y_max = from_axis(opts.log_y, a_max);
-        } else {
+        }
+        if !zoom_y_only {
             let anchor = view.x_min
                 + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64
                     * (view.x_max - view.x_min);

@@ -166,9 +166,20 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
 }
 
 /// Wheel zoom anchored at the cursor, drag pan, double-click reset,
-/// per reference UI analysis section 5.
+/// per reference UI analysis section 5. A held Shift makes some
+/// platforms report the wheel as horizontal scroll, so the dominant
+/// delta component is used in that case.
 fn handle_input(ui: &egui::Ui, view: &mut SmithView, rect: Rect, response: &egui::Response) {
-    let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+    let (delta, modifiers) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.modifiers));
+    let scroll = if modifiers.shift {
+        if delta.x.abs() > delta.y.abs() {
+            delta.x
+        } else {
+            delta.y
+        }
+    } else {
+        delta.y
+    };
     if scroll != 0.0
         && response.hovered()
         && let Some(pos) = response.hover_pos()
