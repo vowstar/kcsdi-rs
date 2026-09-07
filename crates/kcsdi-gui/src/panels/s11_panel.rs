@@ -7,16 +7,11 @@ use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
 use crate::i18n::{Language, StatusMessage, Text};
-use crate::state::{AppState, ConnectionState, S11Display, WorkerCommand};
-use crate::theme::PRIMARY;
+use crate::state::{AppState, ConnectionState, DEVICE_MODEL, S11Display, WorkerCommand};
+
+use super::sweep_controls::{self, SweepEdit, SweepFields, group_heading};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xd3, 0x2f, 0x2f);
-
-/// Upper frequency bound for input fields in MHz (KC901V tops at 6.8 GHz).
-const MAX_MHZ: f64 = 6800.0;
-
-/// Calibration choices in display order (no `Cal::ALL` in core).
-const CALS: [Cal; 4] = [Cal::CalOn, Cal::CalOff, Cal::CalSys, Cal::CalUser];
 
 fn cal_label(cal: Cal, language: Language) -> &'static str {
     language.text(match cal {
@@ -81,7 +76,14 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
     });
     if previous.wire_format() != state.s11.display.wire_format() {
         if state.s11.running {
-            state.send(WorkerCommand::RunS11(state.s11.s11_params()));
+            match state.s11.s11_params() {
+                Ok(params) => state.send(WorkerCommand::RunS11(params)),
+                Err(error) => {
+                    state.s11.running = false;
+                    state.send(WorkerCommand::StopSweep);
+                    state.status_message = Some(error.to_string().into());
+                }
+            }
         } else {
             state.status_message = Some(StatusMessage::Text(Text::RunForDisplay));
         }
@@ -90,35 +92,19 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// START/STOP/CENTER/SPAN frequency fields plus the POINTS count.
 fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
-    let mut start_stop_edited = false;
-    let mut center_span_edited = false;
-
-    egui::Grid::new("s11_sweep_grid")
-        .num_columns(2)
-        .spacing([8.0, 8.0])
-        .show(ui, |ui| {
-            let s11 = &mut state.s11;
-            ui.label(state.language.text(Text::Start));
-            start_stop_edited |= freq_field(ui, &mut s11.start_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Stop));
-            start_stop_edited |= freq_field(ui, &mut s11.stop_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Center));
-            center_span_edited |= freq_field(ui, &mut s11.center_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Span));
-            center_span_edited |= freq_field(ui, &mut s11.span_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Points));
-            ui.add(egui::DragValue::new(&mut s11.points).range(2..=10001));
-            ui.end_row();
-        });
-
-    if start_stop_edited {
-        state.s11.start_stop_changed();
-    } else if center_span_edited {
-        state.s11.center_span_changed();
+    let s11 = &mut state.s11;
+    let edit = SweepFields {
+        start: &mut s11.start_hz,
+        stop: &mut s11.stop_hz,
+        center: &mut s11.center_hz,
+        span: &mut s11.span_hz,
+        points: &mut s11.points,
+    }
+    .show(ui, DEVICE_MODEL.capabilities().s11.range, state.language);
+    match edit {
+        SweepEdit::StartStop => s11.start_stop_changed(),
+        SweepEdit::CenterSpan => s11.center_span_changed(),
+        SweepEdit::None => {}
     }
 }
 
@@ -134,7 +120,7 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
             egui::ComboBox::from_id_salt("s11_cal")
                 .selected_text(cal_label(s11.cal, state.language))
                 .show_ui(ui, |ui| {
-                    for cal in CALS {
+                    for &cal in DEVICE_MODEL.capabilities().s11_calibrations() {
                         ui.selectable_value(&mut s11.cal, cal, cal_label(cal, state.language))
                             .on_hover_text(cal.as_str());
                     }
@@ -153,7 +139,7 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
                 egui::ComboBox::from_id_salt("s11_rbw")
                     .selected_text(rbw.to_string())
                     .show_ui(ui, |ui| {
-                        for value in Rbw::ALL {
+                        for &value in DEVICE_MODEL.capabilities().rbw_list {
                             ui.selectable_value(rbw, value, value.to_string());
                         }
                     });
@@ -184,43 +170,12 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
             state.s11.running = false;
             state.send(WorkerCommand::StopSweep);
         }
-    } else {
-        let button =
-            egui::Button::new(egui::RichText::new(state.language.text(Text::Run)).strong())
-                .fill(PRIMARY);
-        if ui.add_sized(size, button).clicked() {
-            state.send(WorkerCommand::RunS11(state.s11.s11_params()));
-            state.s11.running = true;
-            state.s11.needs_fit = true;
-            state.s11.view_locked = false;
-        }
+    } else if let Some(params) =
+        sweep_controls::run_button(ui, state.s11.s11_params(), state.language)
+    {
+        state.send(WorkerCommand::RunS11(params));
+        state.s11.running = true;
+        state.s11.needs_fit = true;
+        state.s11.view_locked = false;
     }
-}
-
-/// Centered uppercase group header matching the reference menu groups.
-fn group_heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(text).strong().small());
-    });
-    ui.separator();
-}
-
-/// Frequency input in MHz over an `f64` value in Hz. Returns true when the
-/// value changed this frame.
-fn freq_field(ui: &mut egui::Ui, hz: &mut f64) -> bool {
-    let mut mhz = *hz / 1e6;
-    let changed = ui
-        .add(
-            egui::DragValue::new(&mut mhz)
-                .speed(0.1)
-                .range(0.0..=MAX_MHZ)
-                .suffix(" MHz")
-                .max_decimals(3),
-        )
-        .changed();
-    if changed {
-        *hz = mhz * 1e6;
-    }
-    changed
 }

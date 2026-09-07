@@ -3,16 +3,12 @@
 
 //! Right column: SPEC sweep parameters and run control.
 
-use kcsdi_core::model::Rbw;
-
 use crate::i18n::Text;
-use crate::state::{AppState, ConnectionState, WorkerCommand};
-use crate::theme::PRIMARY;
+use crate::state::{AppState, ConnectionState, DEVICE_MODEL, WorkerCommand};
+
+use super::sweep_controls::{self, SweepEdit, SweepFields, group_heading};
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xd3, 0x2f, 0x2f);
-
-/// Upper frequency bound for input fields in MHz (KC901V tops at 6.8 GHz).
-const MAX_MHZ: f64 = 6800.0;
 
 /// Draw the SPEC parameter panel. Signature is a module contract; do not
 /// change it.
@@ -46,35 +42,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// START/STOP/CENTER/SPAN frequency fields plus the POINTS count.
 fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
-    let mut start_stop_edited = false;
-    let mut center_span_edited = false;
-
-    egui::Grid::new("sweep_grid")
-        .num_columns(2)
-        .spacing([8.0, 8.0])
-        .show(ui, |ui| {
-            let spec = &mut state.spec;
-            ui.label(state.language.text(Text::Start));
-            start_stop_edited |= freq_field(ui, &mut spec.start_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Stop));
-            start_stop_edited |= freq_field(ui, &mut spec.stop_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Center));
-            center_span_edited |= freq_field(ui, &mut spec.center_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Span));
-            center_span_edited |= freq_field(ui, &mut spec.span_hz);
-            ui.end_row();
-            ui.label(state.language.text(Text::Points));
-            ui.add(egui::DragValue::new(&mut spec.points).range(2..=10001));
-            ui.end_row();
-        });
-
-    if start_stop_edited {
-        state.spec.start_stop_changed();
-    } else if center_span_edited {
-        state.spec.center_span_changed();
+    let spec = &mut state.spec;
+    let edit = SweepFields {
+        start: &mut spec.start_hz,
+        stop: &mut spec.stop_hz,
+        center: &mut spec.center_hz,
+        span: &mut spec.span_hz,
+        points: &mut spec.points,
+    }
+    .show(ui, DEVICE_MODEL.capabilities().spec.range, state.language);
+    match edit {
+        SweepEdit::StartStop => spec.start_stop_changed(),
+        SweepEdit::CenterSpan => spec.center_span_changed(),
+        SweepEdit::None => {}
     }
 }
 
@@ -90,7 +70,7 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
             egui::ComboBox::from_id_salt("rbw")
                 .selected_text(spec.rbw.to_string())
                 .show_ui(ui, |ui| {
-                    for rbw in Rbw::ALL {
+                    for &rbw in DEVICE_MODEL.capabilities().rbw_list {
                         ui.selectable_value(&mut spec.rbw, rbw, rbw.to_string());
                     }
                 });
@@ -98,7 +78,11 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(state.language.text(Text::RefLevel));
             ui.add(
                 egui::DragValue::new(&mut spec.ref_level_dbm)
-                    .range(-30..=0)
+                    .range(
+                        DEVICE_MODEL.capabilities().spec.ref_min_dbm
+                            ..=DEVICE_MODEL.capabilities().spec.ref_max_dbm,
+                    )
+                    .clamp_existing_to_range(false)
                     .suffix(" dBm"),
             );
             ui.end_row();
@@ -116,44 +100,13 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
             state.spec.running = false;
             state.send(WorkerCommand::StopSweep);
         }
-    } else {
-        let button =
-            egui::Button::new(egui::RichText::new(state.language.text(Text::Run)).strong())
-                .fill(PRIMARY);
-        if ui.add_sized(size, button).clicked() {
-            state.send(WorkerCommand::RunSpec(state.spec.spec_params()));
-            state.spec.running = true;
-            // Auto-fit the view to the incoming sweep data.
-            state.spec.needs_fit = true;
-            state.spec.view_locked = false;
-        }
+    } else if let Some(params) =
+        sweep_controls::run_button(ui, state.spec.spec_params(), state.language)
+    {
+        state.send(WorkerCommand::RunSpec(params));
+        state.spec.running = true;
+        // Auto-fit the view to the incoming sweep data.
+        state.spec.needs_fit = true;
+        state.spec.view_locked = false;
     }
-}
-
-/// Centered uppercase group header matching the reference menu groups.
-fn group_heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(text).strong().small());
-    });
-    ui.separator();
-}
-
-/// Frequency input in MHz over an `f64` value in Hz. Returns true when the
-/// value changed this frame.
-fn freq_field(ui: &mut egui::Ui, hz: &mut f64) -> bool {
-    let mut mhz = *hz / 1e6;
-    let changed = ui
-        .add(
-            egui::DragValue::new(&mut mhz)
-                .speed(0.1)
-                .range(0.0..=MAX_MHZ)
-                .suffix(" MHz")
-                .max_decimals(3),
-        )
-        .changed();
-    if changed {
-        *hz = mhz * 1e6;
-    }
-    changed
 }

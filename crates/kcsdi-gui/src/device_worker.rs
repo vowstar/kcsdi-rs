@@ -15,7 +15,7 @@ use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
-use crate::state::{WorkerCommand, WorkerEvent};
+use crate::state::{DEVICE_MODEL, WorkerCommand, WorkerEvent};
 
 /// A repeating sweep job requested by the UI.
 #[derive(Debug, Clone)]
@@ -83,7 +83,10 @@ fn handle(
     match cmd {
         WorkerCommand::Connect { host, port } => {
             *job = None;
-            match Device::connect(&host, port).and_then(|mut dev| {
+            // Drop an old session before opening the device's single
+            // control connection, including reconnect after a failure.
+            *device = None;
+            match Device::connect_with_model(&host, port, DEVICE_MODEL).and_then(|mut dev| {
                 let info = dev.device_info()?;
                 Ok((dev, info))
             }) {
@@ -114,6 +117,11 @@ fn handle(
         }
         WorkerCommand::StopSweep => {
             *job = None;
+            if let Some(dev) = device.as_mut()
+                && let Err(e) = dev.stop_sweep()
+            {
+                emit(WorkerEvent::Error(format!("Stop failed: {e}")));
+            }
         }
         WorkerCommand::RefreshStatus => {
             if let Some(dev) = device.as_mut() {

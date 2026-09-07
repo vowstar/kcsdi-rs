@@ -85,6 +85,12 @@ catalog! {
     Center => ("CENTER", "中心频率"),
     Span => ("SPAN", "频宽"),
     Points => ("POINTS", "点数"),
+    FrequencyRange => ("Range", "频率范围"),
+    MinimumSpan => ("Minimum span", "最小频宽"),
+    PointsHelp => (
+        "Returned samples including both endpoints. The KC901V command uses a count one less than the requested samples. Single-frequency continuous mode is not a finite sweep.",
+        "包含两个端点的返回采样点数。KC901V 命令中的点数会减一。单频连续测量不属于有限扫描。"
+    ),
     Rbw => ("RBW", "分辨率带宽"),
     RefLevel => ("REF LEVEL", "参考电平"),
     Calibration => ("CAL", "校准"),

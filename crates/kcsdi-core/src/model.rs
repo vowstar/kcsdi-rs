@@ -11,6 +11,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::commands::{Cal, Format};
+
 /// Sampling bandwidth for `$bw` (manual 3.2.18, doc 3.3.1).
 ///
 /// The `100Hz`/`300Hz` literals include the `Hz` suffix exactly; legacy
@@ -137,9 +139,11 @@ impl FreqRange {
         }
     }
 
-    /// True when `[start_hz, stop_hz]` is a legal sweep inside this range.
+    /// True for an ascending sweep inside this range. Descending firmware
+    /// scans are intentionally outside the high-level sweep API.
     pub fn contains_sweep(&self, start_hz: u64, stop_hz: u64) -> bool {
-        start_hz >= self.min_hz
+        start_hz <= stop_hz
+            && start_hz >= self.min_hz
             && stop_hz <= self.max_hz
             && stop_hz.saturating_sub(start_hz) >= self.min_span_hz
     }
@@ -184,8 +188,10 @@ pub struct Capabilities {
     pub model: Model,
     pub min_version: Version,
     pub sweep: FreqRange,
+    /// Requested sample count, including both endpoints, not wire count.
     pub points_min: u32,
     pub points_max: u32,
+    /// Subtracted from the requested sample count when building a command.
     pub excess_points: u32,
     pub system_cal_count: u32,
     pub system_cal_rbw: Rbw,
@@ -198,6 +204,36 @@ pub struct Capabilities {
     pub s22: ModeCaps,
     pub s12: ModeCaps,
     pub spec: SpecCaps,
+}
+
+impl Capabilities {
+    /// S11 calibration literals represented by the current command API.
+    /// KC901V choices were verified on firmware V1.6.1 (section 12).
+    /// Other models retain the reference table choices, not hardware claims.
+    pub fn s11_calibrations(&self) -> &'static [Cal] {
+        match self.model {
+            Model::Kc901Sp | Model::Kc901Cp => &[Cal::CalOn, Cal::CalOff],
+            Model::Kc901V | Model::Kc901M | Model::Kc901Q => {
+                &[Cal::CalSys, Cal::CalUser, Cal::CalOff]
+            }
+            Model::Kc901K | Model::Kc901R | Model::Kc901J => &[Cal::CalOff],
+        }
+    }
+
+    /// S11 formats supported by both the model and the command API.
+    pub fn s11_formats(&self) -> &'static [Format] {
+        &[
+            Format::Ri,
+            Format::Ma,
+            Format::Vswr,
+            Format::Z,
+            Format::Loss,
+        ]
+    }
+
+    pub fn spec_calibrations(&self) -> &'static [Cal] {
+        &[Cal::CalOn, Cal::CalOff]
+    }
 }
 
 const LEGACY_RBW: &[Rbw] = &[Rbw::R1k, Rbw::R3k, Rbw::R10k, Rbw::R30k];

@@ -21,6 +21,10 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A sweep parameter failed validation before any command was sent.
+    #[error("invalid sweep parameter: {0}")]
+    InvalidParameter(String),
+
     /// The connection was closed by the peer (or never established).
     #[error("not connected")]
     NotConnected,

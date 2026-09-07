@@ -11,11 +11,16 @@ use std::sync::mpsc;
 use kcsdi_core::commands::{Cal, Format};
 use kcsdi_core::data::{DeviceInfo, SweepData, Voltage};
 use kcsdi_core::device::{S11Params, SpecParams};
-use kcsdi_core::model::Rbw;
+use kcsdi_core::model::{Model, Rbw};
+use kcsdi_core::validation::frequency_hz;
 
 use crate::i18n::{Language, StatusMessage, Text};
 use crate::widgets::plot::PlotView;
 use crate::widgets::smith::SmithView;
+
+/// The GUI currently targets KC901V. Identity packets do not identify a
+/// model reliably, so this must match the worker's explicit session model.
+pub const DEVICE_MODEL: Model = Model::Kc901V;
 
 /// Commands sent from the UI to the device worker thread.
 #[derive(Debug)]
@@ -141,18 +146,12 @@ macro_rules! impl_freq_helpers {
     () => {
         /// Recompute center/span after start or stop changed.
         pub fn start_stop_changed(&mut self) {
-            if self.stop_hz < self.start_hz {
-                std::mem::swap(&mut self.start_hz, &mut self.stop_hz);
-            }
             self.center_hz = (self.start_hz + self.stop_hz) / 2.0;
             self.span_hz = self.stop_hz - self.start_hz;
         }
 
         /// Recompute start/stop after center or span changed.
         pub fn center_span_changed(&mut self) {
-            if self.span_hz < 0.0 {
-                self.span_hz = -self.span_hz;
-            }
             self.start_hz = self.center_hz - self.span_hz / 2.0;
             self.stop_hz = self.center_hz + self.span_hz / 2.0;
         }
@@ -208,16 +207,18 @@ impl SpecState {
     impl_freq_helpers!();
 
     /// Build worker parameters from the current field values.
-    pub fn spec_params(&self) -> SpecParams {
-        SpecParams {
+    pub fn spec_params(&self) -> kcsdi_core::Result<SpecParams> {
+        let params = SpecParams {
             cal: Cal::CalOff,
             lo: kcsdi_core::commands::Lo::HighLo,
             points: self.points,
-            start_hz: self.start_hz as u64,
-            stop_hz: self.stop_hz as u64,
+            start_hz: frequency_hz(self.start_hz, "SPEC start")?,
+            stop_hz: frequency_hz(self.stop_hz, "SPEC stop")?,
             rbw: self.rbw,
             ref_level_dbm: self.ref_level_dbm,
-        }
+        };
+        params.validate(&DEVICE_MODEL.capabilities())?;
+        Ok(params)
     }
 }
 
@@ -282,15 +283,17 @@ impl S11State {
     impl_freq_helpers!();
 
     /// Build worker parameters from the current field values.
-    pub fn s11_params(&self) -> S11Params {
-        S11Params {
+    pub fn s11_params(&self) -> kcsdi_core::Result<S11Params> {
+        let params = S11Params {
             cal: self.cal,
             format: self.display.wire_format(),
             points: self.points,
-            start_hz: self.start_hz as u64,
-            stop_hz: self.stop_hz as u64,
+            start_hz: frequency_hz(self.start_hz, "S11 start")?,
+            stop_hz: frequency_hz(self.stop_hz, "S11 stop")?,
             rbw: self.rbw,
-        }
+        };
+        params.validate(&DEVICE_MODEL.capabilities())?;
+        Ok(params)
     }
 }
 
@@ -337,6 +340,19 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Switching panels stops the old job and keeps both RUN indicators
+    /// consistent with the worker's single active measurement mode.
+    pub fn change_mode(&mut self, mode: AppMode) {
+        if self.mode != mode {
+            if self.any_running() {
+                self.spec.running = false;
+                self.s11.running = false;
+                self.send(WorkerCommand::StopSweep);
+            }
+            self.mode = mode;
+        }
+    }
+
     /// Send a command to the device worker, dropping it silently when the
     /// worker is gone (it outlives no panic).
     pub fn send(&self, cmd: WorkerCommand) {
@@ -348,5 +364,101 @@ impl AppState {
     /// Whether any sweep is currently repeating.
     pub fn any_running(&self) -> bool {
         self.spec.running || self.s11.running
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_mode_stops_the_old_job_and_clears_both_run_indicators() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            ..AppState::default()
+        };
+        state.spec.running = true;
+        state.change_mode(AppMode::S11);
+        assert_eq!(state.mode, AppMode::S11);
+        assert!(!state.any_running());
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::StopSweep)));
+        state.change_mode(AppMode::S11);
+        assert!(rx.try_recv().is_err());
+        state.s11.running = true;
+        state.change_mode(AppMode::Spec);
+        assert!(!state.any_running());
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::StopSweep)));
+    }
+
+    #[test]
+    fn parameter_builders_preserve_sample_counts_and_round_whole_hz() {
+        let state = S11State {
+            start_hz: 5000.6,
+            ..S11State::default()
+        };
+        let params = state.s11_params().unwrap();
+        assert_eq!(params.start_hz, 5001);
+        assert_eq!(params.points, 201);
+        assert_eq!(SpecState::default().spec_params().unwrap().points, 201);
+    }
+
+    #[test]
+    fn mode_limits_and_non_finite_inputs_are_checked_before_casting() {
+        for start_hz in [f64::NAN, f64::INFINITY, -1.0, 0.0, 4999.0] {
+            let state = S11State {
+                start_hz,
+                ..S11State::default()
+            };
+            assert!(state.s11_params().is_err(), "{start_hz}");
+        }
+        for start_hz in [f64::NAN, f64::INFINITY, -0.1] {
+            let state = SpecState {
+                start_hz,
+                ..SpecState::default()
+            };
+            assert!(state.spec_params().is_err(), "{start_hz}");
+        }
+        let spec = SpecState {
+            start_hz: 0.0,
+            stop_hz: 1000.0,
+            ..SpecState::default()
+        };
+        assert_eq!(spec.spec_params().unwrap().start_hz, 0);
+    }
+
+    #[test]
+    fn linked_fields_do_not_hide_reversed_or_negative_sweeps() {
+        let mut state = S11State {
+            start_hz: 1e6,
+            stop_hz: 1e5,
+            ..S11State::default()
+        };
+        state.start_stop_changed();
+        assert_eq!((state.start_hz, state.stop_hz), (1e6, 1e5));
+        assert!(state.s11_params().is_err());
+        state.center_hz = 5000.0;
+        state.span_hz = 20000.0;
+        state.center_span_changed();
+        assert_eq!(state.start_hz, -5000.0);
+        assert!(state.s11_params().is_err());
+        state.span_hz = -1000.0;
+        state.center_span_changed();
+        assert!(state.s11_params().is_err());
+    }
+
+    #[test]
+    fn invalid_legacy_settings_are_preserved_but_cannot_run() {
+        let cfg: crate::config::AppConfig = toml::from_str(
+            "[s11]\nstart_hz = 0.0\npoints = 10001\ncal = 'calon'\n[spec]\nrbw = '100Hz'\n",
+        )
+        .unwrap();
+        let mut state = AppState::default();
+        cfg.apply_to(&mut state);
+        assert_eq!(state.s11.start_hz, 0.0);
+        assert_eq!(state.s11.points, 10001);
+        assert_eq!(state.s11.cal, Cal::CalOn);
+        assert!(state.s11.s11_params().is_err());
+        assert!(state.spec.spec_params().is_err());
     }
 }

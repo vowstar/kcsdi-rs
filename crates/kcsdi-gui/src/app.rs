@@ -209,19 +209,21 @@ impl eframe::App for KcsdiApp {
         egui::Panel::top("top_bar").show(ui, |ui| {
             panels::top_bar::show(ui, &mut self.state);
         });
+        let mut mode = self.state.mode;
         egui::Panel::top("mode_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(
-                    &mut self.state.mode,
+                    &mut mode,
                     AppMode::Spec,
                     self.state.language.text(Text::Spectrum),
                 );
-                ui.selectable_value(&mut self.state.mode, AppMode::S11, "S11");
+                ui.selectable_value(&mut mode, AppMode::S11, "S11");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     language_selector(ui, &mut self.state.language);
                 });
             });
         });
+        self.state.change_mode(mode);
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             panels::status_bar::show(ui, &mut self.state);
         });

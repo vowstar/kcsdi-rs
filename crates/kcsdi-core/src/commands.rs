@@ -149,9 +149,9 @@ pub fn set_spec_ref(dbm: i32) -> String {
     format!("$specref,{dbm}\n")
 }
 
-/// Append the frequency fields shared by all `run` commands. With
-/// `points == 1` only `f1` is sent; any `f2` would be parsed as a new
-/// command by the instrument (doc 3.4).
+/// Append literal frequency fields shared by all `run` commands. The
+/// caller must pass `None` for f2 in single-frequency continuous mode
+/// (wire count 1). This helper does not validate parameters (section 3.4).
 fn freq_fields(scan: ScanMode, f1: u64, f2: Option<u64>) -> String {
     match f2 {
         Some(f2) => format!(",{scan},{f1},{f2}"),

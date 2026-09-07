@@ -21,6 +21,7 @@ pub mod error;
 pub mod model;
 pub mod protocol;
 pub mod transport;
+pub mod validation;
 
 pub use device::Device;
 pub use error::{Error, Result};
