@@ -512,10 +512,15 @@ fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
     let font = FontId::monospace(LABEL_FONT_SIZE);
     let mut y = plot_rect.top() + 2.0;
     for series in &opts.series {
+        let label = if opts.y_label.is_empty() {
+            series.name.to_string()
+        } else {
+            format!("{} {}", series.name, opts.y_label)
+        };
         painter.text(
             Pos2::new(plot_rect.right() - 18.0, y),
             Align2::RIGHT_TOP,
-            series.name,
+            label,
             font.clone(),
             TEXT_COLOR,
         );
@@ -531,8 +536,36 @@ fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
     }
 }
 
-/// Crosshair lines and a (frequency, value) readout of the data
-/// coordinates under the mouse. Log mode reports the raw value.
+/// Y of the drawable point whose x is closest to `x`. `points` must be
+/// sorted by x (sweep data always is). Points that would not be drawn
+/// (non-finite x/y, non-positive y in log mode) are skipped. An `x`
+/// outside the data range snaps to the nearest drawable end point;
+/// returns None only when no drawable point exists. Ties prefer the
+/// point left of `x`.
+fn nearest_y(points: &[(f64, f64)], x: f64, log_y: bool) -> Option<f64> {
+    let usable = |p: &&(f64, f64)| p.0.is_finite() && p.1.is_finite() && (!log_y || p.1 > 0.0);
+    let pos = points.partition_point(|p| p.0 < x);
+    let left = points[..pos].iter().rev().find(usable);
+    let right = points[pos..].iter().find(usable);
+    match (left, right) {
+        (Some(l), Some(r)) => {
+            if (x - l.0).abs() <= (r.0 - x).abs() {
+                Some(l.1)
+            } else {
+                Some(r.1)
+            }
+        }
+        (Some(l), None) => Some(l.1),
+        (None, Some(r)) => Some(r.1),
+        (None, None) => None,
+    }
+}
+
+/// Crosshair lines and readouts of the data under the mouse. With a
+/// single series this shows the (frequency, value) coordinates of the
+/// cursor; with several series it shows one row per series at the
+/// bottom right, in the series color, holding the value of the point
+/// nearest to the cursor x. Log mode reports the raw value.
 fn draw_cursor(
     painter: &egui::Painter,
     view: &PlotView,
@@ -563,6 +596,38 @@ fn draw_cursor(
 
     let freq = view.x_min
         + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64 * (view.x_max - view.x_min);
+    let font = FontId::monospace(LABEL_FONT_SIZE);
+
+    if opts.series.len() >= 2 {
+        // One row per series with a drawable point near the cursor x,
+        // stacked upward from the bottom right corner in series order.
+        let rows: Vec<(Color32, String)> = opts
+            .series
+            .iter()
+            .filter_map(|s| {
+                let value = nearest_y(&s.points, freq, opts.log_y)?;
+                let text = if opts.y_label.is_empty() {
+                    format!("{} {}", s.name, format_value(value))
+                } else {
+                    format!("{} {} {}", s.name, format_value(value), opts.y_label)
+                };
+                Some((s.color, text))
+            })
+            .collect();
+        let row_h = LABEL_FONT_SIZE + 3.0;
+        for (i, (color, text)) in rows.iter().enumerate() {
+            let y = plot_rect.bottom() - 4.0 - (rows.len() - 1 - i) as f32 * row_h;
+            painter.text(
+                Pos2::new(plot_rect.right() - 4.0, y),
+                Align2::RIGHT_BOTTOM,
+                text,
+                font.clone(),
+                *color,
+            );
+        }
+        return;
+    }
+
     let (a_min, a_max) = (
         to_axis(opts.log_y, view.y_min),
         to_axis(opts.log_y, view.y_max),
@@ -580,7 +645,7 @@ fn draw_cursor(
             format_value(value),
             opts.y_label
         ),
-        FontId::monospace(LABEL_FONT_SIZE),
+        font,
         TEXT_COLOR,
     );
 }
@@ -772,5 +837,53 @@ mod tests {
         // A drag followed by a double-click in one frame stays Locked.
         assert_eq!(Unchanged.merge(Locked).merge(Unlocked), Locked);
         assert_eq!(Unlocked.merge(Unlocked), Unlocked);
+    }
+
+    #[test]
+    fn nearest_y_hits_exact_points() {
+        let points = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)];
+        assert_eq!(nearest_y(&points, 2.0, false), Some(20.0));
+        assert_eq!(nearest_y(&points, 1.0, false), Some(10.0));
+    }
+
+    #[test]
+    fn nearest_y_picks_the_closer_side_and_left_on_ties() {
+        let points = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)];
+        assert_eq!(nearest_y(&points, 1.6, false), Some(20.0));
+        assert_eq!(nearest_y(&points, 2.4, false), Some(20.0));
+        assert_eq!(nearest_y(&points, 2.6, false), Some(30.0));
+        // Exactly in the middle: the left point wins.
+        assert_eq!(nearest_y(&points, 1.5, false), Some(10.0));
+    }
+
+    #[test]
+    fn nearest_y_snaps_to_boundary_outside_the_range() {
+        let points = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)];
+        assert_eq!(nearest_y(&points, -5.0, false), Some(10.0));
+        assert_eq!(nearest_y(&points, 99.0, false), Some(30.0));
+        assert_eq!(nearest_y(&[], 1.0, false), None);
+    }
+
+    #[test]
+    fn nearest_y_skips_non_finite_points() {
+        let points = [
+            (1.0, 10.0),
+            (2.0, f64::NAN),
+            (3.0, f64::INFINITY),
+            (4.0, 40.0),
+        ];
+        assert_eq!(nearest_y(&points, 2.0, false), Some(10.0));
+        assert_eq!(nearest_y(&points, 2.9, false), Some(40.0));
+        let all_bad = [(1.0, f64::NAN), (f64::NAN, 2.0)];
+        assert_eq!(nearest_y(&all_bad, 1.0, false), None);
+    }
+
+    #[test]
+    fn nearest_y_log_mode_skips_non_positive_points() {
+        let points = [(1.0, -10.0), (2.0, 0.0), (3.0, 30.0)];
+        assert_eq!(nearest_y(&points, 1.0, true), Some(30.0));
+        assert_eq!(nearest_y(&points, 2.0, true), Some(30.0));
+        // Linear mode keeps them drawable.
+        assert_eq!(nearest_y(&points, 1.0, false), Some(-10.0));
     }
 }
