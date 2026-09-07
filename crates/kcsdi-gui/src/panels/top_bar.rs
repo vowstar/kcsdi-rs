@@ -50,9 +50,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ConnectionState::Connected => {
                 if ui.button("Disconnect").clicked() {
-                    if state.spec.running {
+                    if state.any_running() {
                         state.spec.running = false;
-                        state.send(WorkerCommand::StopSpec);
+                        state.s11.running = false;
+                        state.send(WorkerCommand::StopSweep);
                     }
                     state.send(WorkerCommand::Disconnect);
                 }

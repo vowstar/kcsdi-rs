@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 
-//! Right column: SPEC sweep parameters and run control.
+//! Right column: S11 display format tabs, sweep parameters, run control.
 
+use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
-use crate::state::{AppState, ConnectionState, WorkerCommand};
+use crate::state::{AppState, ConnectionState, S11Display, WorkerCommand};
 use crate::theme::PRIMARY;
 
 const RED: egui::Color32 = egui::Color32::from_rgb(0xd3, 0x2f, 0x2f);
@@ -13,13 +14,18 @@ const RED: egui::Color32 = egui::Color32::from_rgb(0xd3, 0x2f, 0x2f);
 /// Upper frequency bound for input fields in MHz (KC901V tops at 6.8 GHz).
 const MAX_MHZ: f64 = 6800.0;
 
-/// Draw the SPEC parameter panel. Signature is a module contract; do not
+/// Calibration choices in display order (no `Cal::ALL` in core).
+const CALS: [Cal; 4] = [Cal::CalOn, Cal::CalOff, Cal::CalSys, Cal::CalUser];
+
+/// Draw the S11 parameter panel. Signature is a module contract; do not
 /// change it.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let connected = state.connection == ConnectionState::Connected;
-    let running = state.spec.running;
+    let running = state.s11.running;
 
     ui.add_enabled_ui(connected, |ui| {
+        display_tabs(ui, state);
+        ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
@@ -29,6 +35,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 sweep_fields(ui, state);
                 ui.add_space(8.0);
                 receiver_fields(ui, state);
+                ui.add_space(8.0);
+                display_fields(ui, state);
             });
 
             ui.add_space(16.0);
@@ -37,65 +45,98 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
+/// Segmented display-format selector: Phase / Return Loss / VSWR / Smith /
+/// Impedance. Switching resets the view because the Y range changes.
+fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.horizontal_wrapped(|ui| {
+        for display in S11Display::ALL {
+            if ui
+                .selectable_value(&mut state.s11.display, display, display.label())
+                .changed()
+            {
+                state.s11.reset_view();
+            }
+        }
+    });
+}
+
 /// START/STOP/CENTER/SPAN frequency fields plus the POINTS count.
 fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
     let mut start_stop_edited = false;
     let mut center_span_edited = false;
 
-    egui::Grid::new("sweep_grid")
+    egui::Grid::new("s11_sweep_grid")
         .num_columns(2)
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
-            let spec = &mut state.spec;
+            let s11 = &mut state.s11;
             ui.label("START");
-            start_stop_edited |= freq_field(ui, &mut spec.start_hz);
+            start_stop_edited |= freq_field(ui, &mut s11.start_hz);
             ui.end_row();
             ui.label("STOP");
-            start_stop_edited |= freq_field(ui, &mut spec.stop_hz);
+            start_stop_edited |= freq_field(ui, &mut s11.stop_hz);
             ui.end_row();
             ui.label("CENTER");
-            center_span_edited |= freq_field(ui, &mut spec.center_hz);
+            center_span_edited |= freq_field(ui, &mut s11.center_hz);
             ui.end_row();
             ui.label("SPAN");
-            center_span_edited |= freq_field(ui, &mut spec.span_hz);
+            center_span_edited |= freq_field(ui, &mut s11.span_hz);
             ui.end_row();
             ui.label("POINTS");
-            ui.add(egui::DragValue::new(&mut spec.points).range(2..=10001));
+            ui.add(egui::DragValue::new(&mut s11.points).range(2..=10001));
             ui.end_row();
         });
 
     if start_stop_edited {
-        state.spec.start_stop_changed();
+        state.s11.start_stop_changed();
     } else if center_span_edited {
-        state.spec.center_span_changed();
+        state.s11.center_span_changed();
     }
 }
 
-/// RBW selector and reference level.
+/// CAL selector and the optional RBW pushed before a run.
 fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
     group_heading(ui, "RECEIVER");
-    egui::Grid::new("receiver_grid")
+    egui::Grid::new("s11_receiver_grid")
         .num_columns(2)
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
-            let spec = &mut state.spec;
-            ui.label("RBW");
-            egui::ComboBox::from_id_salt("rbw")
-                .selected_text(spec.rbw.to_string())
+            let s11 = &mut state.s11;
+            ui.label("CAL");
+            egui::ComboBox::from_id_salt("s11_cal")
+                .selected_text(s11.cal.as_str())
                 .show_ui(ui, |ui| {
-                    for rbw in Rbw::ALL {
-                        ui.selectable_value(&mut spec.rbw, rbw, rbw.to_string());
+                    for cal in CALS {
+                        ui.selectable_value(&mut s11.cal, cal, cal.as_str());
                     }
                 });
             ui.end_row();
-            ui.label("REF LEVEL");
-            ui.add(
-                egui::DragValue::new(&mut spec.ref_level_dbm)
-                    .range(-30..=0)
-                    .suffix(" dBm"),
-            );
+
+            // RBW is optional on S11 runs: unchecked means no `$bw` push.
+            let mut rbw_on = s11.rbw.is_some();
+            if ui.checkbox(&mut rbw_on, "RBW").changed() {
+                s11.rbw = rbw_on.then_some(Rbw::R10k);
+            }
+            if let Some(rbw) = &mut s11.rbw {
+                egui::ComboBox::from_id_salt("s11_rbw")
+                    .selected_text(rbw.to_string())
+                    .show_ui(ui, |ui| {
+                        for value in Rbw::ALL {
+                            ui.selectable_value(rbw, value, value.to_string());
+                        }
+                    });
+            }
             ui.end_row();
         });
+}
+
+/// LOG Y toggle, only meaningful for cartesian formats.
+fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
+    group_heading(ui, "DISPLAY");
+    let cartesian = state.s11.display != S11Display::Smith;
+    ui.add_enabled_ui(cartesian, |ui| {
+        ui.checkbox(&mut state.s11.log_y, "LOG Y");
+    });
 }
 
 /// Full-width RUN/STOP toggle, green/primary at rest and red while running.
@@ -104,20 +145,15 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
     if running {
         let button = egui::Button::new(egui::RichText::new("STOP").strong()).fill(RED);
         if ui.add_sized(size, button).clicked() {
-            state.spec.running = false;
+            state.s11.running = false;
             state.send(WorkerCommand::StopSweep);
         }
     } else {
         let button = egui::Button::new(egui::RichText::new("RUN").strong()).fill(PRIMARY);
         if ui.add_sized(size, button).clicked() {
-            state.send(WorkerCommand::RunSpec(state.spec.spec_params()));
-            state.spec.running = true;
-            // Follow the new sweep range; keep the current level range.
-            let (y_min, y_max) = (state.spec.view.y_min, state.spec.view.y_max);
-            state
-                .spec
-                .view
-                .reset(state.spec.start_hz, state.spec.stop_hz, y_min, y_max);
+            state.send(WorkerCommand::RunS11(state.s11.s11_params()));
+            state.s11.running = true;
+            state.s11.reset_view();
         }
     }
 }

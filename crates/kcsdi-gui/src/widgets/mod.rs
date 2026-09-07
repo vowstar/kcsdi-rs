@@ -4,3 +4,4 @@
 //! Shared custom widgets.
 
 pub mod plot;
+pub mod smith;

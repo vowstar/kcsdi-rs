@@ -11,7 +11,7 @@ use log::{info, warn};
 use crate::config::AppConfig;
 use crate::device_worker;
 use crate::panels;
-use crate::state::{AppState, ConnectionState, WorkerEvent};
+use crate::state::{AppMode, AppState, ConnectionState, S11Display, WorkerEvent};
 use crate::theme;
 use crate::widgets;
 
@@ -75,6 +75,7 @@ impl KcsdiApp {
                 self.state.connection = ConnectionState::Disconnected;
                 self.state.device_info = None;
                 self.state.spec.running = false;
+                self.state.s11.running = false;
                 self.state.status_message = Some("Disconnected".to_string());
             }
             WorkerEvent::Error(msg) => {
@@ -82,10 +83,16 @@ impl KcsdiApp {
                     self.state.connection = ConnectionState::Error(msg.clone());
                 }
                 self.state.spec.running = false;
+                self.state.s11.running = false;
                 self.state.status_message = Some(msg);
             }
-            WorkerEvent::SpecTrace(data) => {
-                self.state.spec.trace = Some(data);
+            WorkerEvent::SweepTrace(data) => {
+                use kcsdi_core::protocol::StreamMode;
+                match data.mode {
+                    StreamMode::Spec => self.state.spec.trace = Some(data),
+                    StreamMode::S11 => self.state.s11.trace = Some(data),
+                    _ => {}
+                }
             }
             WorkerEvent::Status {
                 temperature,
@@ -122,6 +129,35 @@ impl KcsdiApp {
     }
 }
 
+/// Build plot series for an S11 cartesian display from the `z`/`ma`/
+/// `loss`/`vswr` columns (protocol doc 4.4).
+fn cartesian_series(
+    display: S11Display,
+    trace: Option<&kcsdi_core::data::SweepData>,
+) -> Vec<widgets::plot::Series> {
+    let Some(trace) = trace else {
+        return Vec::new();
+    };
+    let column = |i: usize, color: egui::Color32| widgets::plot::Series {
+        color,
+        points: trace
+            .points
+            .iter()
+            .map(|p| (p.freq_hz, p.values.get(i).copied().unwrap_or(f64::NAN)))
+            .collect(),
+    };
+    match display {
+        S11Display::Phase => vec![column(1, theme::TRACE_COLORS[0])],
+        S11Display::ReturnLoss | S11Display::Vswr => vec![column(0, theme::TRACE_COLORS[0])],
+        S11Display::Impedance => vec![
+            column(0, theme::TRACE_COLORS[0]),
+            column(1, theme::TRACE_COLORS[1]),
+            column(2, theme::TRACE_COLORS[2]),
+        ],
+        S11Display::Smith => Vec::new(),
+    }
+}
+
 impl eframe::App for KcsdiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -134,18 +170,62 @@ impl eframe::App for KcsdiApp {
         egui::Panel::top("top_bar").show(ui, |ui| {
             panels::top_bar::show(ui, &mut self.state);
         });
+        egui::Panel::top("mode_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.state.mode, AppMode::Spec, "SPEC");
+                ui.selectable_value(&mut self.state.mode, AppMode::S11, "S11");
+            });
+        });
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             panels::status_bar::show(ui, &mut self.state);
         });
-        egui::Panel::right("spec_panel")
+        egui::Panel::right("params_panel")
             .default_size(260.0)
             .resizable(true)
-            .show(ui, |ui| {
-                panels::spec_panel::show(ui, &mut self.state);
+            .show(ui, |ui| match self.state.mode {
+                AppMode::Spec => panels::spec_panel::show(ui, &mut self.state),
+                AppMode::S11 => panels::s11_panel::show(ui, &mut self.state),
             });
-        egui::CentralPanel::default().show(ui, |ui| {
-            let spec = &mut self.state.spec;
-            widgets::plot::show(ui, &mut spec.view, spec.trace.as_ref());
+        egui::CentralPanel::default().show(ui, |ui| match self.state.mode {
+            AppMode::Spec => {
+                let spec = &mut self.state.spec;
+                let series = spec
+                    .trace
+                    .as_ref()
+                    .map(|t| widgets::plot::Series {
+                        color: theme::TRACE_COLORS[0],
+                        points: t
+                            .points
+                            .iter()
+                            .map(|p| (p.freq_hz, p.values.first().copied().unwrap_or(f64::NAN)))
+                            .collect(),
+                    })
+                    .into_iter()
+                    .collect();
+                let opts = widgets::plot::PlotOptions {
+                    y_label: "dBm",
+                    log_y: false,
+                    series,
+                };
+                widgets::plot::show(ui, &mut spec.view, &opts);
+            }
+            AppMode::S11 => {
+                let s11 = &mut self.state.s11;
+                match s11.display {
+                    S11Display::Smith => {
+                        widgets::smith::show(ui, &mut s11.smith, s11.trace.as_ref());
+                    }
+                    display => {
+                        let series = cartesian_series(display, s11.trace.as_ref());
+                        let opts = widgets::plot::PlotOptions {
+                            y_label: display.y_label(),
+                            log_y: s11.log_y,
+                            series,
+                        };
+                        widgets::plot::show(ui, &mut s11.view, &opts);
+                    }
+                }
+            }
         });
 
         // Pick up worker events promptly even when idle.

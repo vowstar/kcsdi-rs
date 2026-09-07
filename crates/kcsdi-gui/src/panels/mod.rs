@@ -3,6 +3,7 @@
 
 //! Panel functions. Each panel is a free function over `&mut AppState`.
 
+pub mod s11_panel;
 pub mod spec_panel;
 pub mod status_bar;
 pub mod top_bar;

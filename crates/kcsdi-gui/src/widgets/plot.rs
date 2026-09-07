@@ -1,18 +1,39 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 
-//! Spectrum trace plot, custom-drawn with `egui::Painter`.
+//! Cartesian trace plot, custom-drawn with `egui::Painter`.
 //!
 //! Deliberately not egui_plot: the reference interface uses per-axis
 //! strips and cursor-anchored zoom that do not fit owned axes
-//! (the reference UI analysis section 6).
+//! (the reference UI analysis section 6). Supports multiple series and
+//! an optional logarithmic Y axis (extension over the reference
+//! interface).
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind};
-use kcsdi_core::data::SweepData;
 
-use crate::theme::TRACE_COLORS;
+/// One drawn trace.
+#[derive(Debug, Clone)]
+pub struct Series {
+    pub color: egui::Color32,
+    /// (x, y) data points; non-finite values break the polyline. In
+    /// log-Y mode non-positive values also break it.
+    pub points: Vec<(f64, f64)>,
+}
 
-/// Visible data range of the plot (frequency x level).
+/// What to draw, prepared by the caller each frame.
+pub struct PlotOptions<'a> {
+    /// Y axis unit label (e.g. "dBm", "ohm", "deg").
+    pub y_label: &'a str,
+    /// Logarithmic Y axis (base 10). Non-positive values are skipped.
+    pub log_y: bool,
+    pub series: Vec<Series>,
+}
+
+/// Visible data range of the plot (x x y, in data units).
+///
+/// In log-Y mode (`PlotOptions::log_y`) `y_min`/`y_max` still hold raw
+/// data values, not log10 of them; the widget maps to log space
+/// internally for layout, zoom, and pan. Keep both positive there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlotView {
     pub x_min: f64,
@@ -47,12 +68,30 @@ const MARGIN_TOP: f32 = 8.0;
 const MARGIN_BOTTOM: f32 = 20.0;
 const LABEL_FONT_SIZE: f32 = 11.0;
 const MIN_SPAN: f64 = 1e-9;
+/// Floor for raw Y values before the log10 mapping, so a view that
+/// drifted to zero or below still maps to something finite.
+const MIN_POSITIVE: f64 = 1e-300;
 
 // Chart chrome colors from reference UI analysis section 4.3 (dark theme).
 const BG_COLOR: Color32 = Color32::from_rgb(0x18, 0x18, 0x18);
 const GRID_COLOR: Color32 = Color32::from_rgb(0x42, 0x42, 0x42);
 const TEXT_COLOR: Color32 = Color32::from_rgb(0xd5, 0xd5, 0xd5);
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0x90, 0x90, 0x90);
+
+/// Map a raw Y value into axis space: identity in linear mode, log10 in
+/// log mode (clamped away from zero so the mapping stays finite).
+fn to_axis(log_y: bool, v: f64) -> f64 {
+    if log_y {
+        v.max(MIN_POSITIVE).log10()
+    } else {
+        v
+    }
+}
+
+/// Inverse of [`to_axis`].
+fn from_axis(log_y: bool, a: f64) -> f64 {
+    if log_y { 10f64.powf(a) } else { a }
+}
 
 /// Pick a 1-2-5 step so `span / step` lands near `target_divs`.
 fn nice_step(span: f64, target_divs: usize) -> f64 {
@@ -72,12 +111,6 @@ fn nice_step(span: f64, target_divs: usize) -> f64 {
         10.0
     };
     nice * mag
-}
-
-/// Like [`nice_step`], but rounded up to an integer step of at least 1,
-/// for axes whose labels must stay whole numbers (dBm).
-fn nice_int_step(span: f64, target_divs: usize) -> i64 {
-    nice_step(span, target_divs).ceil().max(1.0) as i64
 }
 
 /// SI unit and scale for a frequency magnitude: Hz below 1 kHz, then
@@ -115,16 +148,50 @@ fn format_freq(hz: f64, unit: &str, scale: f64, decimals: usize) -> String {
     format!("{:.*} {}", decimals, hz / scale, unit)
 }
 
+/// Label for 10^exp on a log axis: plain up to 100, then k/M/G.
+fn format_pow10(exp: i32) -> String {
+    const SUFFIX: [&str; 3] = ["k", "M", "G"];
+    match exp {
+        0 => "1".to_string(),
+        1 => "10".to_string(),
+        2 => "100".to_string(),
+        -1 => "0.1".to_string(),
+        -2 => "0.01".to_string(),
+        -3 => "0.001".to_string(),
+        e if e > 2 && e <= 11 => {
+            let suffix = SUFFIX[(e as usize - 3) / 3];
+            let mantissa = 10u64.pow((e as u32 - 3) % 3);
+            format!("{}{}", mantissa, suffix)
+        }
+        e => format!("1e{}", e),
+    }
+}
+
+/// Compact number for tick labels and readouts: fixed point inside a
+/// sane magnitude band, scientific outside, trailing zeros trimmed.
+fn format_value(v: f64) -> String {
+    let a = v.abs();
+    if a != 0.0 && !(1e-3..1e6).contains(&a) {
+        return format!("{:.3e}", v);
+    }
+    let s = format!("{:.4}", v);
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
 /// Draw the plot into the available space. Signature is a module
 /// contract; do not change it.
-pub fn show(ui: &mut egui::Ui, view: &mut PlotView, trace: Option<&SweepData>) {
+pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &PlotOptions) {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_LEFT, rect.top() + MARGIN_TOP),
         Pos2::new(rect.right() - MARGIN_RIGHT, rect.bottom() - MARGIN_BOTTOM),
     );
 
-    handle_input(ui, view, trace, plot_rect, &response);
+    handle_input(ui, view, opts, plot_rect, &response);
 
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, BG_COLOR);
@@ -132,33 +199,34 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, trace: Option<&SweepData>) {
         return;
     }
 
-    draw_grid(painter, view, plot_rect);
+    draw_grid(painter, view, opts, plot_rect);
 
-    match trace {
-        Some(data) if !data.points.is_empty() => {
-            let clipped = painter.with_clip_rect(plot_rect);
-            draw_trace(&clipped, view, data);
+    if opts.series.iter().any(|s| !s.points.is_empty()) {
+        let clipped = painter.with_clip_rect(plot_rect);
+        for series in &opts.series {
+            draw_series(&clipped, view, opts.log_y, series);
         }
-        _ => {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "No data",
-                FontId::monospace(14.0),
-                TEXT_COLOR,
-            );
-        }
+        draw_legend(painter, opts, plot_rect);
+    } else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No data",
+            FontId::monospace(14.0),
+            TEXT_COLOR,
+        );
     }
 
-    draw_cursor(painter, view, plot_rect, &response);
+    draw_cursor(painter, view, opts, plot_rect, &response);
 }
 
 /// Wheel zoom (10% per step, anchored at the cursor; Shift selects the Y
 /// axis), drag pan, and double-click reset, per reference UI analysis section 5.
+/// Y math happens in axis space so log mode zooms/pans by decades.
 fn handle_input(
     ui: &egui::Ui,
     view: &mut PlotView,
-    trace: Option<&SweepData>,
+    opts: &PlotOptions,
     plot_rect: Rect,
     response: &egui::Response,
 ) {
@@ -171,10 +239,15 @@ fn handle_input(
         let factor = if scroll > 0.0 { 0.9 } else { 1.0 / 0.9 };
         let shift = ui.ctx().input(|i| i.modifiers.shift);
         if shift {
-            let anchor = view.y_max
-                - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64
-                    * (view.y_max - view.y_min);
-            zoom_axis(&mut view.y_min, &mut view.y_max, anchor, factor);
+            let (mut a_min, mut a_max) = (
+                to_axis(opts.log_y, view.y_min),
+                to_axis(opts.log_y, view.y_max),
+            );
+            let anchor =
+                a_max - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64 * (a_max - a_min);
+            zoom_axis(&mut a_min, &mut a_max, anchor, factor);
+            view.y_min = from_axis(opts.log_y, a_min);
+            view.y_max = from_axis(opts.log_y, a_max);
         } else {
             let anchor = view.x_min
                 + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64
@@ -189,14 +262,20 @@ fn handle_input(
             let dx = -(d.x as f64 / plot_rect.width() as f64) * (view.x_max - view.x_min);
             view.x_min += dx;
             view.x_max += dx;
-            let dy = (d.y as f64 / plot_rect.height() as f64) * (view.y_max - view.y_min);
-            view.y_min += dy;
-            view.y_max += dy;
+            let (mut a_min, mut a_max) = (
+                to_axis(opts.log_y, view.y_min),
+                to_axis(opts.log_y, view.y_max),
+            );
+            let dy = (d.y as f64 / plot_rect.height() as f64) * (a_max - a_min);
+            a_min += dy;
+            a_max += dy;
+            view.y_min = from_axis(opts.log_y, a_min);
+            view.y_max = from_axis(opts.log_y, a_max);
         }
     }
 
     if response.double_clicked()
-        && let Some((x_min, x_max, y_min, y_max)) = data_range(trace)
+        && let Some((x_min, x_max, y_min, y_max)) = data_range(opts)
     {
         view.reset(x_min, x_max, y_min, y_max);
     }
@@ -211,33 +290,44 @@ fn zoom_axis(min: &mut f64, max: &mut f64, anchor: f64, factor: f64) {
     *max = anchor + (*max - anchor) * factor;
 }
 
-/// Full data extent of the trace: frequency range and values[0] range
-/// with 5% headroom, for the double-click reset.
-fn data_range(trace: Option<&SweepData>) -> Option<(f64, f64, f64, f64)> {
-    let points = &trace?.points;
+/// Full data extent over all series, with 5% Y headroom (5% of the
+/// decade span in log mode), for the double-click reset. In log mode
+/// only positive Y values count.
+fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
     let mut range: Option<(f64, f64, f64, f64)> = None;
-    for p in points {
-        let Some(&v) = p.values.first() else {
-            continue;
-        };
-        if !p.freq_hz.is_finite() || !v.is_finite() {
-            continue;
+    for series in &opts.series {
+        for &(x, y) in &series.points {
+            if !x.is_finite() || !y.is_finite() || (opts.log_y && y <= 0.0) {
+                continue;
+            }
+            range = Some(match range {
+                None => (x, x, y, y),
+                Some((x0, x1, y0, y1)) => (x0.min(x), x1.max(x), y0.min(y), y1.max(y)),
+            });
         }
-        range = Some(match range {
-            None => (p.freq_hz, p.freq_hz, v, v),
-            Some((x0, x1, y0, y1)) => (x0.min(p.freq_hz), x1.max(p.freq_hz), y0.min(v), y1.max(v)),
-        });
     }
     range.map(|(x0, x1, y0, y1)| {
-        let pad = ((y1 - y0) * 0.05).max(1.0);
-        (x0, x1, y0 - pad, y1 + pad)
+        if opts.log_y {
+            let (a0, a1) = (y0.log10(), y1.log10());
+            let pad = ((a1 - a0) * 0.05).max(0.05);
+            (x0, x1, 10f64.powf(a0 - pad), 10f64.powf(a1 + pad))
+        } else {
+            let pad = ((y1 - y0) * 0.05).max(1.0);
+            (x0, x1, y0 - pad, y1 + pad)
+        }
     })
 }
 
-fn draw_grid(painter: &egui::Painter, view: &PlotView, plot_rect: Rect) {
+fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, plot_rect: Rect) {
     let font = FontId::monospace(LABEL_FONT_SIZE);
     let x_span = view.x_max - view.x_min;
-    let y_span = view.y_max - view.y_min;
+    let (a_min, a_max) = (
+        to_axis(opts.log_y, view.y_min),
+        to_axis(opts.log_y, view.y_max),
+    );
+    let a_span = a_max - a_min;
+    let y_to_screen =
+        |a: f64| plot_rect.bottom() - ((a - a_min) / a_span) as f32 * plot_rect.height();
 
     // X axis: frequency with an SI prefix chosen from the visible range.
     let (unit, scale) = si_unit(view.x_min.abs().max(view.x_max.abs()));
@@ -263,31 +353,54 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, plot_rect: Rect) {
         x += x_step;
     }
 
-    // Y axis: whole-dBm steps so labels stay integers.
-    let y_step = nice_int_step(y_span, TARGET_DIVISIONS) as f64;
-    let mut y = first_tick(view.y_min, y_step);
-    while y <= view.y_max + y_step * 1e-6 {
-        let sy = plot_rect.bottom() - ((y - view.y_min) / y_span) as f32 * plot_rect.height();
-        painter.line_segment(
-            [
-                Pos2::new(plot_rect.left(), sy),
-                Pos2::new(plot_rect.right(), sy),
-            ],
-            Stroke::new(1.0, GRID_COLOR),
-        );
-        painter.text(
-            Pos2::new(plot_rect.left() - 4.0, sy),
-            Align2::RIGHT_CENTER,
-            format!("{}", y.round() as i64),
-            font.clone(),
-            TEXT_COLOR,
-        );
-        y += y_step;
+    // Y axis: powers of ten in log mode, 1-2-5 steps in linear mode.
+    if opts.log_y {
+        let mut exp = a_min.ceil() as i32;
+        while (exp as f64) <= a_max + 1e-9 {
+            let sy = y_to_screen(exp as f64);
+            painter.line_segment(
+                [
+                    Pos2::new(plot_rect.left(), sy),
+                    Pos2::new(plot_rect.right(), sy),
+                ],
+                Stroke::new(1.0, GRID_COLOR),
+            );
+            painter.text(
+                Pos2::new(plot_rect.left() - 4.0, sy),
+                Align2::RIGHT_CENTER,
+                format_pow10(exp),
+                font.clone(),
+                TEXT_COLOR,
+            );
+            exp += 1;
+        }
+    } else {
+        let y_step = nice_step(a_span, TARGET_DIVISIONS);
+        let y_dec = decimals(y_step);
+        let mut y = first_tick(a_min, y_step);
+        while y <= a_max + y_step * 1e-6 {
+            let sy = y_to_screen(y);
+            painter.line_segment(
+                [
+                    Pos2::new(plot_rect.left(), sy),
+                    Pos2::new(plot_rect.right(), sy),
+                ],
+                Stroke::new(1.0, GRID_COLOR),
+            );
+            painter.text(
+                Pos2::new(plot_rect.left() - 4.0, sy),
+                Align2::RIGHT_CENTER,
+                format!("{:.*}", y_dec, y),
+                font.clone(),
+                TEXT_COLOR,
+            );
+            y += y_step;
+        }
     }
     painter.text(
         Pos2::new(plot_rect.left() + 4.0, plot_rect.top() + 2.0),
         Align2::LEFT_TOP,
-        "dBm",
+        opts.y_label,
         font.clone(),
         TEXT_COLOR,
     );
@@ -300,43 +413,30 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, plot_rect: Rect) {
     );
 }
 
-/// Draw the trace polyline. Only the visible index window (plus one
-/// neighbor on each side, for continuity at the edges) is projected to
-/// screen coordinates; sweeps are sorted by frequency, so
-/// `partition_point` finds the window without scanning everything.
-fn draw_trace(painter: &egui::Painter, view: &PlotView, trace: &SweepData) {
-    let stroke = Stroke::new(1.5, TRACE_COLORS[0]);
-    let points = &trace.points;
+/// Draw one series polyline. Runs break at non-finite points and, in log
+/// mode, at non-positive Y values, so a gap does not smear a line
+/// across the plot.
+fn draw_series(painter: &egui::Painter, view: &PlotView, log_y: bool, series: &Series) {
+    let stroke = Stroke::new(1.5, series.color);
     let x_span = (view.x_max - view.x_min).max(MIN_SPAN);
-    let y_span = (view.y_max - view.y_min).max(MIN_SPAN);
+    let (a_min, a_max) = (to_axis(log_y, view.y_min), to_axis(log_y, view.y_max));
+    let a_span = (a_max - a_min).max(MIN_SPAN);
     let rect = painter.clip_rect();
-    let to_screen = |freq: f64, level: f64| {
+    let to_screen = |x: f64, y: f64| {
         Pos2::new(
-            rect.left() + ((freq - view.x_min) / x_span) as f32 * rect.width(),
-            rect.bottom() - ((level - view.y_min) / y_span) as f32 * rect.height(),
+            rect.left() + ((x - view.x_min) / x_span) as f32 * rect.width(),
+            rect.bottom() - ((to_axis(log_y, y) - a_min) / a_span) as f32 * rect.height(),
         )
     };
 
-    let start = points
-        .partition_point(|p| p.freq_hz < view.x_min)
-        .saturating_sub(1);
-    let end = (points.partition_point(|p| p.freq_hz <= view.x_max) + 1).min(points.len());
-
-    // Split into runs at non-finite samples so a gap does not smear a
-    // line across the plot.
     let mut run: Vec<Pos2> = Vec::new();
-    for p in &points[start..end] {
-        match p.values.first() {
-            Some(&level) if level.is_finite() && p.freq_hz.is_finite() => {
-                run.push(to_screen(p.freq_hz, level));
-            }
-            _ => {
-                if run.len() >= 2 {
-                    painter.add(Shape::line(std::mem::take(&mut run), stroke));
-                } else {
-                    run.clear();
-                }
-            }
+    for &(x, y) in &series.points {
+        if x.is_finite() && y.is_finite() && (!log_y || y > 0.0) {
+            run.push(to_screen(x, y));
+        } else if run.len() >= 2 {
+            painter.add(Shape::line(std::mem::take(&mut run), stroke));
+        } else {
+            run.clear();
         }
     }
     if run.len() >= 2 {
@@ -344,11 +444,30 @@ fn draw_trace(painter: &egui::Painter, view: &PlotView, trace: &SweepData) {
     }
 }
 
-/// Crosshair lines and a (frequency, level) readout of the data
-/// coordinates under the mouse.
+/// Series key: the shared y_label sits at the top left already, so this
+/// only draws per-series color swatches at the top right when more than
+/// one series is on screen (series carry no names).
+fn draw_legend(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) {
+    if opts.series.len() < 2 {
+        return;
+    }
+    let mut x = plot_rect.right() - 16.0;
+    let y = plot_rect.top() + 8.0;
+    for series in opts.series.iter().rev() {
+        painter.line_segment(
+            [Pos2::new(x - 12.0, y), Pos2::new(x, y)],
+            Stroke::new(2.0, series.color),
+        );
+        x -= 20.0;
+    }
+}
+
+/// Crosshair lines and a (frequency, value) readout of the data
+/// coordinates under the mouse. Log mode reports the raw value.
 fn draw_cursor(
     painter: &egui::Painter,
     view: &PlotView,
+    opts: &PlotOptions,
     plot_rect: Rect,
     response: &egui::Response,
 ) {
@@ -375,13 +494,23 @@ fn draw_cursor(
 
     let freq = view.x_min
         + ((pos.x - plot_rect.left()) / plot_rect.width()) as f64 * (view.x_max - view.x_min);
-    let level = view.y_max
-        - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64 * (view.y_max - view.y_min);
+    let (a_min, a_max) = (
+        to_axis(opts.log_y, view.y_min),
+        to_axis(opts.log_y, view.y_max),
+    );
+    let a = a_max - ((pos.y - plot_rect.top()) / plot_rect.height()) as f64 * (a_max - a_min);
+    let value = from_axis(opts.log_y, a);
     let (unit, scale) = si_unit(freq.abs());
     painter.text(
-        Pos2::new(plot_rect.right() - 4.0, plot_rect.top() + 2.0),
-        Align2::RIGHT_TOP,
-        format!("{:.3} {}  {:.1} dBm", freq / scale, unit, level),
+        Pos2::new(plot_rect.right() - 4.0, plot_rect.bottom() - 4.0),
+        Align2::RIGHT_BOTTOM,
+        format!(
+            "{:.3} {}  {} {}",
+            freq / scale,
+            unit,
+            format_value(value),
+            opts.y_label
+        ),
         FontId::monospace(LABEL_FONT_SIZE),
         TEXT_COLOR,
     );
@@ -390,7 +519,6 @@ fn draw_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kcsdi_core::protocol::StreamMode;
 
     #[test]
     fn nice_step_picks_1_2_5() {
@@ -406,14 +534,6 @@ mod tests {
         assert_eq!(nice_step(0.0, 10), 1.0);
         assert_eq!(nice_step(-5.0, 10), 1.0);
         assert_eq!(nice_step(f64::NAN, 10), 1.0);
-    }
-
-    #[test]
-    fn nice_int_step_stays_a_positive_integer() {
-        assert_eq!(nice_int_step(3.0, 10), 1);
-        assert_eq!(nice_int_step(100.0, 10), 10);
-        assert_eq!(nice_int_step(95.0, 10), 10);
-        assert_eq!(nice_int_step(0.4, 10), 1);
     }
 
     #[test]
@@ -447,6 +567,37 @@ mod tests {
     }
 
     #[test]
+    fn format_pow10_labels_decades() {
+        assert_eq!(format_pow10(0), "1");
+        assert_eq!(format_pow10(1), "10");
+        assert_eq!(format_pow10(2), "100");
+        assert_eq!(format_pow10(3), "1k");
+        assert_eq!(format_pow10(5), "100k");
+        assert_eq!(format_pow10(6), "1M");
+        assert_eq!(format_pow10(-2), "0.01");
+        assert_eq!(format_pow10(12), "1e12");
+    }
+
+    #[test]
+    fn format_value_trims_and_switches_to_scientific() {
+        assert_eq!(format_value(-50.0), "-50");
+        assert_eq!(format_value(2.5), "2.5");
+        assert_eq!(format_value(0.0), "0");
+        assert_eq!(format_value(1.5e7), "1.500e7");
+        assert_eq!(format_value(2.0e-4), "2.000e-4");
+    }
+
+    #[test]
+    fn axis_mapping_roundtrips() {
+        assert_eq!(to_axis(false, 42.0), 42.0);
+        assert_eq!(from_axis(false, 42.0), 42.0);
+        assert!((to_axis(true, 100.0) - 2.0).abs() < 1e-12);
+        assert!((from_axis(true, 2.0) - 100.0).abs() < 1e-9);
+        assert!(to_axis(true, 0.0).is_finite());
+        assert!(to_axis(true, -5.0).is_finite());
+    }
+
+    #[test]
     fn zoom_axis_keeps_anchor_fixed() {
         let (mut min, mut max) = (0.0, 100.0);
         zoom_axis(&mut min, &mut max, 50.0, 0.9);
@@ -457,46 +608,41 @@ mod tests {
         assert!((max - 100.0).abs() < 1e-9);
     }
 
+    fn opts_with_points(points: &[(f64, f64)], log_y: bool) -> PlotOptions<'static> {
+        PlotOptions {
+            y_label: "dBm",
+            log_y,
+            series: vec![Series {
+                color: Color32::WHITE,
+                points: points.to_vec(),
+            }],
+        }
+    }
+
     #[test]
     fn data_range_covers_points_with_headroom() {
-        let trace = SweepData {
-            mode: StreamMode::Spec,
-            format: String::new(),
-            points: vec![
-                kcsdi_core::data::SweepPoint {
-                    freq_hz: 1e6,
-                    values: vec![-80.0],
-                },
-                kcsdi_core::data::SweepPoint {
-                    freq_hz: 2e6,
-                    values: vec![-20.0],
-                },
-            ],
-        };
-        let (x0, x1, y0, y1) = data_range(Some(&trace)).unwrap();
+        let opts = opts_with_points(&[(1e6, -80.0), (2e6, -20.0)], false);
+        let (x0, x1, y0, y1) = data_range(&opts).unwrap();
         assert_eq!((x0, x1), (1e6, 2e6));
         assert_eq!(y0, -83.0);
         assert_eq!(y1, -17.0);
-        assert!(data_range(None).is_none());
+        assert!(data_range(&opts_with_points(&[], false)).is_none());
     }
 
     #[test]
     fn data_range_skips_non_finite_samples() {
-        let trace = SweepData {
-            mode: StreamMode::Spec,
-            format: String::new(),
-            points: vec![
-                kcsdi_core::data::SweepPoint {
-                    freq_hz: 1e6,
-                    values: vec![f64::NAN],
-                },
-                kcsdi_core::data::SweepPoint {
-                    freq_hz: 3e6,
-                    values: vec![-50.0],
-                },
-            ],
-        };
-        let (x0, x1, _, _) = data_range(Some(&trace)).unwrap();
+        let opts = opts_with_points(&[(1e6, f64::NAN), (3e6, -50.0)], false);
+        let (x0, x1, _, _) = data_range(&opts).unwrap();
         assert_eq!((x0, x1), (3e6, 3e6));
+    }
+
+    #[test]
+    fn data_range_log_mode_skips_non_positive_and_pads_decades() {
+        let opts = opts_with_points(&[(1e6, -5.0), (2e6, 0.0), (3e6, 10.0), (4e6, 1000.0)], true);
+        let (x0, x1, y0, y1) = data_range(&opts).unwrap();
+        assert_eq!((x0, x1), (3e6, 4e6));
+        assert!((y0.log10() - (1.0 - 0.1)).abs() < 1e-9);
+        assert!((y1.log10() - (3.0 + 0.1)).abs() < 1e-9);
+        assert!(data_range(&opts_with_points(&[(1e6, 0.0)], true)).is_none());
     }
 }

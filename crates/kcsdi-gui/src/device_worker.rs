@@ -11,11 +11,18 @@
 use std::sync::mpsc;
 
 use kcsdi_core::Device;
-use kcsdi_core::device::SpecParams;
+use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
 use crate::state::{WorkerCommand, WorkerEvent};
+
+/// A repeating sweep job requested by the UI.
+#[derive(Debug, Clone)]
+enum SweepJob {
+    Spec(SpecParams),
+    S11(S11Params),
+}
 
 /// Entry point of the `"device-worker"` thread.
 pub fn device_worker(
@@ -24,7 +31,7 @@ pub fn device_worker(
     ctx: egui::Context,
 ) {
     let mut device: Option<Device<TcpTransport>> = None;
-    let mut spec: Option<SpecParams> = None;
+    let mut job: Option<SweepJob> = None;
 
     let emit = |evt: WorkerEvent| {
         if evt_tx.send(evt).is_err() {
@@ -34,28 +41,32 @@ pub fn device_worker(
     };
 
     loop {
-        if device.is_some() && spec.is_some() {
+        if device.is_some() && job.is_some() {
             // Run one sweep, then drain any pending commands.
-            let params = spec.clone().expect("checked above");
+            let current = job.clone().expect("checked above");
             let dev = device.as_mut().expect("checked above");
-            match dev.sweep_spec(&params) {
-                Ok(data) => emit(WorkerEvent::SpecTrace(data)),
+            let result = match &current {
+                SweepJob::Spec(params) => dev.sweep_spec(params),
+                SweepJob::S11(params) => dev.sweep_s11(params),
+            };
+            match result {
+                Ok(data) => emit(WorkerEvent::SweepTrace(data)),
                 Err(e) => {
                     error!("sweep failed: {e}");
-                    spec = None;
+                    job = None;
                     emit(WorkerEvent::Error(format!("Sweep failed: {e}")));
                 }
             }
             loop {
                 match cmd_rx.try_recv() {
-                    Ok(cmd) => handle(cmd, &mut device, &mut spec, &emit),
+                    Ok(cmd) => handle(cmd, &mut device, &mut job, &emit),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return,
                 }
             }
         } else {
             match cmd_rx.recv() {
-                Ok(cmd) => handle(cmd, &mut device, &mut spec, &emit),
+                Ok(cmd) => handle(cmd, &mut device, &mut job, &emit),
                 Err(_) => return,
             }
         }
@@ -66,12 +77,12 @@ pub fn device_worker(
 fn handle(
     cmd: WorkerCommand,
     device: &mut Option<Device<TcpTransport>>,
-    spec: &mut Option<SpecParams>,
+    job: &mut Option<SweepJob>,
     emit: &dyn Fn(WorkerEvent),
 ) {
     match cmd {
         WorkerCommand::Connect { host, port } => {
-            *spec = None;
+            *job = None;
             match Device::connect(&host, port).and_then(|mut dev| {
                 let info = dev.device_info()?;
                 Ok((dev, info))
@@ -89,17 +100,20 @@ fn handle(
             }
         }
         WorkerCommand::Disconnect => {
-            *spec = None;
+            *job = None;
             if let Some(mut dev) = device.take() {
                 dev.close();
             }
             emit(WorkerEvent::Disconnected);
         }
         WorkerCommand::RunSpec(params) => {
-            *spec = Some(params);
+            *job = Some(SweepJob::Spec(params));
         }
-        WorkerCommand::StopSpec => {
-            *spec = None;
+        WorkerCommand::RunS11(params) => {
+            *job = Some(SweepJob::S11(params));
+        }
+        WorkerCommand::StopSweep => {
+            *job = None;
         }
         WorkerCommand::RefreshStatus => {
             if let Some(dev) = device.as_mut() {

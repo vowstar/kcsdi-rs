@@ -16,6 +16,11 @@ V1.6.1).
 - S11 and spectrum sweeps with CSV export (CLI)
 - Spectrum analyzer GUI: live trace plot with cursor-anchored zoom and
   pan, sweep parameters, RBW and reference level control
+- S11 GUI: five display modes (Phase, Return Loss, VSWR, Smith chart,
+  Impedance) with linear/log Y axis toggle
+- GUI settings persist across restarts in the platform-standard config
+  directory (`~/.config/kcsdi/config.toml` on Linux), overridable via
+  `KCSDI_CONFIG_PATH`
 - Protocol implementation verified against a real
   KC901V (firmware V1.6.1)
 
