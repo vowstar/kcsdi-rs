@@ -3,7 +3,7 @@
 
 //! Theme, fonts, and design tokens.
 //!
-//! Tokens follow the KCSDI reference interface (the reference UI analysis
+//! Tokens follow the KCSDI reference interface (reference UI analysis
 //! section 4): dark theme, primary #4696d3, a fixed trace color sequence,
 //! monospace numerals for readouts.
 

@@ -4,7 +4,7 @@
 //! KC901 instrument protocol library.
 //!
 //! Blocking I/O implementation of the KC901 text protocol documented in
-//! `the protocol reference`:
+//! the project protocol reference:
 //!
 //! - [`transport`]: line-oriented transports (TCP),
 //! - [`protocol`]: `$start`/`$end` packet and measurement stream parsers,

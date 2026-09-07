@@ -67,7 +67,7 @@ pub enum AppMode {
 }
 
 /// S11 display formats, matching the reference interface tabs
-/// (the protocol reference 4.4).
+/// (protocol reference 4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum S11Display {
     /// Phase of S11 in degrees (wire `ma`, column 2).

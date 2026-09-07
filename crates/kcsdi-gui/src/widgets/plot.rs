@@ -5,7 +5,7 @@
 //!
 //! Deliberately not egui_plot: the reference interface uses per-axis
 //! strips and cursor-anchored zoom that do not fit owned axes
-//! (the reference UI analysis section 6). Supports multiple series and
+//! (reference UI analysis section 6). Supports multiple series and
 //! an optional logarithmic Y axis (extension over the reference
 //! interface).
 

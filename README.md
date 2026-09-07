@@ -21,8 +21,7 @@ V1.6.1).
 - GUI settings persist across restarts in the platform-standard config
   directory (`~/.config/kcsdi/config.toml` on Linux), overridable via
   `KCSDI_CONFIG_PATH`
-- Protocol implementation verified against a real
-  KC901V (firmware V1.6.1)
+- Protocol implementation verified against a real KC901V (firmware V1.6.1)
 
 ## Building
 
@@ -57,8 +56,7 @@ kcsdi sweep s11 --host 192.0.2.10 --port 901 \
 The protocol layer is informed by the KC901 programming manual
 (B002-008, 3rd edition, KeXinShe) and cross-checked against the
 documented device behavior of the KCSDI application (MEASALL Technology).
-See `the protocol reference` for the full reference and NOTICE
-for credits.
+See NOTICE for credits.
 
 ## License
 
