@@ -298,6 +298,7 @@ fn draw_grid(painter: &egui::Painter, mapping: &Mapping) {
 
 /// Normalized resistance labels sit on the real axis. Reactance labels
 /// sit at the unit-circle ends of their arcs, positive above the axis.
+/// Reference loads and region captions share the same collision check.
 fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
     let font = FontId::monospace(LABEL_FONT_SIZE);
     let mut occupied: Vec<Rect> = Vec::new();
@@ -317,11 +318,28 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
         }
     };
 
-    // Give the matched-load label priority in a crowded view.
-    for r in [1.0]
-        .into_iter()
-        .chain(RESISTANCE_GRID.into_iter().filter(|r| *r != 1.0))
-    {
+    // Keep the matched load readable before adding the other labels.
+    label(
+        "1".to_string(),
+        mapping.to_screen(0.0, 0.0) + egui::vec2(0.0, -3.0),
+        Align2::CENTER_BOTTOM,
+    );
+    for (u, text, align) in [
+        (0.0, "MATCH", Align2::CENTER_TOP),
+        (-1.0, "SHORT", Align2::LEFT_TOP),
+        (1.0, "OPEN", Align2::RIGHT_TOP),
+    ] {
+        let at = mapping.to_screen(u, 0.0);
+        if rect.shrink(4.0).contains(at) {
+            painter.circle_stroke(at, 3.0, Stroke::new(1.0, TEXT_COLOR));
+            label(
+                text.to_string(),
+                at + egui::vec2(-u as f32 * 6.0, 6.0),
+                align,
+            );
+        }
+    }
+    for r in RESISTANCE_GRID.into_iter().filter(|r| *r != 1.0) {
         let (u, v) = gamma_of(r, 0.0, 1.0);
         label(
             r.to_string(),
@@ -362,6 +380,18 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
                 format!("{}j{x}", if sign > 0.0 { "+" } else { "-" }),
                 at,
                 align,
+            );
+        }
+    }
+
+    // These describe regions, not extra grid lines. Omit them when the
+    // circle is too small to leave the trace and numeric labels readable.
+    if mapping.scale >= 100.0 {
+        for (v, text) in [(0.7, "Inductive (+X)"), (-0.7, "Capacitive (-X)")] {
+            label(
+                text.to_string(),
+                mapping.to_screen(-0.35, v),
+                Align2::CENTER_CENTER,
             );
         }
     }
@@ -580,7 +610,7 @@ mod tests {
         let labels = rendered_labels(rect, SmithView::default());
         assert_eq!(
             labels.len(),
-            RESISTANCE_GRID.len() + 2 * REACTANCE_GRID.len() + 2
+            RESISTANCE_GRID.len() + 2 * REACTANCE_GRID.len() + 7
         );
         for r in RESISTANCE_GRID {
             let (_, bounds) = labels
@@ -609,6 +639,108 @@ mod tests {
         }
         assert!(labels.iter().any(|(text, _)| text == "0"));
         assert!(labels.iter().any(|(text, _)| text == "inf"));
+    }
+
+    #[test]
+    fn reference_load_labels_follow_their_gamma_positions() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        for view in [
+            SmithView::default(),
+            SmithView {
+                zoom: 0.75,
+                dx: 0.1,
+                dy: -0.2,
+            },
+        ] {
+            let mapping = Mapping::new(rect, &view);
+            let labels = rendered_labels(rect, view);
+            for (u, text) in [(-1.0, "SHORT"), (0.0, "MATCH"), (1.0, "OPEN")] {
+                let (_, bounds) = labels.iter().find(|(label, _)| label == text).unwrap();
+                let at = mapping.to_screen(u, 0.0);
+                assert!((bounds.top() - at.y - 6.0).abs() < 1e-4);
+                let label_x = match text {
+                    "SHORT" => bounds.left() - 6.0,
+                    "OPEN" => bounds.right() + 6.0,
+                    _ => bounds.center().x,
+                };
+                assert!((label_x - at.x).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn region_labels_follow_reactance_sign_and_hide_when_crowded() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        for view in [
+            SmithView::default(),
+            SmithView {
+                zoom: 1.2,
+                dx: 0.05,
+                dy: 0.05,
+            },
+        ] {
+            let mapping = Mapping::new(rect, &view);
+            let labels = rendered_labels(rect, view);
+            let (_, upper) = labels
+                .iter()
+                .find(|(text, _)| text == "Inductive (+X)")
+                .unwrap();
+            let (_, lower) = labels
+                .iter()
+                .find(|(text, _)| text == "Capacitive (-X)")
+                .unwrap();
+            let axis_y = mapping.to_screen(0.0, 0.0).y;
+            assert!(upper.bottom() < axis_y);
+            assert!(lower.top() > axis_y);
+            assert!((upper.center() - mapping.to_screen(-0.35, 0.7)).length() < 1e-4);
+            assert!((lower.center() - mapping.to_screen(-0.35, -0.7)).length() < 1e-4);
+        }
+        let labels = rendered_labels(
+            rect,
+            SmithView {
+                zoom: MIN_ZOOM,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|(text, _)| text.contains("Inductive") || text.contains("Capacitive"))
+        );
+    }
+
+    #[test]
+    fn reference_markers_use_ideal_short_match_and_open_coordinates() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0));
+        let mapping = Mapping::new(rect, &SmithView::default());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_grid_labels(ui.painter(), &mapping, rect);
+            },
+        );
+        let markers: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Circle(circle) => Some(circle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 3);
+        for u in [-1.0, 0.0, 1.0] {
+            let marker = markers
+                .iter()
+                .find(|marker| marker.center == mapping.to_screen(u, 0.0))
+                .unwrap();
+            assert_eq!(marker.radius, 3.0);
+            assert_eq!(marker.stroke.color, TEXT_COLOR);
+        }
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -690,6 +822,15 @@ mod tests {
         assert!(labels.iter().any(|(text, _)| text == "r = R/Z0   x = X/Z0"));
         assert!(labels.iter().any(|(text, _)| text == "+j1"));
         assert!(labels.iter().any(|(text, _)| text == "-j1"));
+        for expected in [
+            "SHORT",
+            "MATCH",
+            "OPEN",
+            "Inductive (+X)",
+            "Capacitive (-X)",
+        ] {
+            assert!(labels.iter().any(|(text, _)| text == expected));
+        }
         let (_, no_data) = labels.iter().find(|(text, _)| text == "No data").unwrap();
         assert!(no_data.top() >= rect.bottom() - FOOTER_HEIGHT);
         output.drop_without_applying_deltas();
