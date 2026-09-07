@@ -7,6 +7,7 @@
 //! egui/eframe, modeled after the KCSDI reference interface.
 
 mod app;
+mod config;
 mod device_worker;
 mod panels;
 mod state;

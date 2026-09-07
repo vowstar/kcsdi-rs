@@ -4,14 +4,19 @@
 //! Main application struct and eframe::App implementation.
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use log::info;
+use log::{info, warn};
 
+use crate::config::AppConfig;
 use crate::device_worker;
 use crate::panels;
 use crate::state::{AppState, ConnectionState, WorkerEvent};
 use crate::theme;
 use crate::widgets;
+
+/// Debounce before persisting config changes to disk.
+const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// The main kcsdi GUI application.
 pub struct KcsdiApp {
@@ -19,6 +24,10 @@ pub struct KcsdiApp {
     pub state: AppState,
     /// Receiver for events from the device worker thread.
     evt_rx: mpsc::Receiver<WorkerEvent>,
+    /// Last persisted config snapshot, for change detection.
+    last_saved: AppConfig,
+    /// When the first unsaved change happened (debounce start).
+    dirty_since: Option<Instant>,
 }
 
 impl KcsdiApp {
@@ -37,12 +46,18 @@ impl KcsdiApp {
             })
             .expect("failed to spawn device worker thread");
 
+        let cfg = crate::config::load();
+        let mut state = AppState {
+            cmd_tx: Some(cmd_tx),
+            ..AppState::default()
+        };
+        cfg.apply_to(&mut state);
+
         Self {
-            state: AppState {
-                cmd_tx: Some(cmd_tx),
-                ..AppState::default()
-            },
+            last_saved: AppConfig::from_state(&state),
+            state,
             evt_rx,
+            dirty_since: None,
         }
     }
 
@@ -81,6 +96,30 @@ impl KcsdiApp {
             }
         }
     }
+    /// Save the config after a quiet period, so bursts of edits (dragging
+    /// a frequency field) produce at most one write.
+    fn persist_config_debounced(&mut self) {
+        let current = AppConfig::from_state(&self.state);
+        if current == self.last_saved {
+            self.dirty_since = None;
+            return;
+        }
+        let since = self.dirty_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= CONFIG_SAVE_DELAY {
+            self.persist_config();
+        }
+    }
+
+    /// Write the current config to disk immediately.
+    fn persist_config(&mut self) {
+        let current = AppConfig::from_state(&self.state);
+        if let Err(e) = crate::config::save(&current) {
+            warn!("failed to save config: {e}");
+        } else {
+            self.last_saved = current;
+        }
+        self.dirty_since = None;
+    }
 }
 
 impl eframe::App for KcsdiApp {
@@ -111,5 +150,10 @@ impl eframe::App for KcsdiApp {
 
         // Pick up worker events promptly even when idle.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        self.persist_config_debounced();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_config();
     }
 }
