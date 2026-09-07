@@ -13,6 +13,7 @@ use kcsdi_core::data::{DeviceInfo, SweepData, Voltage};
 use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::model::Rbw;
 
+use crate::i18n::{Language, StatusMessage, Text};
 use crate::widgets::plot::PlotView;
 use crate::widgets::smith::SmithView;
 
@@ -92,14 +93,14 @@ impl S11Display {
         Self::Impedance,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Phase => "Phase",
-            Self::ReturnLoss => "Return Loss",
-            Self::Vswr => "VSWR",
-            Self::Smith => "Smith",
-            Self::Impedance => "Impedance",
-        }
+    pub fn label(self, language: Language) -> &'static str {
+        language.text(match self {
+            Self::Phase => Text::Phase,
+            Self::ReturnLoss => Text::ReturnLoss,
+            Self::Vswr => Text::Vswr,
+            Self::Smith => Text::Smith,
+            Self::Impedance => Text::Impedance,
+        })
     }
 
     /// Wire format sent in the `run` command.
@@ -295,6 +296,8 @@ impl S11State {
 
 /// Application state shared across all panels.
 pub struct AppState {
+    /// Language for labels and UI messages, independent of protocol data.
+    pub language: Language,
     /// Host field of the connection bar.
     pub host: String,
     /// Port field of the connection bar.
@@ -309,7 +312,7 @@ pub struct AppState {
     pub spec: SpecState,
     pub s11: S11State,
     /// Transient message for the status bar.
-    pub status_message: Option<String>,
+    pub status_message: Option<StatusMessage>,
     /// Command channel to the device worker thread.
     pub cmd_tx: Option<mpsc::Sender<WorkerCommand>>,
 }
@@ -317,6 +320,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            language: Language::default(),
             host: String::new(),
             port: 901,
             connection: ConnectionState::Disconnected,

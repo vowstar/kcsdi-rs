@@ -122,3 +122,40 @@ fn visuals() -> egui::Visuals {
 
     visuals
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{Language, Text};
+
+    #[test]
+    fn embedded_font_covers_every_translation_in_both_ui_families() {
+        let ctx = egui::Context::default();
+        setup(&ctx);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.fonts_mut(|fonts| {
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    let mut font = fonts.fonts.font(&family);
+                    // Inspect the character map directly. egui 0.36's
+                    // has_glyph can reject glyphs sharing the fallback face.
+                    let characters = font.characters();
+                    for language in Language::ALL {
+                        let strings = std::iter::once(language.label())
+                            .chain(Text::ALL.iter().map(|&key| language.text(key)))
+                            .chain(std::iter::once("中文 日本語 한국어"));
+                        for text in strings {
+                            for character in text.chars() {
+                                assert!(
+                                    characters.contains_key(&character),
+                                    "{family:?}: {language:?}: U+{:04X}",
+                                    character as u32
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        output.drop_without_applying_deltas();
+    }
+}

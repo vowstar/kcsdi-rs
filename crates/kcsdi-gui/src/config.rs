@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
+use crate::i18n::Language;
 use crate::state::{AppMode, AppState, S11Display};
 
 /// Environment variable that overrides the config file path.
@@ -35,6 +36,8 @@ pub const CONFIG_VERSION: u32 = 1;
 #[serde(default)]
 pub struct AppConfig {
     pub version: u32,
+    /// UI language tag. Unknown languages fall back to English.
+    pub language: Language,
     /// Last-used function mode ("spec" or "s11").
     pub mode: String,
     pub connection: Connection,
@@ -120,6 +123,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            language: Language::default(),
             mode: mode_as_str(AppMode::default()).to_string(),
             connection: Connection::default(),
             spec: Spec::default(),
@@ -169,6 +173,7 @@ impl AppConfig {
     pub fn from_state(state: &AppState) -> Self {
         Self {
             version: CONFIG_VERSION,
+            language: state.language,
             mode: mode_as_str(state.mode).to_string(),
             connection: Connection {
                 host: state.host.clone(),
@@ -197,6 +202,7 @@ impl AppConfig {
     /// Apply loaded settings to freshly initialized UI state. Unknown
     /// strings fall back to defaults instead of failing.
     pub fn apply_to(&self, state: &mut AppState) {
+        state.language = self.language;
         state.host = self.connection.host.clone();
         state.port = self.connection.port;
         state.mode = parse_mode(&self.mode);
@@ -288,6 +294,31 @@ mod tests {
     }
 
     #[test]
+    fn language_tags_roundtrip_and_unknown_tags_keep_other_settings() {
+        for language in Language::ALL {
+            let cfg = AppConfig {
+                language,
+                ..AppConfig::default()
+            };
+            let text = toml::to_string_pretty(&cfg).unwrap();
+            let parsed: AppConfig = toml::from_str(&text).unwrap();
+            assert_eq!(parsed, cfg);
+            assert!(text.contains(match language {
+                Language::English => "language = \"en\"",
+                Language::SimplifiedChinese => "language = \"zh-CN\"",
+            }));
+        }
+        let cfg: AppConfig = toml::from_str(
+            "language = \"future-language\"\n[connection]\nhost = \"example.invalid\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.language, Language::English);
+        assert_eq!(cfg.connection.host, "example.invalid");
+        let legacy: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(legacy.language, Language::English);
+    }
+
+    #[test]
     fn partial_file_uses_defaults() {
         let cfg: AppConfig = toml::from_str("[connection]\nhost = \"example.invalid\"\n").unwrap();
         assert_eq!(cfg.connection.host, "example.invalid");
@@ -348,6 +379,7 @@ rbw = "30k"
     #[allow(clippy::field_reassign_with_default)]
     fn state_roundtrip() {
         let mut state = AppState::default();
+        state.language = Language::SimplifiedChinese;
         state.host = "analyzer.example.invalid".to_string();
         state.port = 5025;
         state.mode = AppMode::S11;
@@ -363,6 +395,7 @@ rbw = "30k"
         let cfg = AppConfig::from_state(&state);
         let mut restored = AppState::default();
         cfg.apply_to(&mut restored);
+        assert_eq!(restored.language, Language::SimplifiedChinese);
         assert_eq!(restored.host, "analyzer.example.invalid");
         assert_eq!(restored.port, 5025);
         assert_eq!(restored.spec.start_hz, state.spec.start_hz);

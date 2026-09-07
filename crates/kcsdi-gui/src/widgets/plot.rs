@@ -7,6 +7,8 @@
 //! axis, and cursor-anchored zoom (reference UI analysis section 6).
 //! Y always uses the original signed measurement units.
 
+use crate::i18n::{Text, language};
+
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind};
 
 /// One drawn trace.
@@ -107,10 +109,8 @@ const CURSOR_COLOR: Color32 = Color32::from_rgb(0x90, 0x90, 0x90);
 
 /// Shared frequency-axis control for SPEC and S11 cartesian displays.
 pub fn log_x_control(ui: &mut egui::Ui, log_x: &mut bool) -> bool {
-    ui.checkbox(log_x, "LOG X")
-        .on_hover_text(
-            "Base-10 frequency axis. Only positive frequencies can be shown. Changes the display, not sweep sampling. Y remains linear.",
-        )
+    ui.checkbox(log_x, language(ui.ctx()).text(Text::LogX))
+        .on_hover_text(language(ui.ctx()).text(Text::LogXHelp))
         .changed()
 }
 
@@ -395,11 +395,11 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> V
             rect.center(),
             Align2::CENTER_CENTER,
             if !opts.series.is_empty() && opts.visible_series().next().is_none() {
-                "All traces hidden"
+                language(ui.ctx()).text(Text::AllTracesHidden)
             } else if opts.log_x && has_samples {
-                "No data at positive frequencies"
+                language(ui.ctx()).text(Text::NoPositiveData)
             } else {
-                "No data"
+                language(ui.ctx()).text(Text::NoData)
             },
             FontId::monospace(14.0),
             TEXT_COLOR,
@@ -648,9 +648,9 @@ fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(if series.visible {
-                "Click to hide this trace"
+                language(ui.ctx()).text(Text::HideTrace)
             } else {
-                "Click to show this trace"
+                language(ui.ctx()).text(Text::ShowTrace)
             });
         if response.clicked() {
             series.visible = !series.visible;
@@ -1240,6 +1240,27 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn empty_plot_messages_follow_live_language_changes() {
+        let ctx = egui::Context::default();
+        crate::theme::setup(&ctx);
+        let mut opts = impedance_options();
+        for selected in crate::i18n::Language::ALL {
+            crate::i18n::set_language(&ctx, selected);
+            for series in &mut opts.series {
+                series.visible = false;
+            }
+            let mut view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+            let (_, output) = widget_frame(&ctx, &mut view, &mut opts, vec![], 0.0);
+            assert!(
+                text_shapes(&output)
+                    .iter()
+                    .any(|(text, _)| text == selected.text(Text::AllTracesHidden))
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 
     fn click_legend(

@@ -6,6 +6,7 @@
 use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
+use crate::i18n::{Language, StatusMessage, Text};
 use crate::state::{AppState, ConnectionState, S11Display, WorkerCommand};
 use crate::theme::PRIMARY;
 
@@ -16,6 +17,15 @@ const MAX_MHZ: f64 = 6800.0;
 
 /// Calibration choices in display order (no `Cal::ALL` in core).
 const CALS: [Cal; 4] = [Cal::CalOn, Cal::CalOff, Cal::CalSys, Cal::CalUser];
+
+fn cal_label(cal: Cal, language: Language) -> &'static str {
+    language.text(match cal {
+        Cal::CalOn => Text::CalOn,
+        Cal::CalOff => Text::CalOff,
+        Cal::CalSys => Text::CalSys,
+        Cal::CalUser => Text::CalUser,
+    })
+}
 
 /// Draw the S11 parameter panel. Signature is a module contract; do not
 /// change it.
@@ -29,7 +39,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            group_heading(ui, "SWEEP");
+            group_heading(ui, state.language.text(Text::Sweep));
             // Parameter edits are locked while a sweep is running.
             ui.add_enabled_ui(!running, |ui| {
                 sweep_fields(ui, state);
@@ -52,7 +62,11 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal_wrapped(|ui| {
         for display in S11Display::ALL {
             if ui
-                .selectable_value(&mut state.s11.display, display, display.label())
+                .selectable_value(
+                    &mut state.s11.display,
+                    display,
+                    display.label(state.language),
+                )
                 .changed()
             {
                 state.s11.needs_fit = true;
@@ -69,7 +83,7 @@ fn display_tabs(ui: &mut egui::Ui, state: &mut AppState) {
         if state.s11.running {
             state.send(WorkerCommand::RunS11(state.s11.s11_params()));
         } else {
-            state.status_message = Some("Run a sweep for this display".to_string());
+            state.status_message = Some(StatusMessage::Text(Text::RunForDisplay));
         }
     }
 }
@@ -84,19 +98,19 @@ fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
             let s11 = &mut state.s11;
-            ui.label("START");
+            ui.label(state.language.text(Text::Start));
             start_stop_edited |= freq_field(ui, &mut s11.start_hz);
             ui.end_row();
-            ui.label("STOP");
+            ui.label(state.language.text(Text::Stop));
             start_stop_edited |= freq_field(ui, &mut s11.stop_hz);
             ui.end_row();
-            ui.label("CENTER");
+            ui.label(state.language.text(Text::Center));
             center_span_edited |= freq_field(ui, &mut s11.center_hz);
             ui.end_row();
-            ui.label("SPAN");
+            ui.label(state.language.text(Text::Span));
             center_span_edited |= freq_field(ui, &mut s11.span_hz);
             ui.end_row();
-            ui.label("POINTS");
+            ui.label(state.language.text(Text::Points));
             ui.add(egui::DragValue::new(&mut s11.points).range(2..=10001));
             ui.end_row();
         });
@@ -110,25 +124,29 @@ fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// CAL selector and the optional RBW pushed before a run.
 fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
-    group_heading(ui, "RECEIVER");
+    group_heading(ui, state.language.text(Text::Receiver));
     egui::Grid::new("s11_receiver_grid")
         .num_columns(2)
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
             let s11 = &mut state.s11;
-            ui.label("CAL");
+            ui.label(state.language.text(Text::Calibration));
             egui::ComboBox::from_id_salt("s11_cal")
-                .selected_text(s11.cal.as_str())
+                .selected_text(cal_label(s11.cal, state.language))
                 .show_ui(ui, |ui| {
                     for cal in CALS {
-                        ui.selectable_value(&mut s11.cal, cal, cal.as_str());
+                        ui.selectable_value(&mut s11.cal, cal, cal_label(cal, state.language))
+                            .on_hover_text(cal.as_str());
                     }
                 });
             ui.end_row();
 
             // RBW is optional on S11 runs: unchecked means no `$bw` push.
             let mut rbw_on = s11.rbw.is_some();
-            if ui.checkbox(&mut rbw_on, "RBW").changed() {
+            if ui
+                .checkbox(&mut rbw_on, state.language.text(Text::Rbw))
+                .changed()
+            {
                 s11.rbw = rbw_on.then_some(Rbw::R10k);
             }
             if let Some(rbw) = &mut s11.rbw {
@@ -146,7 +164,7 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Frequency-axis display control, independent of sweep sampling.
 fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
-    group_heading(ui, "DISPLAY");
+    group_heading(ui, state.language.text(Text::Display));
     ui.add_enabled_ui(state.s11.display != S11Display::Smith, |ui| {
         if crate::widgets::plot::log_x_control(ui, &mut state.s11.log_x) {
             state.s11.needs_fit = true;
@@ -159,13 +177,17 @@ fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
 fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
     let size = [ui.available_width(), 32.0];
     if running {
-        let button = egui::Button::new(egui::RichText::new("STOP").strong()).fill(RED);
+        let button =
+            egui::Button::new(egui::RichText::new(state.language.text(Text::StopSweep)).strong())
+                .fill(RED);
         if ui.add_sized(size, button).clicked() {
             state.s11.running = false;
             state.send(WorkerCommand::StopSweep);
         }
     } else {
-        let button = egui::Button::new(egui::RichText::new("RUN").strong()).fill(PRIMARY);
+        let button =
+            egui::Button::new(egui::RichText::new(state.language.text(Text::Run)).strong())
+                .fill(PRIMARY);
         if ui.add_sized(size, button).clicked() {
             state.send(WorkerCommand::RunS11(state.s11.s11_params()));
             state.s11.running = true;

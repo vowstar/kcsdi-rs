@@ -3,6 +3,7 @@
 
 //! Bottom status bar: transient messages and instrument health.
 
+use crate::i18n::{StatusMessage, Text};
 use crate::state::AppState;
 
 /// Draw the status bar. Signature is a module contract; do not change it.
@@ -11,12 +12,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         ui.spacing_mut().item_spacing.x = 8.0;
 
         if let Some(msg) = &state.status_message {
-            ui.label(msg);
+            if matches!(msg, StatusMessage::Detail(_)) {
+                ui.label(state.language.text(Text::Error));
+            }
+            ui.label(msg.text(state.language));
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let voltage = match &state.voltage {
-                Some(v) => format!("ext {:.2} V / bat {:.2} V", v.external, v.battery),
+                Some(v) => format!(
+                    "{} {:.2} V / {} {:.2} V",
+                    state.language.text(Text::ExternalPower),
+                    v.external,
+                    state.language.text(Text::Battery),
+                    v.battery
+                ),
                 None => "--".to_string(),
             };
             let temperature = match state.temperature {

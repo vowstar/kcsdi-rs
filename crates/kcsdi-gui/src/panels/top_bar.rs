@@ -3,6 +3,7 @@
 
 //! Top bar: connection controls and device identity summary.
 
+use crate::i18n::Text;
 use crate::state::{AppState, ConnectionState, WorkerCommand};
 use crate::theme::PRIMARY;
 
@@ -12,6 +13,7 @@ const RED: egui::Color32 = egui::Color32::from_rgb(0xd3, 0x2f, 0x2f);
 
 /// Draw the top bar. Signature is a module contract; do not change it.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    let language = state.language;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -21,9 +23,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ConnectionState::Disconnected | ConnectionState::Error(_)
         );
         ui.add_enabled_ui(editable, |ui| {
-            ui.label("Host");
+            ui.label(language.text(Text::Host));
             ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(110.0));
-            ui.label("Port");
+            ui.label(language.text(Text::Port));
             ui.add(egui::DragValue::new(&mut state.port).range(1..=65535));
         });
 
@@ -33,7 +35,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
                 let can_connect = !state.host.trim().is_empty();
                 if ui
-                    .add_enabled(can_connect, egui::Button::new("Connect"))
+                    .add_enabled(can_connect, egui::Button::new(language.text(Text::Connect)))
                     .clicked()
                 {
                     let cmd = WorkerCommand::Connect {
@@ -45,11 +47,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             ConnectionState::Connecting => {
-                ui.add_enabled(false, egui::Button::new("Connect"));
+                ui.add_enabled(false, egui::Button::new(language.text(Text::Connect)));
                 ui.add(egui::Spinner::new());
             }
             ConnectionState::Connected => {
-                if ui.button("Disconnect").clicked() {
+                if ui.button(language.text(Text::Disconnect)).clicked() {
                     if state.any_running() {
                         state.spec.running = false;
                         state.s11.running = false;
@@ -61,10 +63,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         let (color, text) = match &state.connection {
-            ConnectionState::Disconnected => (egui::Color32::GRAY, "Disconnected"),
-            ConnectionState::Connecting => (AMBER, "Connecting"),
-            ConnectionState::Connected => (GREEN, "Connected"),
-            ConnectionState::Error(_) => (RED, "Error"),
+            ConnectionState::Disconnected => {
+                (egui::Color32::GRAY, language.text(Text::Disconnected))
+            }
+            ConnectionState::Connecting => (AMBER, language.text(Text::Connecting)),
+            ConnectionState::Connected => (GREEN, language.text(Text::Connected)),
+            ConnectionState::Error(_) => (RED, language.text(Text::Error)),
         };
         status_dot(ui, color);
         ui.label(text);
@@ -74,9 +78,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(info) = &state.device_info {
                     ui.label(
-                        egui::RichText::new(format!("{}  sw {}", info.serial, info.software))
-                            .monospace()
-                            .color(PRIMARY),
+                        egui::RichText::new(format!(
+                            "{}  {} {}",
+                            info.serial,
+                            language.text(Text::Firmware),
+                            info.software
+                        ))
+                        .monospace()
+                        .color(PRIMARY),
                     );
                 }
             });

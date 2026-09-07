@@ -5,6 +5,7 @@
 
 use kcsdi_core::model::Rbw;
 
+use crate::i18n::Text;
 use crate::state::{AppState, ConnectionState, WorkerCommand};
 use crate::theme::PRIMARY;
 
@@ -23,7 +24,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            group_heading(ui, "SWEEP");
+            group_heading(ui, state.language.text(Text::Sweep));
             // Parameter edits are locked while a sweep is running.
             ui.add_enabled_ui(!running, |ui| {
                 sweep_fields(ui, state);
@@ -31,7 +32,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 receiver_fields(ui, state);
             });
 
-            group_heading(ui, "DISPLAY");
+            group_heading(ui, state.language.text(Text::Display));
             if crate::widgets::plot::log_x_control(ui, &mut state.spec.log_x) {
                 state.spec.needs_fit = true;
                 state.spec.view_locked = false;
@@ -53,19 +54,19 @@ fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
             let spec = &mut state.spec;
-            ui.label("START");
+            ui.label(state.language.text(Text::Start));
             start_stop_edited |= freq_field(ui, &mut spec.start_hz);
             ui.end_row();
-            ui.label("STOP");
+            ui.label(state.language.text(Text::Stop));
             start_stop_edited |= freq_field(ui, &mut spec.stop_hz);
             ui.end_row();
-            ui.label("CENTER");
+            ui.label(state.language.text(Text::Center));
             center_span_edited |= freq_field(ui, &mut spec.center_hz);
             ui.end_row();
-            ui.label("SPAN");
+            ui.label(state.language.text(Text::Span));
             center_span_edited |= freq_field(ui, &mut spec.span_hz);
             ui.end_row();
-            ui.label("POINTS");
+            ui.label(state.language.text(Text::Points));
             ui.add(egui::DragValue::new(&mut spec.points).range(2..=10001));
             ui.end_row();
         });
@@ -79,13 +80,13 @@ fn sweep_fields(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// RBW selector and reference level.
 fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
-    group_heading(ui, "RECEIVER");
+    group_heading(ui, state.language.text(Text::Receiver));
     egui::Grid::new("receiver_grid")
         .num_columns(2)
         .spacing([8.0, 8.0])
         .show(ui, |ui| {
             let spec = &mut state.spec;
-            ui.label("RBW");
+            ui.label(state.language.text(Text::Rbw));
             egui::ComboBox::from_id_salt("rbw")
                 .selected_text(spec.rbw.to_string())
                 .show_ui(ui, |ui| {
@@ -94,7 +95,7 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
                     }
                 });
             ui.end_row();
-            ui.label("REF LEVEL");
+            ui.label(state.language.text(Text::RefLevel));
             ui.add(
                 egui::DragValue::new(&mut spec.ref_level_dbm)
                     .range(-30..=0)
@@ -108,13 +109,17 @@ fn receiver_fields(ui: &mut egui::Ui, state: &mut AppState) {
 fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
     let size = [ui.available_width(), 32.0];
     if running {
-        let button = egui::Button::new(egui::RichText::new("STOP").strong()).fill(RED);
+        let button =
+            egui::Button::new(egui::RichText::new(state.language.text(Text::StopSweep)).strong())
+                .fill(RED);
         if ui.add_sized(size, button).clicked() {
             state.spec.running = false;
             state.send(WorkerCommand::StopSweep);
         }
     } else {
-        let button = egui::Button::new(egui::RichText::new("RUN").strong()).fill(PRIMARY);
+        let button =
+            egui::Button::new(egui::RichText::new(state.language.text(Text::Run)).strong())
+                .fill(PRIMARY);
         if ui.add_sized(size, button).clicked() {
             state.send(WorkerCommand::RunSpec(state.spec.spec_params()));
             state.spec.running = true;

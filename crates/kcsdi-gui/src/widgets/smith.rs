@@ -10,6 +10,7 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke};
 use kcsdi_core::data::SweepData;
 
+use crate::i18n::{Text, language};
 use crate::theme::TRACE_COLORS;
 
 /// Nominal system impedance in ohms.
@@ -157,7 +158,7 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
     draw_grid(&clipped, &mapping);
     draw_grid_labels(&clipped, &mapping, chart_rect);
     for (row, text) in [
-        format!("Smith | Z0 = {Z0} ohm"),
+        format!("{} | Z0 = {Z0} ohm", language(ui.ctx()).text(Text::Smith)),
         "r = R/Z0   x = X/Z0".to_string(),
     ]
     .iter()
@@ -177,7 +178,7 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
         painter.text(
             Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
-            "No data",
+            language(ui.ctx()).text(Text::NoData),
             FontId::monospace(14.0),
             TEXT_COLOR,
         );
@@ -300,6 +301,7 @@ fn draw_grid(painter: &egui::Painter, mapping: &Mapping) {
 /// sit at the unit-circle ends of their arcs, positive above the axis.
 /// Reference loads and region captions share the same collision check.
 fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
+    let language = language(painter.ctx());
     let font = FontId::monospace(LABEL_FONT_SIZE);
     let mut occupied: Vec<Rect> = Vec::new();
     let mut label = |text: String, at: Pos2, align: Align2| {
@@ -325,9 +327,9 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
         Align2::CENTER_BOTTOM,
     );
     for (u, text, align) in [
-        (0.0, "MATCH", Align2::CENTER_TOP),
-        (-1.0, "SHORT", Align2::LEFT_TOP),
-        (1.0, "OPEN", Align2::RIGHT_TOP),
+        (0.0, language.text(Text::Match), Align2::CENTER_TOP),
+        (-1.0, language.text(Text::Short), Align2::LEFT_TOP),
+        (1.0, language.text(Text::Open), Align2::RIGHT_TOP),
     ] {
         let at = mapping.to_screen(u, 0.0);
         if rect.shrink(4.0).contains(at) {
@@ -387,7 +389,10 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
     // These describe regions, not extra grid lines. Omit them when the
     // circle is too small to leave the trace and numeric labels readable.
     if mapping.scale >= 100.0 {
-        for (v, text) in [(0.7, "Inductive (+X)"), (-0.7, "Capacitive (-X)")] {
+        for (v, text) in [
+            (0.7, language.text(Text::Inductive)),
+            (-0.7, language.text(Text::Capacitive)),
+        ] {
             label(
                 text.to_string(),
                 mapping.to_screen(-0.35, v),
@@ -834,6 +839,46 @@ mod tests {
         let (_, no_data) = labels.iter().find(|(text, _)| text == "No data").unwrap();
         assert!(no_data.top() >= rect.bottom() - FOOTER_HEIGHT);
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn language_switch_updates_annotations_but_preserves_math_and_units() {
+        let ctx = egui::Context::default();
+        crate::theme::setup(&ctx);
+        for selected in crate::i18n::Language::ALL {
+            crate::i18n::set_language(&ctx, selected);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| show(ui, &mut SmithView::default(), None),
+            );
+            let labels = text_shapes(&output);
+            for key in [
+                Text::Match,
+                Text::Short,
+                Text::Open,
+                Text::Inductive,
+                Text::Capacitive,
+                Text::NoData,
+            ] {
+                assert!(
+                    labels.iter().any(|(text, _)| text == selected.text(key)),
+                    "{selected:?}: {key:?}"
+                );
+            }
+            assert!(
+                labels
+                    .iter()
+                    .any(|(text, _)| text
+                        == &format!("{} | Z0 = 50 ohm", selected.text(Text::Smith)))
+            );
+            for expected in ["r = R/Z0   x = X/Z0", "+j1", "-j1"] {
+                assert!(labels.iter().any(|(text, _)| text == expected));
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

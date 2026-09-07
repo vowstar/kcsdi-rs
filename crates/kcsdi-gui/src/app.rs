@@ -10,6 +10,7 @@ use log::{info, warn};
 
 use crate::config::AppConfig;
 use crate::device_worker;
+use crate::i18n::{self, Language, StatusMessage, Text};
 use crate::panels;
 use crate::state::{AppMode, AppState, ConnectionState, S11Display, WorkerEvent};
 use crate::theme;
@@ -68,7 +69,7 @@ impl KcsdiApp {
                 info!("connected, serial {}", info.serial);
                 self.state.connection = ConnectionState::Connected;
                 self.state.device_info = Some(info);
-                self.state.status_message = Some("Connected".to_string());
+                self.state.status_message = Some(StatusMessage::Text(Text::Connected));
                 self.state.send(crate::state::WorkerCommand::RefreshStatus);
             }
             WorkerEvent::Disconnected => {
@@ -76,7 +77,7 @@ impl KcsdiApp {
                 self.state.device_info = None;
                 self.state.spec.running = false;
                 self.state.s11.running = false;
-                self.state.status_message = Some("Disconnected".to_string());
+                self.state.status_message = Some(StatusMessage::Text(Text::Disconnected));
             }
             WorkerEvent::Error(msg) => {
                 if self.state.connection == ConnectionState::Connecting {
@@ -84,7 +85,7 @@ impl KcsdiApp {
                 }
                 self.state.spec.running = false;
                 self.state.s11.running = false;
-                self.state.status_message = Some(msg);
+                self.state.status_message = Some(msg.into());
             }
             WorkerEvent::SweepTrace(data) => {
                 use kcsdi_core::protocol::StreamMode;
@@ -141,6 +142,7 @@ fn cartesian_series(
     display: S11Display,
     trace: Option<&kcsdi_core::data::SweepData>,
     impedance_visible: [bool; 3],
+    language: Language,
 ) -> Vec<widgets::plot::Series<'static>> {
     let Some(trace) = trace else {
         return Vec::new();
@@ -161,9 +163,17 @@ fn cartesian_series(
             .collect(),
     };
     match display {
-        S11Display::Phase => vec![column("Phase", 1, theme::TRACE_COLORS[0])],
-        S11Display::ReturnLoss => vec![column("RL", 0, theme::TRACE_COLORS[0])],
-        S11Display::Vswr => vec![column("VSWR", 0, theme::TRACE_COLORS[0])],
+        S11Display::Phase => vec![column(
+            language.text(Text::Phase),
+            1,
+            theme::TRACE_COLORS[0],
+        )],
+        S11Display::ReturnLoss => vec![column(
+            language.text(Text::ReturnLoss),
+            0,
+            theme::TRACE_COLORS[0],
+        )],
+        S11Display::Vswr => vec![column(language.text(Text::Vswr), 0, theme::TRACE_COLORS[0])],
         S11Display::Impedance => vec![
             column("|Z|", 0, theme::TRACE_COLORS[0]),
             column("R", 1, theme::TRACE_COLORS[1]),
@@ -173,9 +183,23 @@ fn cartesian_series(
     }
 }
 
+/// The selector remains available while disconnected or scanning.
+fn language_selector(ui: &mut egui::Ui, language: &mut Language) {
+    egui::ComboBox::from_id_salt("language_selector")
+        .selected_text(language.label())
+        .show_ui(ui, |ui| {
+            for choice in Language::ALL {
+                ui.selectable_value(language, choice, choice.label());
+            }
+        });
+    ui.label(language.text(Text::Language));
+    i18n::set_language(ui.ctx(), *language);
+}
+
 impl eframe::App for KcsdiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        i18n::set_language(&ctx, self.state.language);
 
         // Drain all pending events from the device worker.
         while let Ok(evt) = self.evt_rx.try_recv() {
@@ -187,8 +211,15 @@ impl eframe::App for KcsdiApp {
         });
         egui::Panel::top("mode_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.state.mode, AppMode::Spec, "SPEC");
+                ui.selectable_value(
+                    &mut self.state.mode,
+                    AppMode::Spec,
+                    self.state.language.text(Text::Spectrum),
+                );
                 ui.selectable_value(&mut self.state.mode, AppMode::S11, "S11");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    language_selector(ui, &mut self.state.language);
+                });
             });
         });
         egui::Panel::bottom("status_bar").show(ui, |ui| {
@@ -208,7 +239,7 @@ impl eframe::App for KcsdiApp {
                     .trace
                     .as_ref()
                     .map(|t| widgets::plot::Series {
-                        name: "Level",
+                        name: self.state.language.text(Text::Level),
                         color: theme::TRACE_COLORS[0],
                         visible: true,
                         points: t
@@ -241,8 +272,12 @@ impl eframe::App for KcsdiApp {
                         widgets::smith::show(ui, &mut s11.smith, s11.trace.as_ref());
                     }
                     display => {
-                        let series =
-                            cartesian_series(display, s11.trace.as_ref(), s11.impedance_visible);
+                        let series = cartesian_series(
+                            display,
+                            s11.trace.as_ref(),
+                            s11.impedance_visible,
+                            self.state.language,
+                        );
                         let mut opts = widgets::plot::PlotOptions {
                             y_label: display.y_label(),
                             log_x: s11.log_x,
@@ -296,14 +331,29 @@ mod tests {
                 values: vec![50.0, 30.0, -40.0],
             }],
         };
-        let series = cartesian_series(S11Display::Impedance, Some(&data), [true; 3]);
+        let series = cartesian_series(
+            S11Display::Impedance,
+            Some(&data),
+            [true; 3],
+            Language::English,
+        );
         assert_eq!(series.len(), 3);
         assert_eq!(series[2].points, vec![(1e6, -40.0)]);
         for display in [S11Display::Phase, S11Display::ReturnLoss, S11Display::Vswr] {
-            assert!(cartesian_series(display, Some(&data), [true; 3]).is_empty());
+            assert!(
+                cartesian_series(display, Some(&data), [true; 3], Language::English).is_empty()
+            );
         }
         data.mode = StreamMode::S21;
-        assert!(cartesian_series(S11Display::Impedance, Some(&data), [true; 3]).is_empty());
+        assert!(
+            cartesian_series(
+                S11Display::Impedance,
+                Some(&data),
+                [true; 3],
+                Language::English
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -321,8 +371,12 @@ mod tests {
         state.impedance_visible = [false, true, false];
         for magnitude in [50.0, 100.0] {
             data.points[0].values[0] = magnitude;
-            let series =
-                cartesian_series(S11Display::Impedance, Some(&data), state.impedance_visible);
+            let series = cartesian_series(
+                S11Display::Impedance,
+                Some(&data),
+                state.impedance_visible,
+                Language::English,
+            );
             assert_eq!(
                 series.iter().map(|s| s.visible).collect::<Vec<_>>(),
                 [false, true, false]
@@ -331,7 +385,12 @@ mod tests {
             assert_eq!(series[2].points, [(100_000.0, -40.0)]);
         }
         data.format = "ma".to_string();
-        let series = cartesian_series(S11Display::Phase, Some(&data), [false; 3]);
+        let series = cartesian_series(
+            S11Display::Phase,
+            Some(&data),
+            [false; 3],
+            Language::English,
+        );
         assert!(series[0].visible);
     }
 
@@ -349,8 +408,27 @@ mod tests {
                     values,
                 }],
             };
-            let series = cartesian_series(display, Some(&data), [true; 3]);
+            let series = cartesian_series(display, Some(&data), [true; 3], Language::English);
             assert_eq!(series[0].points, vec![(1e6, expected)]);
+        }
+    }
+
+    #[test]
+    fn translating_series_changes_labels_not_measurements() {
+        let data = SweepData {
+            mode: StreamMode::S11,
+            format: "ma".to_string(),
+            points: vec![SweepPoint {
+                freq_hz: 1e6,
+                values: vec![0.5, -90.0],
+            }],
+        };
+        for selected in Language::ALL {
+            let series = cartesian_series(S11Display::Phase, Some(&data), [true; 3], selected);
+            assert_eq!(series[0].name, selected.text(Text::Phase));
+            assert_eq!(series[0].points, [(1e6, -90.0)]);
+            assert_eq!(S11Display::Phase.y_label(), "deg");
+            assert_eq!(S11Display::Phase.wire_format().as_str(), "ma");
         }
     }
 }
