@@ -1,0 +1,12 @@
+kcsdi-rs
+========
+
+The KC901 protocol knowledge in this project is informed by the KC901
+programming manual (B002-008, 3rd edition, KeXinShe) and cross-checked
+against the documented device behavior of the KCSDI application
+(MEASALL Technology, https://www.measall.com/). Both works document how
+the instrument behaves on the wire, and both served as references for
+docs/reference/. Selected facts were verified against a real KC901V.
+
+With gratitude to the authors of the KC901 programming manual and to the
+KCSDI project.
