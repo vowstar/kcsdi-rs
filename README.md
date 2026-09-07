@@ -5,13 +5,17 @@ analyzers (KC901V and relatives), written in Rust. MIT licensed.
 
 Status: early development. The CLI (`kcsdi`) connects to a KC901 over
 TCP/IP, reads identity and status, and runs S11 and spectrum sweeps with
-CSV export. An egui GUI is planned next.
+CSV export. The GUI (`kcsdi-gui`, egui) provides a spectrum analyzer view
+with live sweeps. Both are verified against a real KC901V (firmware
+V1.6.1).
 
 ## Features
 
 - TCP/IP transport (single-connection discipline, clean `$local` exit)
 - KC901 text protocol: handshake, identity, temperature, voltage
-- S11 and spectrum sweeps with CSV export
+- S11 and spectrum sweeps with CSV export (CLI)
+- Spectrum analyzer GUI: live trace plot with cursor-anchored zoom and
+  pan, sweep parameters, RBW and reference level control
 - Protocol implementation verified against a real
   KC901V (firmware V1.6.1)
 
@@ -24,6 +28,9 @@ cargo build --workspace
 ```
 
 ## Usage
+
+`192.0.2.10` below is an RFC 5737 example address; substitute your
+instrument's IP (shown in its network settings).
 
 ```sh
 # Identity and status

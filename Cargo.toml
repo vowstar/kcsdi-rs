@@ -6,6 +6,7 @@ resolver = "3"
 members = [
     "crates/kcsdi-core",
     "crates/kcsdi-cli",
+    "crates/kcsdi-gui",
 ]
 
 [workspace.package]

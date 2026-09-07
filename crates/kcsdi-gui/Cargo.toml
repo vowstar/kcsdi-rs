@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+
+[package]
+name = "kcsdi-gui"
+description = "Graphical interface for KC901 instruments (egui)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kcsdi-gui"
+path = "src/main.rs"
+
+[dependencies]
+kcsdi-core = { path = "../kcsdi-core" }
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+    "persistence",
+] }
+egui_extras = { version = "0.36", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["default-formats"] }
+log = "0.4"
+env_logger = "0.11"
