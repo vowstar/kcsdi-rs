@@ -1,12 +1,21 @@
+SPDX-License-Identifier: MIT
+SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+
 kcsdi-rs
-========
 
-The KC901 protocol knowledge in this project is informed by the KC901
-programming manual (B002-008, 3rd edition, KeXinShe) and cross-checked
-against the documented device behavior of the KCSDI application
-(MEASALL Technology, https://www.measall.com/). Both works document how
-the instrument behaves on the wire, and both served as references for
-docs/reference/. Selected facts were verified against a real KC901V.
+Protocol work is informed by the KC901 programming manual, B002-008,
+third edition, KeXinShe, August 2023, https://www.measall.com/.
+It is cross-checked against device behavior documented by KCSDI from
+MEASALL Technology, https://deepace.net/products/software/kcsdi-software/.
+The interface layout also references KCSDI.
 
-With gratitude to the authors of the KC901 programming manual and to the
-KCSDI project.
+The GUI includes Droid Sans Fallback 2.55b under Apache-2.0.
+Its font metadata credits Google Corporation, 2006, and Ascender Corporation.
+The accompanying notice credits the Android Open Source Project, 2005-2008.
+The full text is in crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt.
+Android font sources: https://android.googlesource.com/platform/frameworks/base/+/android-4.0.4_r2.1/data/fonts/
+
+The CI and release workflows adapt the native build and package process from
+die-yield-calculator, https://github.com/vowstar/die-yield-calculator.
+
+Thanks to these projects for their documentation, fonts and build tools.

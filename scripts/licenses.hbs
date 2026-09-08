@@ -1,0 +1,16 @@
+{{! SPDX-License-Identifier: MIT }}
+{{! SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com> }}
+
+kcsdi-rs dependency notices
+
+{{#each licenses}}
+{{name}}
+
+{{#each used_by}}
+{{crate.name}} {{crate.version}}
+{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}/{{crate.version}}{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

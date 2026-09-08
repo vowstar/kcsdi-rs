@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Check release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Match tag to Cargo version
+        id: version
+        run: |
+          release_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ "${GITHUB_REF_TYPE}" == tag && "${GITHUB_REF_NAME}" != "v${release_version}" ]]; then
+            echo "Tag does not match Cargo version" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor HEAD origin/main
+          echo "version=v${release_version}" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Build ${{ matrix.suffix }}
+    needs: [checks, version]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build GUI and CLI
+        run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+
+      - name: Download dependency notices
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dependency-notices
+          path: package
+
+      - name: Package Unix applications
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p package/LICENSES release-assets
+          cp "target/${{ matrix.target }}/release/kcsdi" package/
+          cp "target/${{ matrix.target }}/release/kcsdi-gui" package/
+          cp LICENSE NOTICE README.md README.zh-CN.md package/
+          cp crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt package/LICENSES/
+          chmod +x package/kcsdi package/kcsdi-gui
+          package/kcsdi --help
+          tar -czf "release-assets/kcsdi-rs-${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz" -C package .
+
+      - name: Package Windows applications
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path package/LICENSES, release-assets
+          Copy-Item "target/${{ matrix.target }}/release/kcsdi.exe" package/
+          Copy-Item "target/${{ matrix.target }}/release/kcsdi-gui.exe" package/
+          Copy-Item -Path LICENSE, NOTICE, README.md, README.zh-CN.md -Destination package/
+          Copy-Item crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt package/LICENSES/
+          & package/kcsdi.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path package/* -DestinationPath "release-assets/kcsdi-rs-${env:RELEASE_VERSION}-${{ matrix.suffix }}.zip"
+
+      - name: Upload native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-asset-${{ matrix.suffix }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-asset-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum kcsdi-rs-* | sort -k2 > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --generate-notes
