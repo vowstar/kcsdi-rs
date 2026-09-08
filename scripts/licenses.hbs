@@ -9,6 +9,7 @@ kcsdi-rs dependency notices
 {{#each used_by}}
 {{crate.name}} {{crate.version}}
 {{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}/{{crate.version}}{{/if}}
+{{#if crate.source}}Source: https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download{{/if}}
 {{/each}}
 
 {{{text}}}

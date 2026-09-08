@@ -12,7 +12,7 @@ The interface layout also references KCSDI.
 The GUI includes Droid Sans Fallback 2.55b under Apache-2.0.
 Its font metadata credits Google Corporation, 2006, and Ascender Corporation.
 The accompanying notice credits the Android Open Source Project, 2005-2008.
-The full text is in crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt.
+The full text accompanies the font as DroidSansFallback-Apache2.0.txt.
 Android font sources: https://android.googlesource.com/platform/frameworks/base/+/android-4.0.4_r2.1/data/fonts/
 
 The CI and release workflows adapt the native build and package process from

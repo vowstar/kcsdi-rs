@@ -91,11 +91,13 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          mkdir -p package/LICENSES release-assets
+          mkdir -p package/LICENSES package/docs release-assets
           cp "target/${{ matrix.target }}/release/kcsdi" package/
           cp "target/${{ matrix.target }}/release/kcsdi-gui" package/
-          cp LICENSE NOTICE README.md README.zh-CN.md package/
+          cp LICENSE NOTICE README.md README.zh-CN.md Cargo.lock package/
+          cp docs/touchstone.md package/docs/
           cp crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt package/LICENSES/
+          cp crates/kcsdi-gui/assets/fonts/DroidSansFallback.ttf.license package/LICENSES/
           chmod +x package/kcsdi package/kcsdi-gui
           package/kcsdi --help
           tar -czf "release-assets/kcsdi-rs-${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz" -C package .
@@ -106,11 +108,13 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          New-Item -ItemType Directory -Force -Path package/LICENSES, release-assets
+          New-Item -ItemType Directory -Force -Path package/LICENSES, package/docs, release-assets
           Copy-Item "target/${{ matrix.target }}/release/kcsdi.exe" package/
           Copy-Item "target/${{ matrix.target }}/release/kcsdi-gui.exe" package/
-          Copy-Item -Path LICENSE, NOTICE, README.md, README.zh-CN.md -Destination package/
+          Copy-Item -Path LICENSE, NOTICE, README.md, README.zh-CN.md, Cargo.lock -Destination package/
+          Copy-Item docs/touchstone.md package/docs/
           Copy-Item crates/kcsdi-gui/assets/fonts/DroidSansFallback-Apache2.0.txt package/LICENSES/
+          Copy-Item crates/kcsdi-gui/assets/fonts/DroidSansFallback.ttf.license package/LICENSES/
           & package/kcsdi.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path package/* -DestinationPath "release-assets/kcsdi-rs-${env:RELEASE_VERSION}-${{ matrix.suffix }}.zip"
