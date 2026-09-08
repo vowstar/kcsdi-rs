@@ -231,7 +231,11 @@ impl AppConfig {
 /// Resolve the config file path: env override first, then the
 /// platform-standard config directory.
 pub fn config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(ENV_CONFIG_PATH)
+    config_path_with_override(std::env::var(ENV_CONFIG_PATH).ok().as_deref())
+}
+
+fn config_path_with_override(path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = path
         && !p.is_empty()
     {
         return Some(PathBuf::from(p));
@@ -366,13 +370,14 @@ rbw = "30k"
 
     #[test]
     fn env_override_wins() {
-        // SAFETY: single-threaded test binary section for this test only.
-        unsafe { std::env::set_var(ENV_CONFIG_PATH, "/tmp/kcsdi-test-config.toml") };
         assert_eq!(
-            config_path(),
-            Some(PathBuf::from("/tmp/kcsdi-test-config.toml"))
+            config_path_with_override(Some("test-config.toml")),
+            Some(PathBuf::from("test-config.toml"))
         );
-        unsafe { std::env::remove_var(ENV_CONFIG_PATH) };
+        assert_eq!(
+            config_path_with_override(Some("")),
+            config_path_with_override(None)
+        );
     }
 
     #[test]
