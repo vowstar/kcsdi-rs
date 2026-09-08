@@ -7,7 +7,7 @@
 
 A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11 and spectrum sweeps, and save measurements.
 
-![KC901V impedance and Smith chart from the same S11 sweep](https://github.com/user-attachments/assets/84feeb3d-4d14-41b7-902d-d50299f59330)
+![English impedance and Smith views of one recorded S11 sweep](https://github.com/user-attachments/assets/8eee9271-257a-42d9-8f8b-7aabc8dfcf17)
 
 | Measurement | Views and exports |
 | --- | --- |
