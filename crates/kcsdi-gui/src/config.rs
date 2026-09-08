@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
+use crate::desktop::{DesktopConfig, DeviceProfile};
 use crate::i18n::Language;
 use crate::state::{AppMode, AppState, S11Display};
 
@@ -29,12 +30,17 @@ use crate::state::{AppMode, AppState, S11Display};
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
+
+fn legacy_config_version() -> u32 {
+    1
+}
 
 /// Persisted user settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(default = "legacy_config_version")]
     pub version: u32,
     /// UI language tag. Unknown languages fall back to English.
     pub language: Language,
@@ -43,6 +49,7 @@ pub struct AppConfig {
     pub connection: Connection,
     pub spec: Spec,
     pub s11: S11,
+    pub desktop: DesktopConfig,
 }
 
 /// Last-used connection target.
@@ -128,6 +135,7 @@ impl Default for AppConfig {
             connection: Connection::default(),
             spec: Spec::default(),
             s11: S11::default(),
+            desktop: DesktopConfig::default(),
         }
     }
 }
@@ -196,12 +204,26 @@ impl AppConfig {
                 log_x: state.s11.log_x,
                 rbw: state.s11.rbw.map(|rbw| rbw.as_str().to_string()),
             },
+            desktop: state.desktop.settings.clone(),
         }
     }
 
     /// Apply loaded settings to freshly initialized UI state. Unknown
     /// strings fall back to defaults instead of failing.
     pub fn apply_to(&self, state: &mut AppState) {
+        state.desktop.settings = self.desktop.clone();
+        // Import the legacy connection once. A version-2 empty profile list
+        // represents the user's choice and must stay empty after deletion.
+        if self.version < CONFIG_VERSION && state.desktop.settings.profiles.is_empty() {
+            let host = self.connection.host.trim();
+            if !host.is_empty() {
+                state.desktop.settings.profiles.push(DeviceProfile {
+                    name: host.to_owned(),
+                    host: host.to_owned(),
+                    port: self.connection.port,
+                });
+            }
+        }
         state.language = self.language;
         state.host = self.connection.host.clone();
         state.port = self.connection.port;
@@ -288,6 +310,7 @@ pub fn save(cfg: &AppConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeMode;
 
     #[test]
     fn default_roundtrip() {
@@ -295,6 +318,68 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: AppConfig = toml::from_str(&text).unwrap();
         assert_eq!(cfg, parsed);
+    }
+
+    #[test]
+    fn legacy_connection_becomes_one_profile_without_changing_sweeps() {
+        for version in ["", "version = 1\n"] {
+            let text = format!(
+                "{version}mode = \"s11\"\n[connection]\nhost = \"bench.example.invalid\"\nport = 4321\n[s11]\npoints = 401\n"
+            );
+            let config: AppConfig = toml::from_str(&text).unwrap();
+            let mut state = AppState::default();
+            config.apply_to(&mut state);
+            assert_eq!(
+                state.desktop.settings.profiles,
+                vec![DeviceProfile {
+                    name: "bench.example.invalid".into(),
+                    host: "bench.example.invalid".into(),
+                    port: 4321,
+                }]
+            );
+            assert_eq!(state.s11.points, 401);
+            assert_eq!(state.mode, AppMode::S11);
+            let saved = AppConfig::from_state(&state);
+            assert_eq!(saved.version, CONFIG_VERSION);
+            let mut restored = AppState::default();
+            saved.apply_to(&mut restored);
+            assert_eq!(
+                restored.desktop.settings.profiles,
+                state.desktop.settings.profiles
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_all_profiles_does_not_reimport_last_connection() {
+        let config: AppConfig =
+            toml::from_str("[connection]\nhost = \"bench.example.invalid\"\n").unwrap();
+        let mut state = AppState::default();
+        config.apply_to(&mut state);
+        state.desktop.settings.profiles.clear();
+        let saved = AppConfig::from_state(&state);
+        let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&saved).unwrap()).unwrap();
+        let mut restored = AppState::default();
+        parsed.apply_to(&mut restored);
+        assert!(restored.desktop.settings.profiles.is_empty());
+        assert_eq!(restored.host, "bench.example.invalid");
+    }
+
+    #[test]
+    fn profiles_and_theme_roundtrip_in_the_existing_config_file() {
+        let mut config = AppConfig::default();
+        config.desktop.profiles = vec![DeviceProfile {
+            name: "Bench A".into(),
+            host: "analyzer.example.invalid".into(),
+            port: 901,
+        }];
+        config.desktop.theme = ThemeMode::Light;
+        let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        let mut state = AppState::default();
+        parsed.apply_to(&mut state);
+        assert_eq!(AppConfig::from_state(&state), config);
+        let unknown: AppConfig = toml::from_str("[desktop]\ntheme = \"future-theme\"\n").unwrap();
+        assert_eq!(unknown.desktop.theme, ThemeMode::System);
     }
 
     #[test]

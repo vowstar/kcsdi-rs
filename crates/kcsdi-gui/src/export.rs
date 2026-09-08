@@ -265,6 +265,7 @@ mod tests {
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
             let mut state = crate::state::AppState {
                 language,
+                mode: crate::state::AppMode::S11,
                 ..Default::default()
             };
             // Panels settle their content-sized height over successive frames.
@@ -275,30 +276,26 @@ mod tests {
                         ..Default::default()
                     },
                     |ui| {
-                        egui::Panel::right("params_panel")
-                            .default_size(260.0)
-                            .show(ui, |ui| {
-                                crate::panels::s11_panel::show(ui, &mut state);
-                            });
+                        crate::app::parameter_panel(ui, &mut state);
                     },
                 );
-                for text in [Text::ExportS1p, Text::ExportNeedsComplex] {
-                    let label = output
-                        .shapes
-                        .iter()
-                        .find_map(|shape| match &shape.shape {
-                            egui::Shape::Text(label)
-                                if label.galley.job.text == language.text(text) =>
-                            {
-                                Some(label)
-                            }
-                            _ => None,
-                        })
-                        .expect("export controls must remain visible after disconnecting");
-                    let bounds = label.galley.rect.translate(label.pos.to_vec2());
-                    assert!(screen.contains_rect(bounds), "{language:?}: {bounds:?}");
-                }
+                let labels: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(label) => Some((
+                            label.galley.job.text.clone(),
+                            label.galley.rect.translate(label.pos.to_vec2()),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
                 output.drop_without_applying_deltas();
+                for text in [Text::ExportS1p, Text::ExportNeedsComplex] {
+                    let (_, bounds) = labels.iter().find(|(label, _)| label == language.text(text))
+                        .unwrap_or_else(|| panic!("export controls must remain visible after disconnecting: {language:?}, {labels:?}"));
+                    assert!(screen.contains_rect(*bounds), "{language:?}: {bounds:?}");
+                }
             }
         }
     }

@@ -24,6 +24,15 @@ pub struct Series<'a> {
     pub points: Vec<(f64, f64)>,
 }
 
+/// A user marker remains attached to measured frequency when the view changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marker {
+    pub id: u32,
+    pub frequency_hz: f64,
+    pub selected: bool,
+    pub reference: bool,
+}
+
 /// What to draw, prepared by the caller each frame.
 #[derive(Clone)]
 pub struct PlotOptions<'a> {
@@ -72,6 +81,7 @@ pub struct PlotView {
     pub x_max: f64,
     pub y_min: f64,
     pub y_max: f64,
+    pub y_divisions: usize,
 }
 
 impl PlotView {
@@ -81,12 +91,15 @@ impl PlotView {
             x_max,
             y_min,
             y_max,
+            y_divisions: 8,
         }
     }
 
     /// Reset the view to the given range (e.g. after parameters changed).
     pub fn reset(&mut self, x_min: f64, x_max: f64, y_min: f64, y_max: f64) {
+        let divisions = self.y_divisions;
         *self = Self::new(x_min, x_max, y_min, y_max);
+        self.y_divisions = divisions;
     }
 }
 
@@ -106,6 +119,26 @@ const BG_COLOR: Color32 = Color32::from_rgb(0x18, 0x18, 0x18);
 const GRID_COLOR: Color32 = Color32::from_rgb(0x42, 0x42, 0x42);
 const TEXT_COLOR: Color32 = Color32::from_rgb(0xd5, 0xd5, 0xd5);
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0x90, 0x90, 0x90);
+
+/// Keep the dark chart palette and use the active light theme's chrome.
+pub(super) fn chart_color(ctx: &egui::Context, dark: Color32) -> Color32 {
+    let style = ctx.global_style();
+    if style.visuals.dark_mode {
+        dark
+    } else if dark == BG_COLOR {
+        style.visuals.extreme_bg_color
+    } else if dark == TEXT_COLOR {
+        style.visuals.text_color()
+    } else {
+        style.visuals.widgets.noninteractive.bg_stroke.color
+    }
+}
+
+/// About ten percent zoom for a conventional 60-point wheel notch.
+/// Exponential scaling gives the same result across egui's smoothing frames.
+pub(super) fn wheel_factor(delta: f32) -> f64 {
+    (-f64::from(delta) * 0.1_f64.ln_1p() / 60.0).exp()
+}
 
 /// Shared frequency-axis control for SPEC and S11 cartesian displays.
 pub fn log_x_control(ui: &mut egui::Ui, log_x: &mut bool) -> bool {
@@ -252,6 +285,74 @@ fn format_value(v: f64) -> String {
     }
 }
 
+/// Retain at least the resolution of one division, including narrow views.
+fn y_tick_text(value: f64, step: f64) -> String {
+    let precision = (-step.abs().log10().floor()).clamp(0.0, 16.0) as usize;
+    let text = format!("{value:.precision$}");
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &text
+    };
+    if text == "-0" {
+        "0".into()
+    } else {
+        text.into()
+    }
+}
+
+/// An offset or multiplier keeps narrow-range labels distinct at the normal
+/// font size. These annotations affect labels only, never viewport bounds.
+fn y_tick_labels(
+    painter: &egui::Painter,
+    view: &PlotView,
+    unit: &str,
+) -> (Vec<std::sync::Arc<egui::Galley>>, String) {
+    let divisions = view.y_divisions.clamp(2, 30);
+    let span = view.y_max - view.y_min;
+    let step = span / divisions as f64;
+    let labels = |offset: f64, scale: f64| {
+        (0..=divisions)
+            .map(|i| {
+                painter.layout_no_wrap(
+                    y_tick_text(
+                        (view.y_min - offset + i as f64 * step) / scale,
+                        step / scale,
+                    ),
+                    FontId::monospace(LABEL_FONT_SIZE),
+                    chart_color(painter.ctx(), TEXT_COLOR),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let fits = |labels: &[std::sync::Arc<egui::Galley>]| {
+        labels
+            .iter()
+            .all(|label| label.size().x <= MARGIN_LEFT - 8.0)
+            && labels
+                .windows(2)
+                .all(|pair| pair[0].job.text != pair[1].job.text)
+    };
+    let mut offset = 0.0;
+    let mut scale = 1.0;
+    let mut ticks = labels(offset, scale);
+    if !fits(&ticks) && view.y_min.abs().max(view.y_max.abs()) > span * 10.0 {
+        offset = view.y_min;
+        ticks = labels(offset, scale);
+    }
+    if !fits(&ticks) {
+        scale = 10f64.powf(step.log10().floor());
+        ticks = labels(offset, scale);
+    }
+    let caption = match (scale != 1.0, offset != 0.0) {
+        (false, false) => unit.to_string(),
+        (false, true) => format!("{unit} ({offset:+})"),
+        (true, false) => format!("{unit} (x{scale:e})"),
+        (true, true) => format!("{unit} (x{scale:e}, {offset:+})"),
+    };
+    (ticks, caption)
+}
+
 /// Raw 1-2-5 ticks, also useful when zoomed inside one log decade.
 fn linear_ticks(min: f64, max: f64) -> Vec<f64> {
     let step = nice_step(max - min, TARGET_DIVISIONS);
@@ -344,7 +445,10 @@ fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
     if valid(view) {
         return;
     }
-    fit_view(view, opts);
+    if let Some((x_min, x_max, _, _)) = data_range(opts) {
+        view.x_min = x_min;
+        view.x_max = x_max;
+    }
     if !valid(view) {
         let max = if view.x_max.is_finite() {
             view.x_max.max(10.0)
@@ -358,12 +462,24 @@ fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
 
 /// Draw the plot and report whether the user locked or reset the view.
 pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> ViewLock {
+    show_with_markers(ui, view, opts, &mut [])
+}
+
+pub fn show_with_markers(
+    ui: &mut egui::Ui,
+    view: &mut PlotView,
+    opts: &mut PlotOptions,
+    markers: &mut [Marker],
+) -> ViewLock {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_LEFT, rect.top() + MARGIN_TOP),
         Pos2::new(rect.right() - MARGIN_RIGHT, rect.bottom() - MARGIN_BOTTOM),
     );
-    ui.painter().rect_filled(rect, 0.0, BG_COLOR);
+    ui.painter()
+        .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+    ui.painter()
+        .rect_filled(plot_rect, 0.0, chart_color(ui.ctx(), BG_COLOR));
     if plot_rect.width() < 2.0 || plot_rect.height() < 2.0 {
         return ViewLock::Unchanged;
     }
@@ -371,7 +487,13 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> V
     ensure_x_view(view, opts);
     let legend = legend_rect(ui.painter(), opts, plot_rect);
     let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
-    let lock = if over_legend {
+    let marker_input = interact_markers(
+        ui,
+        &Mapping::new(view, opts.log_x, plot_rect),
+        opts,
+        markers,
+    );
+    let lock = if over_legend || marker_input {
         ViewLock::Unchanged
     } else {
         handle_input(ui, view, opts, plot_rect, &response)
@@ -402,14 +524,109 @@ pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> V
                 language(ui.ctx()).text(Text::NoData)
             },
             FontId::monospace(14.0),
-            TEXT_COLOR,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     }
     if !over_legend {
         draw_cursor(painter, opts, &mapping, &response);
     }
     draw_legend(ui, opts, legend);
+    if opts
+        .visible_series()
+        .any(|series| !series.points.is_empty())
+    {
+        draw_markers(ui.painter(), &mapping, markers);
+    }
     lock
+}
+
+fn interact_markers(
+    ui: &egui::Ui,
+    mapping: &Mapping,
+    opts: &PlotOptions,
+    markers: &mut [Marker],
+) -> bool {
+    if !opts
+        .visible_series()
+        .any(|series| !series.points.is_empty())
+    {
+        return false;
+    }
+    let mut selected = None;
+    let mut busy = false;
+    for marker in markers.iter_mut() {
+        if !usable_x(opts.log_x, marker.frequency_hz) {
+            continue;
+        }
+        let x = mapping.to_screen(marker.frequency_hz, mapping.y_min).x;
+        if x < mapping.rect.left() || x > mapping.rect.right() {
+            continue;
+        }
+        let rect = Rect::from_center_size(
+            Pos2::new(x, mapping.rect.top() + 12.0),
+            egui::vec2(30.0, 24.0),
+        );
+        let response = ui
+            .interact(
+                rect,
+                ui.id().with(("marker", marker.id)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        busy |= response.hovered() || response.dragged();
+        if response.clicked() || response.dragged() {
+            selected = Some(marker.id);
+        }
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let frequency =
+                mapping.frequency_at(pos.x.clamp(mapping.rect.left(), mapping.rect.right()));
+            if let Some((x, _)) = opts
+                .visible_series()
+                .flat_map(|s| &s.points)
+                .filter(|(x, y)| usable_x(opts.log_x, *x) && y.is_finite())
+                .min_by(|a, b| (a.0 - frequency).abs().total_cmp(&(b.0 - frequency).abs()))
+            {
+                marker.frequency_hz = *x;
+            }
+        }
+    }
+    if let Some(id) = selected {
+        for marker in markers {
+            marker.selected = marker.id == id;
+        }
+    }
+    busy
+}
+
+fn draw_markers(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker]) {
+    let painter = painter.with_clip_rect(mapping.rect);
+    for marker in markers {
+        if !usable_x(mapping.log_x, marker.frequency_hz) {
+            continue;
+        }
+        let x = mapping.to_screen(marker.frequency_hz, mapping.y_min).x;
+        let color = if marker.selected {
+            painter.ctx().global_style().visuals.selection.stroke.color
+        } else {
+            chart_color(painter.ctx(), TEXT_COLOR)
+        };
+        painter.line_segment(
+            [
+                Pos2::new(x, mapping.rect.top() + 24.0),
+                Pos2::new(x, mapping.rect.bottom()),
+            ],
+            Stroke::new(0.7, color),
+        );
+        painter.text(
+            Pos2::new(x, mapping.rect.top() + 3.0),
+            Align2::CENTER_TOP,
+            format!("M{}{}", marker.id, if marker.reference { "R" } else { "" }),
+            FontId::monospace(12.0),
+            color,
+        );
+    }
 }
 
 /// Plain wheel zooms X, Shift+wheel zooms Y, Ctrl/Command+wheel zooms
@@ -442,7 +659,11 @@ fn handle_input(
         && plot_rect.contains(pos)
     {
         let mapping = Mapping::new(view, opts.log_x, plot_rect);
-        let factor = if scroll > 0.0 { 0.9 } else { 1.0 / 0.9 };
+        let factor = if zoom_both && zoom_delta != 1.0 {
+            f64::from(zoom_delta).recip()
+        } else {
+            wheel_factor(scroll)
+        };
         if zoom_y_only || zoom_both {
             zoom_axis(
                 &mut view.y_min,
@@ -512,7 +733,7 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, mappi
         let sx = mapping.to_screen(x, view.y_min).x;
         painter.line_segment(
             [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
-            Stroke::new(1.0, GRID_COLOR),
+            Stroke::new(1.0, chart_color(painter.ctx(), GRID_COLOR)),
         );
         // Broad log views label decades only, with 2/5 minor grid lines.
         let exponent = x_to_axis(opts.log_x, x);
@@ -524,40 +745,52 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, mappi
         } else {
             format!("{:.*} {}", x_dec, x / scale, unit)
         };
-        let galley = painter.layout_no_wrap(text, font.clone(), TEXT_COLOR);
+        let galley =
+            painter.layout_no_wrap(text, font.clone(), chart_color(painter.ctx(), TEXT_COLOR));
         let left = (sx - galley.size().x / 2.0).clamp(
             rect.left(),
             (rect.right() - galley.size().x).max(rect.left()),
         );
         if left >= label_right + 8.0 {
             label_right = left + galley.size().x;
-            painter.galley(Pos2::new(left, rect.bottom() + 3.0), galley, TEXT_COLOR);
+            painter.galley(
+                Pos2::new(left, rect.bottom() + 3.0),
+                galley,
+                chart_color(painter.ctx(), TEXT_COLOR),
+            );
         }
     }
 
-    let y_dec = decimals(nice_step(view.y_max - view.y_min, TARGET_DIVISIONS));
-    for y in linear_ticks(view.y_min, view.y_max) {
+    let divisions = view.y_divisions.clamp(2, 30);
+    let step = (view.y_max - view.y_min) / divisions as f64;
+    let (labels, caption) = y_tick_labels(painter, view, opts.y_label);
+    for (index, label) in labels.into_iter().enumerate() {
+        let y = view.y_min + index as f64 * step;
         let sy = mapping.to_screen(view.x_min, y).y;
         painter.line_segment(
             [Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)],
-            Stroke::new(1.0, GRID_COLOR),
+            Stroke::new(1.0, chart_color(painter.ctx(), GRID_COLOR)),
         );
-        painter.text(
-            Pos2::new(rect.left() - 4.0, sy),
-            Align2::RIGHT_CENTER,
-            format!("{:.*}", y_dec, y),
-            font.clone(),
-            TEXT_COLOR,
+        let left = (rect.left() - 4.0 - label.size().x).max(rect.left() - MARGIN_LEFT + 2.0);
+        painter.galley(
+            Pos2::new(left, sy - label.size().y / 2.0),
+            label,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     }
     painter.text(
         Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
         Align2::LEFT_TOP,
-        opts.y_label,
+        caption,
         font,
-        TEXT_COLOR,
+        chart_color(painter.ctx(), TEXT_COLOR),
     );
-    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, chart_color(painter.ctx(), GRID_COLOR)),
+        StrokeKind::Inside,
+    );
 }
 
 /// Invalid samples break runs. Negative and zero Y values remain valid.
@@ -602,7 +835,7 @@ fn legend_rect(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) -> 
                 .layout_no_wrap(
                     series_label(series.name, opts.y_label),
                     font.clone(),
-                    TEXT_COLOR,
+                    chart_color(painter.ctx(), TEXT_COLOR),
                 )
                 .size()
                 .x
@@ -628,7 +861,7 @@ fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
         return;
     }
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 2.0, BG_COLOR);
+    painter.rect_filled(rect, 2.0, chart_color(painter.ctx(), BG_COLOR));
     let font = FontId::monospace(LABEL_FONT_SIZE);
     for (index, series) in opts.series.iter_mut().enumerate() {
         let top = rect.top() + 4.0 + index as f32 * LEGEND_ROW_HEIGHT;
@@ -656,14 +889,18 @@ fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
             series.visible = !series.visible;
         }
         if response.hovered() {
-            painter.rect_filled(row, 2.0, GRID_COLOR);
+            painter.rect_filled(row, 2.0, chart_color(painter.ctx(), GRID_COLOR));
         }
         let color = if series.visible {
             series.color
         } else {
             Color32::from_gray(100)
         };
-        let text_color = if series.visible { TEXT_COLOR } else { color };
+        let text_color = if series.visible {
+            chart_color(painter.ctx(), TEXT_COLOR)
+        } else {
+            color
+        };
         let bounds = painter.text(
             Pos2::new(rect.right() - 18.0, row.center().y),
             Align2::RIGHT_CENTER,
@@ -724,14 +961,14 @@ fn draw_cursor(
             Pos2::new(pos.x, rect.top()),
             Pos2::new(pos.x, rect.bottom()),
         ],
-        Stroke::new(0.5, CURSOR_COLOR),
+        Stroke::new(0.5, chart_color(painter.ctx(), CURSOR_COLOR)),
     );
     painter.line_segment(
         [
             Pos2::new(rect.left(), pos.y),
             Pos2::new(rect.right(), pos.y),
         ],
-        Stroke::new(0.5, CURSOR_COLOR),
+        Stroke::new(0.5, chart_color(painter.ctx(), CURSOR_COLOR)),
     );
     let freq = mapping.frequency_at(pos.x);
     let font = FontId::monospace(LABEL_FONT_SIZE);
@@ -763,7 +1000,7 @@ fn draw_cursor(
             Align2::LEFT_BOTTOM,
             format_freq(freq),
             font,
-            TEXT_COLOR,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     } else {
         painter.text(
@@ -776,7 +1013,7 @@ fn draw_cursor(
                 opts.y_label
             ),
             font,
-            TEXT_COLOR,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     }
 }
@@ -825,6 +1062,94 @@ mod tests {
         assert_eq!(format_value(0.0), "0");
         assert_eq!(format_value(1.5e7), "1.500e7");
         assert_eq!(format_value(2.0e-4), "2.000e-4");
+    }
+
+    #[test]
+    fn non_round_y_limits_keep_tick_labels_inside_the_fixed_axis_margin() {
+        let ctx = egui::Context::default();
+        let mut view = PlotView::new(1e6, 5e6, -454.484830, 461.371430);
+        let original = view;
+        let mut opts = options(&[(1e6, -400.7), (5e6, 430.125)], false);
+        let (_, output) = widget_frame(&ctx, &mut view, &mut opts, vec![], 0.0);
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text)
+                    if text.pos.x < MARGIN_LEFT && text.galley.job.text.parse::<f64>().is_ok() =>
+                {
+                    Some((
+                        text.galley.job.text.clone(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        assert_eq!(labels.len(), 9);
+        assert!(labels.iter().all(|(text, rect)| !text.contains('.')
+            && rect.left() >= 0.0
+            && rect.right() < MARGIN_LEFT));
+        assert_eq!(view, original);
+    }
+
+    #[test]
+    fn narrow_y_ranges_keep_distinct_legible_labels_without_changing_bounds() {
+        for (min, max) in [
+            (1000.0, 1000.008),
+            (-1000.008, -1000.0),
+            (1e9, 1e9 + 0.008),
+            (0.0, 8e-18),
+            (-9e-6, -1e-6),
+        ] {
+            let ctx = egui::Context::default();
+            let view = PlotView::new(1e6, 5e6, min, max);
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let (ticks, caption) = y_tick_labels(ui.painter(), &view, "ohm");
+                assert_eq!(ticks.len(), 9);
+                assert!(
+                    ticks
+                        .windows(2)
+                        .all(|pair| pair[0].job.text != pair[1].job.text)
+                );
+                assert!(ticks.iter().all(|label| {
+                    label.size().x <= MARGIN_LEFT - 8.0
+                        && label.job.sections[0].format.font_id.size == LABEL_FONT_SIZE
+                }));
+                assert!(caption.starts_with("ohm ("), "{caption}");
+            });
+            output.drop_without_applying_deltas();
+            assert_eq!((view.y_min, view.y_max), (min, max));
+        }
+
+        let mut view = PlotView::new(1e6, 5e6, 1000.0, 1000.008);
+        let original = view;
+        let mut opts = options(&[(1e6, 1000.003), (5e6, 1000.005)], false);
+        let (_, output) =
+            widget_frame(&egui::Context::default(), &mut view, &mut opts, vec![], 0.0);
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, Shape::Text(text) if text.galley.job.text.ends_with("(+1000)"))
+        }));
+        output.drop_without_applying_deltas();
+        assert_eq!(view, original);
+    }
+
+    #[test]
+    fn repairing_log_x_from_dc_preserves_manual_y_scale() {
+        for points in [vec![(0.0, -10.0), (1e6, -20.0), (5e6, -30.0)], vec![]] {
+            let mut opts = options(&points, true);
+            let mut view = PlotView::new(0.0, 5e6, -53.25, -12.75);
+            view.y_divisions = 13;
+            let original = view;
+            let (_, output) =
+                widget_frame(&egui::Context::default(), &mut view, &mut opts, vec![], 0.0);
+            output.drop_without_applying_deltas();
+            assert!(view.x_min > 0.0 && view.x_max > view.x_min);
+            assert_eq!(view.y_min, original.y_min);
+            assert_eq!(view.y_max, original.y_max);
+            assert_eq!(view.y_divisions, original.y_divisions);
+        }
     }
 
     #[test]
@@ -1191,6 +1516,104 @@ mod tests {
                 near(after.value_at(cursor.y), before.value_at(cursor.y));
             }
         }
+    }
+
+    #[test]
+    fn one_wheel_event_remains_moderate_after_all_smoothing_frames() {
+        let ctx = egui::Context::default();
+        let opts = options(&[(1e6, -10.0), (1e9, 10.0)], false);
+        let mut view = PlotView::new(1e6, 1e9, -10.0, 10.0);
+        let span = view.x_max - view.x_min;
+        for index in 0..100 {
+            let events = match index {
+                1 => vec![egui::Event::PointerMoved(Pos2::new(300.0, 200.0))],
+                2 => vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 3.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                _ => vec![],
+            };
+            frame(&ctx, &mut view, &opts, events, index as f64 / 60.0);
+        }
+        let ratio = (view.x_max - view.x_min) / span;
+        assert!(
+            (0.65..0.99).contains(&ratio),
+            "zoom ratio after smoothing: {ratio}"
+        );
+    }
+
+    #[test]
+    fn wheel_scaling_is_independent_of_frame_partition() {
+        near(wheel_factor(60.0), wheel_factor(5.0).powi(12));
+        near(wheel_factor(60.0) * wheel_factor(-60.0), 1.0);
+    }
+
+    #[test]
+    fn dragging_a_marker_snaps_frequency_without_panning_the_view() {
+        let ctx = egui::Context::default();
+        let mut opts = options(&[(1e6, 1.0), (3e6, 2.0), (5e6, 3.0)], false);
+        let original = PlotView::new(1e6, 5e6, 0.0, 4.0);
+        let mut view = original;
+        let mut markers = vec![Marker {
+            id: 1,
+            frequency_hz: 3e6,
+            selected: true,
+            reference: false,
+        }];
+        let from = Pos2::new(320.0, 20.0);
+        let to = Pos2::new(540.0, 20.0);
+        for (index, events) in [
+            vec![],
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(to)],
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                    time: Some(index as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    show_with_markers(ui, &mut view, &mut opts, &mut markers);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(markers[0].frequency_hz, 5e6);
+        assert_eq!(view, original);
+    }
+
+    #[test]
+    fn light_chart_uses_the_active_background_and_text_colors() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::Theme::Light);
+        assert_eq!(
+            chart_color(&ctx, BG_COLOR),
+            ctx.global_style().visuals.extreme_bg_color
+        );
+        assert_eq!(
+            chart_color(&ctx, TEXT_COLOR),
+            ctx.global_style().visuals.text_color()
+        );
+        assert_ne!(chart_color(&ctx, BG_COLOR), BG_COLOR);
     }
 
     #[test]

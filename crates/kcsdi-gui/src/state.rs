@@ -160,6 +160,8 @@ macro_rules! impl_freq_helpers {
 
 /// SPEC mode state: sweep parameters, latest trace, and plot viewport.
 pub struct SpecState {
+    pub visible: bool,
+    pub analysis: crate::analysis_tools::AnalysisTools,
     pub start_hz: f64,
     pub stop_hz: f64,
     pub center_hz: f64,
@@ -186,6 +188,8 @@ impl Default for SpecState {
         let start_hz = 100e6;
         let stop_hz = 500e6;
         Self {
+            visible: true,
+            analysis: crate::analysis_tools::AnalysisTools::default(),
             start_hz,
             stop_hz,
             center_hz: (start_hz + stop_hz) / 2.0,
@@ -224,6 +228,8 @@ impl SpecState {
 
 /// S11 mode state: sweep parameters, display format, and latest trace.
 pub struct S11State {
+    pub visible: bool,
+    pub analysis: crate::analysis_tools::AnalysisTools,
     pub start_hz: f64,
     pub stop_hz: f64,
     pub center_hz: f64,
@@ -259,6 +265,8 @@ impl Default for S11State {
         let display = S11Display::default();
         let (y_min, y_max) = display.default_y();
         Self {
+            visible: true,
+            analysis: crate::analysis_tools::AnalysisTools::default(),
             start_hz,
             stop_hz,
             center_hz: (start_hz + stop_hz) / 2.0,
@@ -299,6 +307,7 @@ impl S11State {
 
 /// Application state shared across all panels.
 pub struct AppState {
+    pub desktop: crate::desktop::DesktopState,
     /// Language for labels and UI messages, independent of protocol data.
     pub language: Language,
     /// Host field of the connection bar.
@@ -325,6 +334,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            desktop: crate::desktop::DesktopState::default(),
             language: Language::default(),
             host: String::new(),
             port: 901,

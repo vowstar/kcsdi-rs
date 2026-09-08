@@ -14,7 +14,8 @@ A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11 
 | S11 | Impedance, Smith chart, phase, return loss and VSWR |
 | Spectrum | Live trace with linear or logarithmic frequency axis |
 | Data | CSV and Touchstone `.s1p`. CLI assembly of `.s2p` from four complex measurements |
-| Interface | English and Simplified Chinese. Selectable impedance traces, zoom, pan and fit |
+| Analysis | Selectable traces, hold, maximum and minimum envelopes, markers, zoom, pan and fit |
+| Interface | English and Simplified Chinese. Saved devices, light, dark and system themes |
 
 Hardware tests use a KC901V with firmware V1.6.1. Other KC901 models need hardware tests.
 
@@ -37,7 +38,9 @@ cargo run --release -p kcsdi-gui
 
 The binaries are in `target/release`. Add that directory to PATH to use the CLI commands that follow.
 
-In the GUI, enter the instrument address and TCP port, then select Connect. The instrument accepts one control connection at a time.
+In the GUI, add a device with its address and TCP port, open it, then select Connect in the bottom bar. The instrument accepts one control connection at a time.
+
+Select S11 or Spectrum in the left panel. Use the trace menu to change the S11 view. Each mode keeps its last sweep. Only the selected mode acquires data. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
 
 For the CLI, replace `192.0.2.10` with the instrument address. Frequencies use Hz.
 

@@ -10,8 +10,9 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke};
 use kcsdi_core::data::SweepData;
 
+use super::plot::{Marker, chart_color, wheel_factor};
 use crate::i18n::{Text, language};
-use crate::theme::TRACE_COLORS;
+use crate::theme::trace_colors;
 
 /// Nominal system impedance in ohms.
 pub const Z0: f64 = kcsdi_core::touchstone::REFERENCE_OHMS;
@@ -134,10 +135,29 @@ impl Mapping {
 /// Draw the Smith chart into the available space. Signature is a module
 /// contract; do not change it.
 pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) {
+    show_with_markers(ui, view, trace, &mut []);
+}
+
+pub fn show_with_markers(
+    ui: &mut egui::Ui,
+    view: &mut SmithView,
+    trace: Option<&SweepData>,
+    markers: &mut [Marker],
+) {
+    show_layers(ui, view, trace, None, markers);
+}
+
+pub fn show_layers(
+    ui: &mut egui::Ui,
+    view: &mut SmithView,
+    trace: Option<&SweepData>,
+    held: Option<&SweepData>,
+    markers: &mut [Marker],
+) {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, BG_COLOR);
+    painter.rect_filled(rect, 0.0, chart_color(painter.ctx(), BG_COLOR));
     let chart_rect = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top() + HEADER_HEIGHT),
         Pos2::new(rect.right(), rect.bottom() - FOOTER_HEIGHT),
@@ -146,7 +166,16 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
         return;
     }
 
-    handle_input(ui, view, chart_rect, &response);
+    let points = trace_points(trace);
+    if !interact_markers(
+        ui,
+        &Mapping::new(chart_rect, view),
+        chart_rect,
+        &points,
+        markers,
+    ) {
+        handle_input(ui, view, chart_rect, &response);
+    }
     let mapping = Mapping::new(chart_rect, view);
     let clipped = painter.with_clip_rect(chart_rect);
     draw_grid(&clipped, &mapping);
@@ -163,22 +192,122 @@ pub fn show(ui: &mut egui::Ui, view: &mut SmithView, trace: Option<&SweepData>) 
             Align2::LEFT_TOP,
             text,
             FontId::monospace(LABEL_FONT_SIZE),
-            TEXT_COLOR,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     }
 
-    let points = trace_points(trace);
+    let held_points = trace_points(held);
+    draw_trace_color(
+        &clipped,
+        &mapping,
+        &held_points,
+        Color32::from_rgb(0x28, 0x99, 0xd0),
+    );
     if !points.iter().any(|p| p.3.is_finite() && p.4.is_finite()) {
         painter.text(
             Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
             language(ui.ctx()).text(Text::NoData),
             FontId::monospace(14.0),
-            TEXT_COLOR,
+            chart_color(painter.ctx(), TEXT_COLOR),
         );
     } else {
         draw_trace(&clipped, &mapping, &points);
         draw_hover(painter, &mapping, &points, rect, chart_rect, &response);
+    }
+    draw_markers(&clipped, &mapping, &points, markers);
+}
+
+fn marker_point<'a>(
+    points: &'a [(f64, f64, f64, f64, f64)],
+    marker: &Marker,
+) -> Option<&'a (f64, f64, f64, f64, f64)> {
+    points
+        .iter()
+        .filter(|p| p.0.is_finite() && p.3.is_finite() && p.4.is_finite())
+        .min_by(|a, b| {
+            (a.0 - marker.frequency_hz)
+                .abs()
+                .total_cmp(&(b.0 - marker.frequency_hz).abs())
+        })
+}
+
+fn interact_markers(
+    ui: &egui::Ui,
+    mapping: &Mapping,
+    rect: Rect,
+    points: &[(f64, f64, f64, f64, f64)],
+    markers: &mut [Marker],
+) -> bool {
+    let mut selected = None;
+    let mut busy = false;
+    for marker in markers.iter_mut() {
+        let Some(point) = marker_point(points, marker) else {
+            continue;
+        };
+        let at = mapping.to_screen(point.3, point.4);
+        if !rect.contains(at) {
+            continue;
+        }
+        let response = ui
+            .interact(
+                Rect::from_center_size(at, egui::vec2(22.0, 22.0)),
+                ui.id().with(("smith_marker", marker.id)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab);
+        busy |= response.hovered() || response.dragged();
+        if response.clicked() || response.dragged() {
+            selected = Some(marker.id);
+        }
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let (u, v) = mapping.to_gamma(pos);
+            if let Some(point) = points
+                .iter()
+                .filter(|p| p.3.is_finite() && p.4.is_finite())
+                .min_by(|a, b| {
+                    ((a.3 - u).powi(2) + (a.4 - v).powi(2))
+                        .total_cmp(&((b.3 - u).powi(2) + (b.4 - v).powi(2)))
+                })
+            {
+                marker.frequency_hz = point.0;
+            }
+        }
+    }
+    if let Some(id) = selected {
+        for marker in markers {
+            marker.selected = marker.id == id;
+        }
+    }
+    busy
+}
+
+fn draw_markers(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    points: &[(f64, f64, f64, f64, f64)],
+    markers: &[Marker],
+) {
+    for marker in markers {
+        let Some(point) = marker_point(points, marker) else {
+            continue;
+        };
+        let at = mapping.to_screen(point.3, point.4);
+        let color = if marker.selected {
+            painter.ctx().global_style().visuals.selection.stroke.color
+        } else {
+            chart_color(painter.ctx(), TEXT_COLOR)
+        };
+        painter.circle_stroke(at, 5.0, Stroke::new(1.5, color));
+        painter.text(
+            at + egui::vec2(7.0, -7.0),
+            Align2::LEFT_BOTTOM,
+            format!("M{}", marker.id),
+            FontId::monospace(12.0),
+            color,
+        );
     }
 }
 
@@ -202,7 +331,7 @@ fn handle_input(ui: &egui::Ui, view: &mut SmithView, rect: Rect, response: &egui
         && let Some(pos) = response.hover_pos()
         && rect.contains(pos)
     {
-        let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+        let factor = wheel_factor(scroll).recip();
         let new_zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if new_zoom != view.zoom {
             // Keep the gamma under the cursor fixed: solve for the pan
@@ -256,13 +385,13 @@ fn trace_points(trace: Option<&SweepData>) -> Vec<(f64, f64, f64, f64, f64)> {
 }
 
 fn draw_grid(painter: &egui::Painter, mapping: &Mapping) {
-    let grid = Stroke::new(1.0, GRID_COLOR);
+    let grid = Stroke::new(1.0, chart_color(painter.ctx(), GRID_COLOR));
 
     // Unit circle, slightly brighter than the inner grid.
     painter.circle_stroke(
         mapping.to_screen(0.0, 0.0),
         mapping.scale,
-        Stroke::new(1.0, OUTLINE_COLOR),
+        Stroke::new(1.0, chart_color(painter.ctx(), OUTLINE_COLOR)),
     );
 
     for &r in &RESISTANCE_GRID {
@@ -299,7 +428,8 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
     let font = FontId::monospace(LABEL_FONT_SIZE);
     let mut occupied: Vec<Rect> = Vec::new();
     let mut label = |text: String, at: Pos2, align: Align2| {
-        let galley = painter.layout_no_wrap(text, font.clone(), TEXT_COLOR);
+        let galley =
+            painter.layout_no_wrap(text, font.clone(), chart_color(painter.ctx(), TEXT_COLOR));
         let bounds = align.anchor_size(at, galley.size());
         // Never pin an off-screen label to the edge, where it would no
         // longer identify its grid line. Suppress collisions when zoomed out.
@@ -308,8 +438,12 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
                 .iter()
                 .all(|other| !other.expand(2.0).intersects(bounds))
         {
-            painter.rect_filled(bounds.expand(1.0), 0.0, BG_COLOR);
-            painter.galley(bounds.min, galley, TEXT_COLOR);
+            painter.rect_filled(
+                bounds.expand(1.0),
+                0.0,
+                chart_color(painter.ctx(), BG_COLOR),
+            );
+            painter.galley(bounds.min, galley, chart_color(painter.ctx(), TEXT_COLOR));
             occupied.push(bounds);
         }
     };
@@ -327,7 +461,11 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
     ] {
         let at = mapping.to_screen(u, 0.0);
         if rect.shrink(4.0).contains(at) {
-            painter.circle_stroke(at, 3.0, Stroke::new(1.0, TEXT_COLOR));
+            painter.circle_stroke(
+                at,
+                3.0,
+                Stroke::new(1.0, chart_color(painter.ctx(), TEXT_COLOR)),
+            );
             label(
                 text.to_string(),
                 at + egui::vec2(-u as f32 * 6.0, 6.0),
@@ -399,7 +537,17 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
 /// Gamma polyline of the sweep. Uncalibrated data can exceed |gamma| =
 /// 1; such points are drawn as-is (the clip rect bounds them).
 fn draw_trace(painter: &egui::Painter, mapping: &Mapping, points: &[(f64, f64, f64, f64, f64)]) {
-    let stroke = Stroke::new(1.5, TRACE_COLORS[0]);
+    let color = trace_colors(painter.ctx().global_style().visuals.dark_mode)[0];
+    draw_trace_color(painter, mapping, points, color);
+}
+
+fn draw_trace_color(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    points: &[(f64, f64, f64, f64, f64)],
+    color: Color32,
+) {
+    let stroke = Stroke::new(1.5, color);
     let mut run: Vec<Pos2> = Vec::new();
     for &(_, _, _, u, v) in points {
         if u.is_finite() && v.is_finite() {
@@ -445,15 +593,17 @@ fn draw_hover(
     };
 
     let at = mapping.to_screen(u, v);
-    painter
-        .with_clip_rect(chart_rect)
-        .circle_stroke(at, 4.0, Stroke::new(1.0, TEXT_COLOR));
+    painter.with_clip_rect(chart_rect).circle_stroke(
+        at,
+        4.0,
+        Stroke::new(1.0, chart_color(painter.ctx(), TEXT_COLOR)),
+    );
     painter.text(
         Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
         Align2::LEFT_BOTTOM,
         format!("{}  R = {:.2} ohm  X = {:+.2} ohm", format_hz(freq), r, x),
         FontId::monospace(LABEL_FONT_SIZE),
-        TEXT_COLOR,
+        chart_color(painter.ctx(), TEXT_COLOR),
     );
 }
 
@@ -474,6 +624,103 @@ fn format_hz(hz: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_zoom_stays_moderate_after_the_smoothing_tail() {
+        let ctx = egui::Context::default();
+        let mut view = SmithView::default();
+        for index in 0..100 {
+            let events = match index {
+                1 => vec![egui::Event::PointerMoved(Pos2::new(300.0, 300.0))],
+                2 => vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 3.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                _ => vec![],
+            };
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0))),
+                    time: Some(index as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show(ui, &mut view, None),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(
+            (1.01..1.5).contains(&view.zoom),
+            "zoom after smoothing: {}",
+            view.zoom
+        );
+    }
+
+    #[test]
+    fn dragging_a_smith_marker_follows_measured_points_without_panning() {
+        let ctx = egui::Context::default();
+        let mut view = SmithView::default();
+        let data = SweepData {
+            mode: kcsdi_core::protocol::StreamMode::S11,
+            format: "z".into(),
+            points: [50.0, 100.0, 150.0]
+                .into_iter()
+                .enumerate()
+                .map(|(index, r)| kcsdi_core::data::SweepPoint {
+                    freq_hz: (index + 1) as f64 * 1e6,
+                    values: vec![r, r, 0.0],
+                })
+                .collect(),
+        };
+        let chart = Rect::from_min_max(
+            Pos2::new(0.0, HEADER_HEIGHT),
+            Pos2::new(600.0, 600.0 - FOOTER_HEIGHT),
+        );
+        let mapping = Mapping::new(chart, &view);
+        let from = mapping.to_screen(0.0, 0.0);
+        let to = mapping.to_screen(0.5, 0.0);
+        let mut markers = vec![Marker {
+            id: 1,
+            frequency_hz: 1e6,
+            selected: true,
+            reference: false,
+        }];
+        for (index, events) in [
+            vec![],
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(to)],
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 600.0))),
+                    time: Some(index as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_with_markers(ui, &mut view, Some(&data), &mut markers),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(markers[0].frequency_hz, 3e6);
+        assert_eq!(view, SmithView::default());
+    }
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9

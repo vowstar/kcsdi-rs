@@ -6,8 +6,10 @@
 //! Provides a graphical interface for controlling KC901 analyzers using
 //! egui/eframe, modeled after the KCSDI reference interface.
 
+mod analysis_tools;
 mod app;
 mod config;
+mod desktop;
 mod device_worker;
 mod export;
 mod i18n;
