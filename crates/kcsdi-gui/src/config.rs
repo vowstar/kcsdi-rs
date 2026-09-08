@@ -23,7 +23,7 @@ use kcsdi_core::commands::Cal;
 use kcsdi_core::model::Rbw;
 
 use crate::desktop::{DesktopConfig, DeviceProfile};
-use crate::i18n::Language;
+use crate::i18n::LanguagePreference;
 use crate::state::{AppMode, AppState, S11Display};
 
 /// Environment variable that overrides the config file path.
@@ -42,8 +42,8 @@ fn legacy_config_version() -> u32 {
 pub struct AppConfig {
     #[serde(default = "legacy_config_version")]
     pub version: u32,
-    /// UI language tag. Unknown languages fall back to English.
-    pub language: Language,
+    /// Missing or unknown language preferences follow the system locale.
+    pub language: LanguagePreference,
     /// Last-used function mode ("spec" or "s11").
     pub mode: String,
     pub connection: Connection,
@@ -130,7 +130,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
-            language: Language::default(),
+            language: LanguagePreference::default(),
             mode: mode_as_str(AppMode::default()).to_string(),
             connection: Connection::default(),
             spec: Spec::default(),
@@ -181,7 +181,7 @@ impl AppConfig {
     pub fn from_state(state: &AppState) -> Self {
         Self {
             version: CONFIG_VERSION,
-            language: state.language,
+            language: state.language_preference,
             mode: mode_as_str(state.mode).to_string(),
             connection: Connection {
                 host: state.host.clone(),
@@ -224,7 +224,7 @@ impl AppConfig {
                 });
             }
         }
-        state.language = self.language;
+        state.set_language_preference(self.language);
         state.host = self.connection.host.clone();
         state.port = self.connection.port;
         state.mode = parse_mode(&self.mode);
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn language_tags_roundtrip_and_unknown_tags_keep_other_settings() {
-        for language in Language::ALL {
+        for language in LanguagePreference::ALL {
             let cfg = AppConfig {
                 language,
                 ..AppConfig::default()
@@ -393,18 +393,33 @@ mod tests {
             let parsed: AppConfig = toml::from_str(&text).unwrap();
             assert_eq!(parsed, cfg);
             assert!(text.contains(match language {
-                Language::English => "language = \"en\"",
-                Language::SimplifiedChinese => "language = \"zh-CN\"",
+                LanguagePreference::System => "language = \"system\"",
+                LanguagePreference::English => "language = \"en\"",
+                LanguagePreference::SimplifiedChinese => "language = \"zh-CN\"",
             }));
         }
         let cfg: AppConfig = toml::from_str(
             "language = \"future-language\"\n[connection]\nhost = \"example.invalid\"\n",
         )
         .unwrap();
-        assert_eq!(cfg.language, Language::English);
+        assert_eq!(cfg.language, LanguagePreference::System);
         assert_eq!(cfg.connection.host, "example.invalid");
         let legacy: AppConfig = toml::from_str("").unwrap();
-        assert_eq!(legacy.language, Language::English);
+        assert_eq!(legacy.language, LanguagePreference::System);
+    }
+
+    #[test]
+    fn system_preference_is_saved_instead_of_the_resolved_language() {
+        for language in crate::i18n::Language::ALL {
+            let state = AppState {
+                language,
+                ..AppState::default()
+            };
+            let config = AppConfig::from_state(&state);
+            assert_eq!(config.language, LanguagePreference::System);
+            let text = toml::to_string_pretty(&config).unwrap();
+            assert!(text.contains("language = \"system\""));
+        }
     }
 
     #[test]
@@ -469,7 +484,7 @@ rbw = "30k"
     #[allow(clippy::field_reassign_with_default)]
     fn state_roundtrip() {
         let mut state = AppState::default();
-        state.language = Language::SimplifiedChinese;
+        state.set_language_preference(LanguagePreference::SimplifiedChinese);
         state.host = "analyzer.example.invalid".to_string();
         state.port = 5025;
         state.mode = AppMode::S11;
@@ -485,7 +500,11 @@ rbw = "30k"
         let cfg = AppConfig::from_state(&state);
         let mut restored = AppState::default();
         cfg.apply_to(&mut restored);
-        assert_eq!(restored.language, Language::SimplifiedChinese);
+        assert_eq!(restored.language, crate::i18n::Language::SimplifiedChinese);
+        assert_eq!(
+            restored.language_preference,
+            LanguagePreference::SimplifiedChinese
+        );
         assert_eq!(restored.host, "analyzer.example.invalid");
         assert_eq!(restored.port, 5025);
         assert_eq!(restored.spec.start_hz, state.spec.start_hz);

@@ -16,6 +16,7 @@ pub enum Language {
 }
 
 impl Language {
+    #[cfg(test)]
     pub const ALL: [Self; 2] = [Self::English, Self::SimplifiedChinese];
 
     /// Native language names keep the selector usable in either language.
@@ -23,6 +24,59 @@ impl Language {
         match self {
             Self::English => "English",
             Self::SimplifiedChinese => "简体中文",
+        }
+    }
+
+    fn from_locale(locale: &str) -> Self {
+        let primary = locale
+            .trim()
+            .split(['-', '_', '.', '@'])
+            .next()
+            .unwrap_or("");
+        if primary.eq_ignore_ascii_case("zh") {
+            Self::SimplifiedChinese
+        } else {
+            Self::English
+        }
+    }
+}
+
+/// Store the user's choice separately from the resolved display language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LanguagePreference {
+    #[serde(rename = "en")]
+    English,
+    #[serde(rename = "zh-CN")]
+    SimplifiedChinese,
+    #[default]
+    #[serde(rename = "system", other)]
+    System,
+}
+
+impl LanguagePreference {
+    pub const ALL: [Self; 3] = [Self::System, Self::English, Self::SimplifiedChinese];
+
+    pub fn label(self, language: Language) -> &'static str {
+        match self {
+            Self::System => language.text(Text::FollowSystem),
+            Self::English => Language::English.label(),
+            Self::SimplifiedChinese => Language::SimplifiedChinese.label(),
+        }
+    }
+
+    /// Resolve at startup and when the user changes the preference.
+    pub fn resolve(self) -> Language {
+        let locale = (self == Self::System)
+            .then(sys_locale::get_locale)
+            .flatten();
+        self.resolve_locale(locale.as_deref())
+    }
+
+    fn resolve_locale(self, locale: Option<&str>) -> Language {
+        match self {
+            Self::System => Language::from_locale(locale.unwrap_or("")),
+            Self::English => Language::English,
+            Self::SimplifiedChinese => Language::SimplifiedChinese,
         }
     }
 }
@@ -121,6 +175,7 @@ catalog! {
     AnalysisColumn => ("Readout", "读数分量"),
     AnalysisMagnitude => ("Magnitude", "幅值"),
     Language => ("Language", "语言"),
+    FollowSystem => ("Follow system", "跟随系统"),
     Host => ("Host", "主机"),
     Port => ("Port", "端口"),
     Connect => ("Connect", "连接"),
@@ -232,6 +287,64 @@ pub fn language(ctx: &egui::Context) -> Language {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_locale_supports_bcp47_and_posix_without_prefix_false_matches() {
+        for locale in [
+            "zh",
+            "zh-CN",
+            "zh_Hans_CN.UTF-8",
+            "zh_TW",
+            "ZH-hant-HK",
+            " zh_CN@variant ",
+        ] {
+            assert_eq!(
+                LanguagePreference::System.resolve_locale(Some(locale)),
+                Language::SimplifiedChinese
+            );
+        }
+        for locale in [
+            "en",
+            "en_US.UTF-8",
+            "en-GB",
+            "de_DE",
+            "ja-JP",
+            "C",
+            "POSIX",
+            "",
+            "zhuang",
+            "zhanything",
+        ] {
+            assert_eq!(
+                LanguagePreference::System.resolve_locale(Some(locale)),
+                Language::English
+            );
+        }
+        assert_eq!(
+            LanguagePreference::System.resolve_locale(None),
+            Language::English
+        );
+    }
+
+    #[test]
+    fn explicit_choices_override_the_system_and_can_return_to_it() {
+        for locale in [Some("zh_CN.UTF-8"), Some("en-US"), Some("de-DE"), None] {
+            assert_eq!(
+                LanguagePreference::English.resolve_locale(locale),
+                Language::English
+            );
+            assert_eq!(
+                LanguagePreference::SimplifiedChinese.resolve_locale(locale),
+                Language::SimplifiedChinese
+            );
+        }
+        let system = LanguagePreference::default();
+        assert_eq!(system.resolve_locale(Some("en-US")), Language::English);
+        assert_eq!(
+            system.resolve_locale(Some("zh_CN.UTF-8")),
+            Language::SimplifiedChinese
+        );
+    }
 
     #[test]
     fn catalog_is_complete_and_diagnostics_keep_their_details() {

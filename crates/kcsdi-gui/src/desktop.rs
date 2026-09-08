@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::i18n::{Language, Text};
+use crate::i18n::Text;
 use crate::state::{AppState, ConnectionState, DEVICE_MODEL, WorkerCommand};
 use crate::theme::{self, ThemeMode};
 
@@ -303,13 +303,19 @@ fn show_settings(ui: &mut egui::Ui, state: &mut AppState) {
         .spacing([28.0, 16.0])
         .show(ui, |ui| {
             ui.label(language.text(Text::Language));
+            let mut preference = state.language_preference;
             egui::ComboBox::from_id_salt("desktop_language")
-                .selected_text(state.language.label())
+                .selected_text(preference.label(language))
                 .show_ui(ui, |ui| {
-                    for option in Language::ALL {
-                        ui.selectable_value(&mut state.language, option, option.label());
+                    for option in crate::i18n::LanguagePreference::ALL {
+                        ui.selectable_value(&mut preference, option, option.label(language));
                     }
                 });
+            if preference != state.language_preference {
+                state.set_language_preference(preference);
+                crate::i18n::set_language(ui.ctx(), state.language);
+                ui.ctx().request_repaint();
+            }
             ui.end_row();
             ui.label(language.text(Text::Theme));
             ui.horizontal(|ui| {
@@ -482,6 +488,7 @@ fn show_delete_confirmation(ctx: &egui::Context, state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Language;
 
     #[test]
     fn profile_cards_stack_labels_and_keep_neighboring_cards_separate() {

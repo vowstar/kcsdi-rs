@@ -310,6 +310,7 @@ pub struct AppState {
     pub desktop: crate::desktop::DesktopState,
     /// Language for labels and UI messages, independent of protocol data.
     pub language: Language,
+    pub language_preference: crate::i18n::LanguagePreference,
     /// Host field of the connection bar.
     pub host: String,
     /// Port field of the connection bar.
@@ -336,6 +337,7 @@ impl Default for AppState {
         Self {
             desktop: crate::desktop::DesktopState::default(),
             language: Language::default(),
+            language_preference: crate::i18n::LanguagePreference::default(),
             host: String::new(),
             port: 901,
             connection: ConnectionState::Disconnected,
@@ -353,6 +355,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn set_language_preference(&mut self, preference: crate::i18n::LanguagePreference) {
+        self.language_preference = preference;
+        self.language = preference.resolve();
+    }
+
     /// Switching panels stops the old job and keeps both RUN indicators
     /// consistent with the worker's single active measurement mode.
     pub fn change_mode(&mut self, mode: AppMode) {

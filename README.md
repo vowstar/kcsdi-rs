@@ -42,6 +42,8 @@ In the GUI, add a device with its address and TCP port, open it, then select Con
 
 Select S11 or Spectrum in the left panel. Use the trace menu to change the S11 view. Each mode keeps its last sweep. Only the selected mode acquires data. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
 
+Language follows the system by default. Choose English, Simplified Chinese or Follow system in Settings. Other system languages use English.
+
 For the CLI, replace `192.0.2.10` with the instrument address. Frequencies use Hz.
 
 ```sh
