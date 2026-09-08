@@ -7,6 +7,8 @@
 
 用 Rust 编写的 KC901 图形界面和命令行工具，通过以太网控制仪器，查看 S11 和频谱曲线，保存测量数据。
 
+![KC901V 同一组 S11 测量的阻抗曲线和 Smith 图](https://github.com/user-attachments/assets/84feeb3d-4d14-41b7-902d-d50299f59330)
+
 | 测量 | 视图与导出 |
 | --- | --- |
 | S11 | 阻抗、Smith 图、相位、回波损耗和驻波比 |
