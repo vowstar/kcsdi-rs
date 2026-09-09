@@ -627,12 +627,14 @@ mod tests {
 
     #[test]
     fn disconnect_clears_health_but_preserves_completed_export_data() {
-        let mut state = crate::state::AppState::default();
-        state.temperature = Some(42.0);
-        state.voltage = Some(kcsdi_core::data::Voltage {
-            external: 12.0,
-            battery: 8.0,
-        });
+        let mut state = crate::state::AppState {
+            temperature: Some(42.0),
+            voltage: Some(kcsdi_core::data::Voltage {
+                external: 12.0,
+                battery: 8.0,
+            }),
+            ..Default::default()
+        };
         state.s11.trace = Some(SweepData {
             mode: StreamMode::S11,
             format: "z".into(),
@@ -647,8 +649,10 @@ mod tests {
 
     #[test]
     fn completed_measurement_clears_the_request_to_run_again() {
-        let mut state = crate::state::AppState::default();
-        state.status_message = Some(StatusMessage::Text(Text::RunForDisplay));
+        let state = crate::state::AppState {
+            status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
+            ..Default::default()
+        };
         let mut app = test_app(state);
         app.apply_event(WorkerEvent::SweepTrace(SweepData {
             mode: StreamMode::S11,
