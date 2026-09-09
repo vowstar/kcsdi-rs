@@ -6,7 +6,6 @@
 //! Single-Ended Network Parameter Data. No missing S-parameters are inferred.
 
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::Path;
 
 use crate::data::SweepData;
@@ -144,19 +143,7 @@ impl Document {
         {
             return Err(invalid(format!("expected a .{expected} destination")));
         }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(self.text.as_bytes())?;
-        temporary.as_file().sync_all()?;
-        let result = if overwrite {
-            temporary.persist(path)
-        } else {
-            temporary.persist_noclobber(path)
-        };
-        result.map_err(|error| ExportError::Io(error.error))?;
+        crate::atomic_file::write(path, self.text.as_bytes(), overwrite)?;
         Ok(())
     }
 }

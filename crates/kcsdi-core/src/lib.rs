@@ -14,6 +14,7 @@
 //! - [`data`]: identity and measurement data types,
 //! - [`error`]: shared error type.
 
+pub mod atomic_file;
 pub mod commands;
 pub mod control;
 pub mod data;
@@ -21,6 +22,7 @@ pub mod device;
 pub mod error;
 pub mod model;
 pub mod protocol;
+pub mod table;
 pub mod touchstone;
 pub mod transport;
 pub mod validation;

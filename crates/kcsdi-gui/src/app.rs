@@ -228,6 +228,7 @@ impl KcsdiApp {
     fn poll_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
             self.closing = true;
+            self.state.export.cancel();
             self.state.send(crate::state::WorkerCommand::Shutdown);
         }
         if !self.closing {
@@ -363,7 +364,7 @@ impl eframe::App for KcsdiApp {
                 .show(&ctx, |ui| {
                     ui.spinner();
                     ui.label(self.state.language.text(if self.state.export.is_pending() {
-                        Text::ExportBusy
+                        Text::ExportCancelHelp
                     } else {
                         Text::Disconnecting
                     }));
@@ -794,16 +795,12 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
         )
         .show(ui, |ui| {
             panels::workspace_panel::run_button(ui, state);
-            let completed = state
-                .workspace
-                .selected()
-                .and_then(|trace| trace.completed.clone());
             egui::Panel::bottom("trace_export")
-                .default_size(128.0)
-                .min_size(112.0)
+                .default_size(148.0)
+                .min_size(148.0)
                 .show_separator_line(true)
                 .show(ui, |ui| {
-                    crate::export::show(ui, &mut state.export, completed.as_deref(), language)
+                    crate::export::show(ui, &mut state.export, &state.workspace, language)
                 });
             egui::ScrollArea::vertical()
                 .id_salt("analysis_scroll")
@@ -2257,7 +2254,7 @@ mod tests {
                         for (key, left) in [
                             (Text::TraceList, true),
                             (Text::Run, false),
-                            (Text::ExportS1p, false),
+                            (Text::Export, false),
                         ] {
                             let (_, bounds) = labels
                                 .iter()

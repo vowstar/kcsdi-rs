@@ -115,12 +115,16 @@ fn parse_csv(reader: impl std::io::Read, mode: StreamMode) -> Result<SweepData, 
         .from_reader(reader);
     let headers = reader.headers()?.clone();
     let names: Vec<_> = headers.iter().collect();
-    let format = match names.as_slice() {
-        ["freq_hz", "real", "imag"] => "ri",
-        ["freq_hz", "magnitude", "phase_deg"] => "ma",
-        ["freq_hz", "z_mag_ohm", "resistance_ohm", "reactance_ohm"] => "z",
-        _ => return Err("expected complex CSV headers: freq_hz,real,imag or freq_hz,magnitude,phase_deg or freq_hz,z_mag_ohm,resistance_ohm,reactance_ohm".into()),
-    };
+    let format = ["ri", "ma", "z"]
+        .into_iter()
+        .find(|format| {
+            kcsdi_core::table::columns(mode, format).is_some_and(|columns| {
+                names.len() == columns.len() + 1
+                    && names[0] == "freq_hz"
+                    && names[1..].iter().copied().eq(columns.iter().map(|column| column.name))
+            })
+        })
+        .ok_or("expected complex CSV headers: freq_hz,real,imag or freq_hz,magnitude,phase_deg or freq_hz,z_mag_ohm,resistance_ohm,reactance_ohm")?;
     let mut points = Vec::new();
     for (index, record) in reader.records().enumerate() {
         let record = record?;
@@ -215,5 +219,37 @@ mod tests {
         );
         assert!(sweep_format(Path::new("sweep.s1p"), Some(Format::Loss), true).is_err());
         assert!(sweep_format(Path::new("sweep.s2p"), None, true).is_err());
+    }
+
+    #[test]
+    fn shared_raw_headers_round_trip_through_offline_complex_conversion() {
+        for (mode, format, values) in [
+            (StreamMode::S11, "ri", vec![0.5, -0.25]),
+            (StreamMode::S21, "ma", vec![0.5, -90.0]),
+            (StreamMode::S12, "ri", vec![-0.25, 0.5]),
+            (StreamMode::S22, "z", vec![50.0, 30.0, -40.0]),
+        ] {
+            let source = SweepData {
+                mode,
+                format: format.into(),
+                points: vec![SweepPoint {
+                    freq_hz: 7_000_000_200.0,
+                    values: values.clone(),
+                }],
+            };
+            let bytes = crate::csv_bytes(&source).unwrap();
+            let parsed = parse_csv(bytes.as_slice(), mode).unwrap();
+            assert_eq!(parsed.mode, mode);
+            assert_eq!(parsed.format, format);
+            assert_eq!(parsed.points[0].freq_hz, 7_000_000_200.0);
+            assert_eq!(parsed.points[0].values, values);
+        }
+        assert!(
+            parse_csv(
+                b"freq_hz,z_mag_ohm,resistance_ohm,reactance_ohm\n5000,50,50,0\n".as_slice(),
+                StreamMode::S21
+            )
+            .is_err()
+        );
     }
 }

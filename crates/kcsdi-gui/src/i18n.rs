@@ -253,21 +253,31 @@ catalog! {
     HideTrace => ("Click to hide this trace", "点击隐藏此曲线"),
     ShowTrace => ("Click to show this trace", "点击显示此曲线"),
     ExportS1p => ("Export .s1p", "导出 .s1p"),
+    Export => ("Export", "导出"),
+    ExportFormat => ("Format", "格式"),
+    ExportScope => ("Scope", "范围"),
+    ExportSelected => ("Selected trace", "当前轨迹"),
+    ExportVisible => ("Visible traces", "可见轨迹"),
+    ExportPoints => ("points", "点"),
+    ExportTraces => ("traces", "条轨迹"),
+    ExportMissing => ("Missing completed data", "缺少完整数据"),
+    ExportEmpty => ("No traces to export", "没有可导出的轨迹"),
     ExportBusy => ("Export in progress", "正在导出"),
     ExportSaved => ("Saved", "已保存"),
     ExportCancelled => ("Export cancelled", "已取消导出"),
+    ExportCancelling => ("Cancelling export", "正在取消导出"),
+    ExportCancelHelp => ("Close the file dialog to finish cancelling.", "关闭文件对话框即可完成取消。"),
     ExportFailed => ("Export failed", "导出失败"),
     ExportNeedsComplex => (
         "Select an S11 Phase, Smith or Impedance trace and run a sweep.",
         "选择 S11 相位、史密斯图或阻抗轨迹并运行扫描。"
     ),
-    ExportSnapshot => ("Last completed sweep", "最近完成的扫描"),
     ExportHelp => (
-        "Exports all samples from the last completed sweep as Hz / RI / 50 ohms. Zoom, LOG X and hidden traces do not change the file. Source calibration is unchanged. Two-port export requires four complete CSVs via CLI export s2p.",
-        "导出最近完成扫描的全部采样点，格式为 Hz / RI / 50 欧姆。缩放、X 对数和曲线隐藏不影响文件，不改变原有校准。两端口导出需通过 CLI export s2p 提供四份完整 CSV。"
+        "Exports complete measurements frozen on click, including hidden components. Hold, Max and Min are excluded.",
+        "导出点击时最近完成的测量数据，包含隐藏分量，不含保持和最大值、最小值包络。"
     ),
     ReplaceFile => ("Replace existing file?", "替换已有文件？"),
-    WrongExportExtension => ("Choose a .s1p destination", "请选择 .s1p 目标文件"),
+    WrongExportExtension => ("Required file extension", "所需文件扩展名"),
 }
 
 /// Typed UI messages update immediately when switching languages. Raw

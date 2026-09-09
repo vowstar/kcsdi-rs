@@ -301,7 +301,7 @@ fn sweep_s11(args: &S11Args) -> Result<(), Box<dyn Error>> {
         kcsdi_core::touchstone::Document::s1p(&data, args.touchstone.touchstone_version.into())?
             .save(&args.out, args.touchstone.overwrite)?;
     } else {
-        write_csv(&args.out, s_parameter_headers(format), &data)?;
+        write_csv(&args.out, &data)?;
     }
     println!(
         "{} points written to {}",
@@ -328,7 +328,7 @@ fn sweep_spec(args: &SpecArgs) -> Result<(), Box<dyn Error>> {
     let data = dev.sweep_spec(&params)?;
     dev.close();
 
-    write_csv(&args.out, &["freq_hz", "level_dbm"], &data)?;
+    write_csv(&args.out, &data)?;
     println!(
         "{} points written to {}",
         data.points.len(),
@@ -359,7 +359,7 @@ fn sweep_s21(args: &S21Args) -> Result<(), Box<dyn Error>> {
         Device::<TcpTransport>::connect_with_model(&args.conn.host, args.conn.port, args.model)?;
     let data = dev.sweep_s21(&params)?;
     dev.close();
-    write_csv(&args.out, s_parameter_headers(args.format), &data)?;
+    write_csv(&args.out, &data)?;
     println!(
         "{} points written to {}",
         data.points.len(),
@@ -368,16 +368,13 @@ fn sweep_s21(args: &S21Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// CSV headers for device S-parameter formats (section 4.2).
-fn s_parameter_headers(format: Format) -> &'static [&'static str] {
-    match format {
-        Format::Ri => &["freq_hz", "real", "imag"],
-        Format::Ma => &["freq_hz", "magnitude", "phase_deg"],
-        Format::Vswr => &["freq_hz", "vswr"],
-        Format::Z => &["freq_hz", "z_mag_ohm", "resistance_ohm", "reactance_ohm"],
-        Format::Loss => &["freq_hz", "loss_db"],
-        Format::Delay => &["freq_hz", "delay_s"],
-    }
+/// Keep raw CSV headers consistent with every other measured-data export.
+fn csv_headers(mode: StreamMode, format: &str) -> Result<Vec<&'static str>, Box<dyn Error>> {
+    let columns = kcsdi_core::table::columns(mode, format)
+        .ok_or_else(|| format!("unsupported raw CSV schema: {} {format}", mode.name()))?;
+    Ok(std::iter::once("freq_hz")
+        .chain(columns.iter().map(|column| column.name))
+        .collect())
 }
 
 fn format_freq(freq_hz: f64) -> String {
@@ -388,8 +385,9 @@ fn format_freq(freq_hz: f64) -> String {
     }
 }
 
-fn write_csv(path: &Path, headers: &[&str], data: &SweepData) -> Result<(), Box<dyn Error>> {
-    let mut wtr = csv::Writer::from_path(path)?;
+fn csv_bytes(data: &SweepData) -> Result<Vec<u8>, Box<dyn Error>> {
+    let headers = csv_headers(data.mode, &data.format)?;
+    let mut wtr = csv::Writer::from_writer(Vec::new());
     wtr.write_record(headers)?;
     for point in &data.points {
         let mut record = vec![format_freq(point.freq_hz)];
@@ -397,6 +395,12 @@ fn write_csv(path: &Path, headers: &[&str], data: &SweepData) -> Result<(), Box<
         wtr.write_record(&record)?;
     }
     wtr.flush()?;
+    Ok(wtr.into_inner()?)
+}
+
+fn write_csv(path: &Path, data: &SweepData) -> Result<(), Box<dyn Error>> {
+    let bytes = csv_bytes(data)?;
+    kcsdi_core::atomic_file::write(path, &bytes, true)?;
     log::info!(
         "wrote {} {} points to {}",
         data.points.len(),
@@ -475,11 +479,17 @@ mod tests {
     #[test]
     fn s21_preserves_data_units_and_rejects_touchstone_before_connection() {
         assert_eq!(
-            s_parameter_headers(Format::Ma),
+            csv_headers(StreamMode::S21, "ma").unwrap(),
             &["freq_hz", "magnitude", "phase_deg"]
         );
-        assert_eq!(s_parameter_headers(Format::Loss), &["freq_hz", "loss_db"]);
-        assert_eq!(s_parameter_headers(Format::Delay), &["freq_hz", "delay_s"]);
+        assert_eq!(
+            csv_headers(StreamMode::S21, "loss").unwrap(),
+            &["freq_hz", "loss_db"]
+        );
+        assert_eq!(
+            csv_headers(StreamMode::S21, "delay").unwrap(),
+            &["freq_hz", "delay_s"]
+        );
         for output in ["unused.s1p", "unused.S2P", "unused.txt"] {
             let cli = Cli::try_parse_from([
                 "kcsdi",
@@ -505,6 +515,73 @@ mod tests {
                     .to_string()
                     .contains("S21 sweep output must be .csv")
             );
+        }
+    }
+
+    #[test]
+    fn raw_csv_serializes_exact_headers_and_values_before_opening_a_file() {
+        use kcsdi_core::data::SweepPoint;
+        for (mode, format, values, expected) in [
+            (
+                StreamMode::S11,
+                "ri",
+                vec![0.5, -0.25],
+                "freq_hz,real,imag\n7000000200,0.5,-0.25\n",
+            ),
+            (
+                StreamMode::S21,
+                "ma",
+                vec![0.5, -90.0],
+                "freq_hz,magnitude,phase_deg\n7000000200,0.5,-90\n",
+            ),
+            (
+                StreamMode::S11,
+                "z",
+                vec![50.0, 30.0, -40.0],
+                "freq_hz,z_mag_ohm,resistance_ohm,reactance_ohm\n7000000200,50,30,-40\n",
+            ),
+            (
+                StreamMode::S11,
+                "vswr",
+                vec![1.5],
+                "freq_hz,vswr\n7000000200,1.5\n",
+            ),
+            (
+                StreamMode::S21,
+                "loss",
+                vec![-3.0],
+                "freq_hz,loss_db\n7000000200,-3\n",
+            ),
+            (
+                StreamMode::S21,
+                "delay",
+                vec![-5e-9],
+                "freq_hz,delay_s\n7000000200,-0.000000005\n",
+            ),
+            (
+                StreamMode::Spec,
+                "",
+                vec![-42.5],
+                "freq_hz,level_dbm\n7000000200,-42.5\n",
+            ),
+        ] {
+            let data = SweepData {
+                mode,
+                format: format.into(),
+                points: vec![SweepPoint {
+                    freq_hz: 7_000_000_200.0,
+                    values,
+                }],
+            };
+            assert_eq!(csv_bytes(&data).unwrap(), expected.as_bytes());
+            let mut malformed = data.clone();
+            malformed.points.push(SweepPoint {
+                freq_hz: 7_000_000_300.0,
+                values: vec![],
+            });
+            assert!(csv_bytes(&malformed).is_err());
+            malformed.points[1].values = vec![1.0; 4];
+            assert!(csv_bytes(&malformed).is_err());
         }
     }
 

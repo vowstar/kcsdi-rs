@@ -16,6 +16,7 @@ mod export;
 mod i18n;
 mod panels;
 mod preview;
+mod spreadsheet;
 mod state;
 mod theme;
 mod widgets;

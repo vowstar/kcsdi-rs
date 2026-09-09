@@ -5,11 +5,11 @@
 
 The GUI and CLI save `.s1p` files. The CLI also assembles `.s2p` files from four complex measurements. Both [Touchstone versions](https://ibis.org/touchstone_ver2.0/touchstone_ver2_0.pdf) use Hz, real and imaginary values, and a 50 ohm reference.
 
-The default is version 2.0. For version 1, select it in the GUI or use `--touchstone-version 1`. To replace an existing file, use `--overwrite` in the CLI or accept the GUI confirmation.
+Choose Touchstone 1.0 or 2.0 in the GUI export format list. The CLI defaults to version 2.0 and accepts `--touchstone-version 1`. To replace an existing file, use `--overwrite` in the CLI or accept the GUI confirmation.
 
 ## CSV inputs
 
-The column header determines the input format:
+The CLI raw CSV column header determines the input format. GUI CSV includes trace metadata and is not an input to this converter:
 
 | Header | Values | Use |
 | --- | --- | --- |

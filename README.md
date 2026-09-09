@@ -14,7 +14,7 @@ A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11,
 | S11 | Impedance, Smith chart, phase, return loss and VSWR |
 | S21 | Phase, loss and group delay |
 | Spectrum | Live trace with linear or logarithmic frequency axis |
-| Data | CSV and Touchstone `.s1p`. CLI assembly of `.s2p` from four complex measurements |
+| Data | CSV, XLSX and Touchstone `.s1p`. CLI assembly of `.s2p` from four complex measurements |
 | Analysis | Selectable traces, hold, maximum and minimum envelopes, markers, zoom, pan and fit |
 | Interface | English and Simplified Chinese. Saved devices, light, dark and system themes |
 
@@ -70,7 +70,9 @@ These are tested command limits. Use the instrument specifications for measureme
 
 ## Export
 
-For GUI export, complete an S11 Phase, Smith or Impedance sweep, then select Export .s1p. The file contains the selected trace's full completed measurement, including hidden components and points outside the current view. Return loss and VSWR alone lack phase.
+Choose CSV or XLSX to export the selected trace or all visible traces. Files contain complete measurements and their captured settings. Hold, Max and Min are excluded. GUI CSV has one row per raw value with frequency, unit and trace metadata. XLSX has one data sheet per trace and a Metadata sheet.
+
+For `.s1p`, choose Touchstone after an S11 Phase, Smith or Impedance sweep. It saves all samples and complex components of the selected completed trace. Return loss and VSWR alone lack phase.
 
 S21 CLI exports use CSV. Phase uses degrees and group delay uses seconds. Loss values keep the sign reported by the instrument.
 
@@ -81,7 +83,7 @@ kcsdi export s2p --s11 s11.csv --s21 s21.csv \
     --s12 s12.csv --s22 s22.csv --out network.s2p
 ```
 
-Full two-port acquisition is not implemented. Export defaults to Touchstone 2.0 with a 50 ohm reference. See [Touchstone export](docs/touchstone.md) for input formats and independent validation.
+Full two-port acquisition is not implemented. CLI Touchstone export defaults to version 2.0 with a 50 ohm reference. See [Touchstone export](docs/touchstone.md) for input formats and independent validation.
 
 ## References and license
 
