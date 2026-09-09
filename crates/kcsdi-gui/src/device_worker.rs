@@ -22,6 +22,7 @@ use crate::preview::{PreviewEnvelope, PreviewMailbox};
 use crate::state::{CommandEnvelope, DEVICE_MODEL, EventEnvelope, WorkerCommand, WorkerEvent};
 
 pub const EVENT_CAPACITY: usize = 16;
+const STATUS_COMMAND_GAP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 struct SweepRequest {
@@ -60,6 +61,7 @@ pub fn device_worker(
     let mut job: Option<SweepRequest> = None;
     let mut identity = WorkerIdentity::default();
     let mut cycle_id = 0_u64;
+    let mut pending_status = None;
 
     let emit = |evt: EventEnvelope| {
         send_event(&evt_tx, evt, &shutdown, None, &ctx);
@@ -69,8 +71,58 @@ pub fn device_worker(
         if shutdown.is_cancelled() {
             break;
         }
+        if device.is_none() || job.is_none() {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    if shutdown.is_cancelled() || matches!(cmd.command, WorkerCommand::Shutdown) {
+                        break;
+                    }
+                    handle_or_defer(
+                        cmd,
+                        &mut pending_status,
+                        &mut identity,
+                        &mut device,
+                        &mut job,
+                        &emit,
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+        // Control commands take precedence over health queries and the next group.
+        loop {
+            if shutdown.is_cancelled() {
+                break 'worker;
+            }
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if matches!(cmd.command, WorkerCommand::Shutdown) {
+                        break 'worker;
+                    }
+                    handle_or_defer(
+                        cmd,
+                        &mut pending_status,
+                        &mut identity,
+                        &mut device,
+                        &mut job,
+                        &emit,
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break 'worker,
+            }
+        }
+        if let Some(status) = pending_status.take() {
+            let cancel = status.cancel.clone();
+            handle(status, &mut identity, &mut device, &mut job, &|event| {
+                send_event(&evt_tx, event, &shutdown, Some(&cancel), &ctx);
+            });
+        }
+        if shutdown.is_cancelled() {
+            break;
+        }
         if device.is_some() && job.is_some() {
-            // Run one sweep, then drain any pending commands.
+            // A stream is owned exclusively until its complete frame or cleanup.
             let current = job.clone().expect("checked above");
             if current.cancel.is_cancelled() {
                 job = None;
@@ -141,36 +193,34 @@ pub fn device_worker(
                     fail(e, "Sweep failed", &mut device, &mut job, &emit_result);
                 }
             }
-            loop {
-                if shutdown.is_cancelled() {
-                    break 'worker;
-                }
-                match cmd_rx.try_recv() {
-                    Ok(cmd) => {
-                        if matches!(cmd.command, WorkerCommand::Shutdown) {
-                            break 'worker;
-                        }
-                        handle(cmd, &mut identity, &mut device, &mut job, &emit);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break 'worker,
-                }
-            }
-        } else {
-            match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if shutdown.is_cancelled() || matches!(cmd.command, WorkerCommand::Shutdown) {
-                        break;
-                    }
-                    handle(cmd, &mut identity, &mut device, &mut job, &emit);
-                }
-                Err(_) => break,
-            }
         }
     }
     shutdown.cancel();
     if let Some(mut dev) = device.take() {
         dev.close();
+    }
+}
+
+fn handle_or_defer(
+    envelope: CommandEnvelope,
+    pending_status: &mut Option<CommandEnvelope>,
+    identity: &mut WorkerIdentity,
+    device: &mut Option<Device<TcpTransport>>,
+    job: &mut Option<SweepRequest>,
+    emit: &dyn Fn(EventEnvelope),
+) {
+    if matches!(envelope.command, WorkerCommand::RefreshStatus) {
+        if envelope.session_id == identity.session_id {
+            *pending_status = Some(envelope);
+        }
+    } else {
+        handle(envelope, identity, device, job, emit);
+        if pending_status
+            .as_ref()
+            .is_some_and(|status| status.session_id != identity.session_id)
+        {
+            *pending_status = None;
+        }
     }
 }
 
@@ -231,7 +281,10 @@ fn handle(
             request_id,
         };
     } else {
-        if session_id != identity.session_id || request_id < identity.request_id {
+        if session_id != identity.session_id
+            || (!matches!(command, WorkerCommand::RefreshStatus)
+                && request_id < identity.request_id)
+        {
             return;
         }
         if !matches!(command, WorkerCommand::RefreshStatus) {
@@ -289,21 +342,56 @@ fn handle(
             }
         }
         WorkerCommand::RefreshStatus => {
-            if let Some(dev) = device.as_mut() {
-                match dev
-                    .temperature_controlled(&cancel)
-                    .and_then(|t| dev.voltage_controlled(&cancel).map(|v| (t, v)))
-                {
-                    Ok((temperature, voltage)) => {
-                        emit(WorkerEvent::Status {
-                            temperature,
-                            voltage,
-                        });
-                    }
-                    Err(e) => fail(e, "Status query failed", device, job, &emit),
-                }
-            }
+            refresh_status(&cancel, device, job, &emit);
         }
+    }
+}
+
+fn refresh_status(
+    cancel: &CancellationToken,
+    device: &mut Option<Device<TcpTransport>>,
+    job: &mut Option<SweepRequest>,
+    emit: &dyn Fn(WorkerEvent),
+) {
+    let Some(dev) = device.as_mut() else { return };
+    // Status belongs to the session, not a sweep. Stop cannot interrupt an
+    // in-flight pair, which retains two 10-second query budgets and this gap.
+    // Disconnect and shutdown cancel the session token instead.
+    let observed_at = Instant::now();
+    let result = dev.temperature_controlled(cancel).and_then(|temperature| {
+        status_command_gap(cancel)?;
+        dev.voltage_controlled(cancel)
+            .map(|voltage| crate::health::HealthSnapshot {
+                temperature,
+                voltage,
+                observed_at,
+            })
+    });
+    match result {
+        Ok(snapshot) => emit(WorkerEvent::Status(snapshot)),
+        Err(error)
+            if connection_failed(&error)
+                || device.as_ref().is_some_and(Device::requires_reconnect) =>
+        {
+            fail(error, "Status query failed", device, job, emit);
+        }
+        Err(kcsdi_core::Error::Cancelled) => {}
+        Err(error) => emit(WorkerEvent::StatusFailed(format!(
+            "Status query failed: {error}"
+        ))),
+    }
+}
+
+fn status_command_gap(cancel: &CancellationToken) -> kcsdi_core::Result<()> {
+    let started = Instant::now();
+    loop {
+        if cancel.is_cancelled() {
+            return Err(kcsdi_core::Error::Cancelled);
+        }
+        let Some(remaining) = STATUS_COMMAND_GAP.checked_sub(started.elapsed()) else {
+            return Ok(());
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -488,6 +576,8 @@ mod tests {
         let (commands, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
         let (partial_sent, partial_ready) = mpsc::channel();
+        let (frame_sent, frame_ready) = mpsc::channel();
+        let (refresh_queued, refresh_ready) = mpsc::channel();
         let shutdown = CancellationToken::default();
         let worker_shutdown = shutdown.clone();
         let cancel = CancellationToken::default();
@@ -543,9 +633,33 @@ mod tests {
                 ] {
                     expect_line(&mut peer, command);
                 }
-                peer.get_mut().write_all(
-                    b"$start,s11,z\n$1000000,50,50,0\n$1500000,55,55,0\n$2000000,60,60,0\n$end\n"
-                ).unwrap();
+                peer.get_mut()
+                    .write_all(b"$start,s11,z\n$1000000,50,50,0\n")
+                    .unwrap();
+                frame_sent.send(()).unwrap();
+                refresh_ready.recv_timeout(WAIT).unwrap();
+                peer.get_mut()
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let error = peer.read(&mut [0]).unwrap_err();
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ));
+                peer.get_mut().set_read_timeout(Some(WAIT)).unwrap();
+                peer.get_mut()
+                    .write_all(b"$1500000,55,55,0\n$2000000,60,60,0\n$end\n")
+                    .unwrap();
+                expect_line(&mut peer, "$temp\n");
+                let temperature_response_at = Instant::now();
+                peer.get_mut()
+                    .write_all(b"$start,temp\n$42\n$end\n")
+                    .unwrap();
+                expect_line(&mut peer, "$voltage\n");
+                assert!(temperature_response_at.elapsed() >= STATUS_COMMAND_GAP);
+                peer.get_mut()
+                    .write_all(b"$start,voltage\n$12,8\n$end\n")
+                    .unwrap();
                 for command in [
                     "$s11,stop\n",
                     "$spec,init\n",
@@ -628,6 +742,20 @@ mod tests {
                     command: WorkerCommand::RunWorkspace(plan),
                 })
                 .unwrap();
+            frame_ready.recv_timeout(WAIT).unwrap();
+            // Both requests predate the active acquisition generation. They
+            // still belong to this session and must coalesce at its boundary.
+            for _ in 0..2 {
+                commands
+                    .send(CommandEnvelope {
+                        session_id: 1,
+                        request_id: 1,
+                        cancel: CancellationToken::default(),
+                        command: WorkerCommand::RefreshStatus,
+                    })
+                    .unwrap();
+            }
+            refresh_queued.send(()).unwrap();
             let mut completed = Vec::new();
             for (cycle, members, expected_settings) in [
                 (1, vec![TraceId(1), TraceId(3)], settings),
@@ -647,6 +775,17 @@ mod tests {
                 assert_eq!(delivery.snapshot.session_id, 1);
                 assert!(expected_settings.accepts(&delivery.snapshot.data));
                 completed.push(delivery.snapshot);
+                if cycle == 1 {
+                    let status = event_rx.recv_timeout(WAIT).unwrap();
+                    assert_eq!((status.session_id, status.request_id), (1, 1));
+                    assert!(matches!(
+                        status.event,
+                        WorkerEvent::Status(crate::health::HealthSnapshot {
+                            temperature: 42.0,
+                            ..
+                        })
+                    ));
+                }
             }
             partial_ready.recv_timeout(WAIT).unwrap();
             cancel.cancel();
@@ -994,7 +1133,7 @@ mod tests {
         handle(
             CommandEnvelope {
                 session_id: 2,
-                request_id: 7,
+                request_id: 3,
                 cancel: CancellationToken::default(),
                 command: WorkerCommand::RefreshStatus,
             },
@@ -1011,14 +1150,345 @@ mod tests {
         assert_eq!(job.plan.groups.len(), 2);
         assert!(device.is_some());
         let events = events.borrow();
-        assert_eq!((events[0].session_id, events[0].request_id), (2, 7));
+        assert_eq!((events[0].session_id, events[0].request_id), (2, 3));
         assert!(matches!(
             events[0].event,
-            WorkerEvent::Status {
+            WorkerEvent::Status(crate::health::HealthSnapshot {
                 temperature: 42.0,
                 ..
-            }
+            })
         ));
+    }
+
+    #[test]
+    fn deferred_refreshes_coalesce_behind_controls_and_expire_with_the_session() {
+        let mut identity = WorkerIdentity {
+            session_id: 2,
+            request_id: 7,
+        };
+        let mut device = None;
+        let mut job = Some(request(AcquisitionSettings::S11(s11())));
+        let mut pending = None;
+        let events = RefCell::new(Vec::new());
+        let emit = |event| events.borrow_mut().push(event);
+        for request_id in [3, 4] {
+            handle_or_defer(
+                CommandEnvelope {
+                    session_id: 2,
+                    request_id,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::RefreshStatus,
+                },
+                &mut pending,
+                &mut identity,
+                &mut device,
+                &mut job,
+                &emit,
+            );
+        }
+        assert_eq!(pending.as_ref().unwrap().request_id, 4);
+        assert!(job.is_some());
+        assert!(events.borrow().is_empty());
+        handle_or_defer(
+            CommandEnvelope {
+                session_id: 2,
+                request_id: 8,
+                cancel: CancellationToken::default(),
+                command: WorkerCommand::StopSweep,
+            },
+            &mut pending,
+            &mut identity,
+            &mut device,
+            &mut job,
+            &emit,
+        );
+        assert!(job.is_none());
+        assert!(matches!(
+            events.borrow()[0].event,
+            WorkerEvent::SweepStopped
+        ));
+        assert_eq!(pending.as_ref().unwrap().request_id, 4);
+        assert_eq!(identity.request_id, 8);
+        handle_or_defer(
+            CommandEnvelope {
+                session_id: 1,
+                request_id: 9,
+                cancel: CancellationToken::default(),
+                command: WorkerCommand::RefreshStatus,
+            },
+            &mut pending,
+            &mut identity,
+            &mut device,
+            &mut job,
+            &emit,
+        );
+        assert_eq!(pending.as_ref().unwrap().request_id, 4);
+        handle_or_defer(
+            CommandEnvelope {
+                session_id: 3,
+                request_id: 9,
+                cancel: CancellationToken::default(),
+                command: WorkerCommand::Disconnect,
+            },
+            &mut pending,
+            &mut identity,
+            &mut device,
+            &mut job,
+            &emit,
+        );
+        assert!(pending.is_none());
+        assert!(matches!(
+            events.borrow()[1].event,
+            WorkerEvent::Disconnected
+        ));
+    }
+
+    #[test]
+    fn recoverable_status_failures_preserve_the_job_and_allow_a_fresh_pair() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for fail_voltage in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut peer = BufReader::new(socket);
+                let mut replies = Vec::new();
+                if fail_voltage {
+                    replies.push(("$temp\n", "$start,temp\n$99\n$end\n"));
+                }
+                replies.push((
+                    if fail_voltage {
+                        "$voltage\n"
+                    } else {
+                        "$temp\n"
+                    },
+                    "$start,err_par5\n$invalid query\n$end\n",
+                ));
+                replies.extend([
+                    ("$temp\n", "$start,temp\n$42\n$end\n"),
+                    ("$voltage\n", "$start,voltage\n$12,8\n$end\n"),
+                ]);
+                for (command, response) in replies {
+                    let mut line = String::new();
+                    peer.read_line(&mut line).unwrap();
+                    assert_eq!(line, command);
+                    peer.get_mut().write_all(response.as_bytes()).unwrap();
+                }
+            });
+            let mut device = Some(Device::new(
+                TcpTransport::connect("127.0.0.1", port).unwrap(),
+            ));
+            let mut identity = WorkerIdentity {
+                session_id: 2,
+                request_id: 7,
+            };
+            let mut job = Some(SweepRequest {
+                request_id: 7,
+                cancel: CancellationToken::default(),
+                plan: SweepPlan::from_requests([
+                    (TraceId(1), AcquisitionSettings::S11(s11())),
+                    (TraceId(2), AcquisitionSettings::Spec(spec())),
+                ])
+                .unwrap(),
+                next_group: 1,
+            });
+            let events = RefCell::new(Vec::new());
+            for attempt in 0..2 {
+                let started = Instant::now();
+                handle(
+                    CommandEnvelope {
+                        session_id: 2,
+                        request_id: 3,
+                        cancel: CancellationToken::default(),
+                        command: WorkerCommand::RefreshStatus,
+                    },
+                    &mut identity,
+                    &mut device,
+                    &mut job,
+                    &|event| events.borrow_mut().push(event),
+                );
+                assert!(device.is_some());
+                assert!(!device.as_ref().unwrap().requires_reconnect());
+                assert_eq!(job.as_ref().unwrap().request_id, 7);
+                assert_eq!(job.as_ref().unwrap().next_group, 1);
+                assert_eq!(identity.request_id, 7);
+                let events = events.borrow();
+                assert_eq!(events.len(), attempt + 1);
+                let event = &events[attempt];
+                assert_eq!((event.session_id, event.request_id), (2, 3));
+                if attempt == 0 {
+                    assert!(
+                        matches!(&event.event, WorkerEvent::StatusFailed(message) if message.contains("err_par5"))
+                    );
+                } else {
+                    let WorkerEvent::Status(snapshot) = &event.event else {
+                        panic!("expected complete status pair")
+                    };
+                    assert_eq!(snapshot.temperature, 42.0);
+                    assert_eq!(snapshot.voltage.external, 12.0);
+                    assert_eq!(snapshot.voltage.battery, 8.0);
+                    assert!(snapshot.observed_at >= started);
+                    assert!(snapshot.observed_at.elapsed() >= STATUS_COMMAND_GAP);
+                }
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_status_gap_and_obsolete_status_delivery_do_not_block() {
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert!(matches!(status_command_gap(&cancel), Err(Error::Cancelled)));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(WorkerIdentity::default().event(WorkerEvent::SweepStopped))
+            .unwrap();
+        let shutdown = CancellationToken::default();
+        send_event(
+            &sender,
+            WorkerIdentity::default().event(WorkerEvent::StatusFailed("obsolete".into())),
+            &shutdown,
+            Some(&cancel),
+            &egui::Context::default(),
+        );
+        assert!(!shutdown.is_cancelled());
+        assert!(matches!(
+            receiver.recv().unwrap().event,
+            WorkerEvent::SweepStopped
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_interrupts_an_in_flight_status_pair_and_releases_remote_mode() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        struct ShutdownOnDrop {
+            commands: mpsc::Sender<CommandEnvelope>,
+            session: CancellationToken,
+            shutdown: CancellationToken,
+        }
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.session.cancel();
+                self.shutdown.cancel();
+                let _ = self.commands.send(CommandEnvelope {
+                    session_id: 2,
+                    request_id: 2,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::Shutdown,
+                });
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let (query_sent, query_ready) = mpsc::channel();
+        let session = CancellationToken::default();
+        let shutdown = CancellationToken::default();
+        let worker_shutdown = shutdown.clone();
+        std::thread::scope(|scope| {
+            let cleanup = ShutdownOnDrop {
+                commands: commands.clone(),
+                session: session.clone(),
+                shutdown,
+            };
+            let server = scope.spawn(move || {
+                let started = Instant::now();
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(started.elapsed() < WAIT);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("peer accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(WAIT)).unwrap();
+                socket.set_write_timeout(Some(WAIT)).unwrap();
+                let mut peer = BufReader::new(socket);
+                let mut byte = [0];
+                peer.read_exact(&mut byte).unwrap();
+                assert_eq!(&byte, b"C");
+                peer.get_mut()
+                    .write_all(b"$start,id\n$000000000001\n$end\n")
+                    .unwrap();
+                let mut line = String::new();
+                peer.read_line(&mut line).unwrap();
+                assert_eq!(line, "$device\n");
+                peer.get_mut()
+                    .write_all(
+                        b"$start,device\n$Synthetic peer\n\
+                    $<-User @ :replay>\n$<-Software ver:test>\n\
+                    $<-Hardware ver:test>\n$<-Serial num:000000000001>\n\
+                    $<-Copyright:Test fixture>\n$end\n",
+                    )
+                    .unwrap();
+                line.clear();
+                peer.read_line(&mut line).unwrap();
+                assert_eq!(line, "$temp\n");
+                peer.get_mut().write_all(b"$start,temp\n").unwrap();
+                query_sent.send(()).unwrap();
+                line.clear();
+                peer.read_line(&mut line).unwrap();
+                assert_eq!(line, "$local\n");
+                assert_eq!(peer.read(&mut byte).unwrap(), 0);
+            });
+            let worker = scope.spawn(move || {
+                device_worker(
+                    command_rx,
+                    events,
+                    egui::Context::default(),
+                    worker_shutdown,
+                    PreviewMailbox::default(),
+                )
+            });
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 1,
+                    cancel: session.clone(),
+                    command: WorkerCommand::Connect {
+                        host: "127.0.0.1".into(),
+                        port,
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::Connected(_)
+            ));
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 1,
+                    cancel: session,
+                    command: WorkerCommand::RefreshStatus,
+                })
+                .unwrap();
+            query_ready.recv_timeout(WAIT).unwrap();
+            let cancelled_at = Instant::now();
+            drop(cleanup);
+            worker.join().unwrap();
+            assert!(cancelled_at.elapsed() < Duration::from_secs(3));
+            server.join().unwrap();
+            assert!(event_rx.try_recv().is_err());
+        });
     }
 
     #[test]

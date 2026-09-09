@@ -4,13 +4,15 @@
 //! Application state and identities shared by the GUI and its device worker.
 
 use std::sync::mpsc;
+use std::time::Instant;
 
 use kcsdi_core::commands::Format;
 use kcsdi_core::control::CancellationToken;
-use kcsdi_core::data::{DeviceInfo, Voltage};
+use kcsdi_core::data::DeviceInfo;
 use kcsdi_core::model::Model;
 
 use crate::acquisition::{SweepDelivery, SweepPlan};
+use crate::health::{HealthSnapshot, HealthState};
 use crate::i18n::{Language, StatusMessage, Text};
 use crate::preview::PreviewMailbox;
 use crate::workspace::Workspace;
@@ -35,7 +37,8 @@ pub enum WorkerEvent {
     Error(String),
     SweepTrace(SweepDelivery),
     SweepStopped,
-    Status { temperature: f64, voltage: Voltage },
+    Status(HealthSnapshot),
+    StatusFailed(String),
 }
 
 #[derive(Debug)]
@@ -203,8 +206,7 @@ pub struct AppState {
     pub port: u16,
     pub connection: ConnectionState,
     pub device_info: Option<DeviceInfo>,
-    pub temperature: Option<f64>,
-    pub voltage: Option<Voltage>,
+    pub health: HealthState,
     pub workspace: Workspace,
     pub active_plan: Option<SweepPlan>,
     pub export: crate::export::ExportState,
@@ -230,8 +232,7 @@ impl Default for AppState {
             port: 901,
             connection: Default::default(),
             device_info: None,
-            temperature: None,
-            voltage: None,
+            health: Default::default(),
             workspace: Default::default(),
             active_plan: None,
             export: Default::default(),
@@ -272,10 +273,17 @@ impl AppState {
     }
 
     pub fn send(&mut self, command: WorkerCommand) {
+        if matches!(command, WorkerCommand::RefreshStatus)
+            && (self.connection != ConnectionState::Connected || !self.health.begin())
+        {
+            return;
+        }
         if matches!(
             command,
             WorkerCommand::Connect { .. } | WorkerCommand::Disconnect | WorkerCommand::Shutdown
         ) {
+            self.device_info = None;
+            self.health = HealthState::default();
             self.session_cancel.cancel();
             self.acquisition_cancel.cancel();
             self.session_cancel = CancellationToken::default();
@@ -340,6 +348,15 @@ impl AppState {
         self.sweep == SweepState::Running
     }
 
+    pub fn refresh_health_if_due(&mut self, now: Instant) {
+        if self.connection == ConnectionState::Connected
+            && self.sweep != SweepState::Stopping
+            && self.health.due(now)
+        {
+            self.send(WorkerCommand::RefreshStatus);
+        }
+    }
+
     pub fn clear_preview(&mut self) {
         self.workspace.clear_previews();
         self.preview_mailbox.clear();
@@ -353,8 +370,7 @@ impl AppState {
         self.active_plan = None;
         self.clear_preview();
         self.device_info = None;
-        self.temperature = None;
-        self.voltage = None;
+        self.health = HealthState::default();
         let message = "Device worker stopped".to_string();
         self.connection = ConnectionState::Error(message.clone());
         self.status_message = Some(message.into());
@@ -378,6 +394,7 @@ mod tests {
             port: 901,
         });
         let connect = rx.try_recv().unwrap();
+        state.connection = ConnectionState::Connected;
         let plan = state.workspace.plan().unwrap();
         state.send(WorkerCommand::RunWorkspace(plan.clone()));
         let first = rx.try_recv().unwrap();
@@ -438,5 +455,105 @@ mod tests {
         assert_eq!(state.sweep, SweepState::Idle);
         assert!(matches!(state.connection, ConnectionState::Error(_)));
         assert!(state.worker_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn manual_and_periodic_refresh_share_one_pending_request() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            connection: ConnectionState::Connected,
+            session_id: 3,
+            request_id: 7,
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        state.refresh_health_if_due(now);
+        for _ in 0..10 {
+            state.send(WorkerCommand::RefreshStatus);
+            state.refresh_health_if_due(now + std::time::Duration::from_secs(120));
+        }
+        let request = rx.try_recv().unwrap();
+        assert!(matches!(request.command, WorkerCommand::RefreshStatus));
+        assert_eq!((request.session_id, request.request_id), (3, 7));
+        assert!(rx.try_recv().is_err());
+        assert_eq!((state.session_id, state.request_id), (3, 7));
+        state.health.fail("Temporary rejection".into(), now);
+        state.refresh_health_if_due(now);
+        assert!(rx.try_recv().is_err());
+        state.refresh_health_if_due(now + crate::health::REFRESH_INTERVAL);
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::RefreshStatus
+        ));
+    }
+
+    #[test]
+    fn health_clock_only_queues_in_a_usable_session() {
+        for connection in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Disconnecting,
+            ConnectionState::Error("connection failed".into()),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let mut state = AppState {
+                connection,
+                cmd_tx: Some(tx),
+                ..Default::default()
+            };
+            state.refresh_health_if_due(Instant::now());
+            state.send(WorkerCommand::RefreshStatus);
+            assert!(!state.health.pending);
+            assert!(rx.try_recv().is_err());
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            connection: ConnectionState::Connected,
+            sweep: SweepState::Stopping,
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.refresh_health_if_due(Instant::now());
+        assert!(rx.try_recv().is_err());
+        state.sweep = SweepState::Idle;
+        state.refresh_health_if_due(Instant::now());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn session_transitions_clear_identity_and_all_health_immediately() {
+        for command in [
+            WorkerCommand::Disconnect,
+            WorkerCommand::Shutdown,
+            WorkerCommand::Connect {
+                host: "instrument.local".into(),
+                port: 901,
+            },
+        ] {
+            let mut state = AppState {
+                connection: ConnectionState::Connected,
+                device_info: Some(DeviceInfo {
+                    serial: "previous".into(),
+                    username: String::new(),
+                    software: String::new(),
+                    hardware: String::new(),
+                    copyright: String::new(),
+                }),
+                ..Default::default()
+            };
+            state.health.succeed(
+                crate::health::tests::snapshot(42.0, Instant::now()),
+                Instant::now(),
+            );
+            state.health.error = Some("Old query failure".into());
+            state.health.pending = true;
+            state.send(command);
+            assert!(state.device_info.is_none());
+            assert!(state.health.snapshot.is_none());
+            assert!(state.health.error.is_none());
+            assert!(state.health.last_attempt.is_none());
+            assert!(!state.health.pending);
+        }
     }
 }

@@ -174,6 +174,7 @@ impl KcsdiApp {
                 self.connection_open = false;
                 info!("connected, serial {}", info.serial);
                 self.state.connection = ConnectionState::Connected;
+                self.state.health = Default::default();
                 self.state.device_info = Some(info);
                 self.state.status_message = Some(StatusMessage::Text(Text::Connected));
                 self.state.send(crate::state::WorkerCommand::RefreshStatus);
@@ -203,12 +204,15 @@ impl KcsdiApp {
                 }
             }
             WorkerEvent::SweepTrace(_) => {}
-            WorkerEvent::Status {
-                temperature,
-                voltage,
-            } => {
-                self.state.temperature = Some(temperature);
-                self.state.voltage = Some(voltage);
+            WorkerEvent::Status(snapshot) => {
+                if self.state.connection == ConnectionState::Connected {
+                    self.state.health.succeed(snapshot, Instant::now());
+                }
+            }
+            WorkerEvent::StatusFailed(message) => {
+                if self.state.connection == ConnectionState::Connected {
+                    self.state.health.fail(message, Instant::now());
+                }
             }
         }
     }
@@ -216,8 +220,7 @@ impl KcsdiApp {
     fn clear_connection(&mut self) {
         self.state.connection = ConnectionState::Disconnected;
         self.state.device_info = None;
-        self.state.temperature = None;
-        self.state.voltage = None;
+        self.state.health = Default::default();
         self.state.sweep = SweepState::Idle;
         self.state.active_plan = None;
         self.state.clear_preview();
@@ -356,6 +359,9 @@ impl eframe::App for KcsdiApp {
         if let Some(preview) = self.state.preview_mailbox.take() {
             self.apply_preview(preview);
         }
+        if !self.closing {
+            self.state.refresh_health_if_due(Instant::now());
+        }
         if self.closing {
             ui.disable();
             egui::Window::new(self.state.language.text(Text::Closing))
@@ -378,17 +384,7 @@ impl eframe::App for KcsdiApp {
         if self.state.desktop.page == Page::Instrument {
             self.instrument_ui(ui);
         } else {
-            if matches!(
-                self.state.connection,
-                ConnectionState::Connected | ConnectionState::Disconnecting
-            ) {
-                egui::Panel::bottom("desktop_session_status").show(ui, |ui| {
-                    if panels::status_bar::show(ui, &mut self.state) {
-                        self.connection_open = true;
-                    }
-                });
-            }
-            desktop::show_home(ui, &mut self.state);
+            self.desktop_ui(ui);
         }
 
         egui::Window::new(self.state.language.text(Text::Connection))
@@ -425,6 +421,17 @@ impl Drop for KcsdiApp {
 }
 
 impl KcsdiApp {
+    fn desktop_ui(&mut self, ui: &mut egui::Ui) {
+        if self.state.connection != ConnectionState::Disconnected {
+            egui::Panel::bottom("desktop_session_status").show(ui, |ui| {
+                if panels::status_bar::show(ui, &mut self.state) {
+                    self.connection_open = true;
+                }
+            });
+        }
+        desktop::show_home(ui, &mut self.state);
+    }
+
     fn instrument_ui(&mut self, ui: &mut egui::Ui) {
         let language = self.state.language;
         egui::Panel::top("instrument_menu")
@@ -1086,7 +1093,10 @@ mod tests {
         let mut state = AppState {
             connection: ConnectionState::Connected,
             session_id: 1,
-            temperature: Some(42.0),
+            health: crate::health::HealthState {
+                snapshot: Some(crate::health::tests::snapshot(42.0, Instant::now())),
+                ..Default::default()
+            },
             ..Default::default()
         };
         state.workspace = Workspace::empty(SweepRange::new(1_000_000.0, 2_000_000.0, 3));
@@ -1957,8 +1967,8 @@ mod tests {
             } else {
                 WorkerEvent::Disconnected
             });
-            assert!(app.state.temperature.is_none());
-            assert!(app.state.voltage.is_none());
+            assert!(app.state.health.snapshot.is_none());
+            assert!(!app.state.health.pending);
             assert!(app.state.workspace.selected().unwrap().preview.is_none());
             assert_eq!(complete_data(&app), Some(completed_impedance()));
             assert_eq!(app.state.sweep, SweepState::Idle);
@@ -2044,13 +2054,8 @@ mod tests {
                     copyright: String::new(),
                 }),
                 WorkerEvent::Disconnected,
-                WorkerEvent::Status {
-                    temperature: 99.0,
-                    voltage: kcsdi_core::data::Voltage {
-                        external: 9.0,
-                        battery: 7.0,
-                    },
-                },
+                WorkerEvent::Status(crate::health::tests::snapshot(99.0, Instant::now())),
+                WorkerEvent::StatusFailed("old status error".into()),
                 WorkerEvent::ConnectionLost("old socket closed".into()),
             ] {
                 let request_id = app.state.request_id;
@@ -2069,8 +2074,9 @@ mod tests {
                     }
                 );
                 assert!(app.state.device_info.is_none());
-                assert_eq!(app.state.temperature, Some(42.0));
-                assert!(app.state.voltage.is_none());
+                assert!(app.state.health.snapshot.is_none());
+                assert!(app.state.health.error.is_none());
+                assert!(!app.state.health.pending);
                 assert_eq!(app.state.request_id, request_id);
                 assert!(!app.state.any_running());
                 assert_eq!(complete_data(&app), Some(completed_impedance()));
@@ -2089,7 +2095,7 @@ mod tests {
             event: WorkerEvent::ConnectionLost("shared socket closed".into()),
         });
         assert!(matches!(app.state.connection, ConnectionState::Error(_)));
-        assert!(app.state.temperature.is_none());
+        assert!(app.state.health.snapshot.is_none());
         assert!(!app.state.any_running());
         assert_eq!(complete_data(&app), Some(completed_impedance()));
     }
@@ -2102,17 +2108,185 @@ mod tests {
             session_id: app.state.session_id,
             request_id: 1,
             cycle_id: None,
-            event: WorkerEvent::Status {
-                temperature: 43.0,
-                voltage: kcsdi_core::data::Voltage {
-                    external: 12.0,
-                    battery: 8.0,
-                },
-            },
+            event: WorkerEvent::Status(crate::health::tests::snapshot(43.0, Instant::now())),
         });
-        assert_eq!(app.state.temperature, Some(43.0));
+        assert_eq!(
+            app.state.health.snapshot.as_ref().unwrap().temperature,
+            43.0
+        );
         assert!(app.state.any_running());
         assert_eq!(app.state.request_id, 3);
+    }
+
+    #[test]
+    fn status_failure_preserves_running_job_and_last_complete_readings() {
+        let mut app = active_impedance_app();
+        app.state.request_id = 3;
+        app.state.status_message = Some("An unrelated message".to_string().into());
+        app.state.health.pending = true;
+        let original = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .clone()
+            .unwrap();
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: 1,
+            cycle_id: None,
+            event: WorkerEvent::StatusFailed("Status query failed: err_cmd".into()),
+        });
+        assert!(app.state.any_running());
+        assert!(app.state.active_plan.is_some());
+        assert_eq!(
+            app.state.health.snapshot.as_ref().unwrap().temperature,
+            42.0
+        );
+        assert!(app.state.health.is_stale(Instant::now()));
+        assert!(!app.state.health.pending);
+        assert!(app.state.health.error.is_some());
+        assert!(Arc::ptr_eq(
+            &original,
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+        ));
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: 1,
+            cycle_id: None,
+            event: WorkerEvent::Status(crate::health::tests::snapshot(44.0, Instant::now())),
+        });
+        assert!(app.state.health.error.is_none());
+        assert!(!app.state.health.is_stale(Instant::now()));
+        assert_eq!(
+            app.state
+                .status_message
+                .as_ref()
+                .unwrap()
+                .text(Language::English),
+            "An unrelated message"
+        );
+    }
+
+    #[test]
+    fn delayed_health_event_keeps_query_age_but_starts_a_new_cooldown() {
+        let mut app = active_impedance_app();
+        let now = Instant::now();
+        let observed_at = now - std::time::Duration::from_secs(60);
+        app.apply_event(WorkerEvent::Status(crate::health::tests::snapshot(
+            42.0,
+            observed_at,
+        )));
+        assert_eq!(
+            app.state.health.age(now),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert!(app.state.health.is_stale(now));
+        assert!(!app.state.health.due(now));
+    }
+
+    #[test]
+    fn health_events_cannot_repopulate_an_inactive_current_session() {
+        for connection in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Disconnecting,
+            ConnectionState::Error("connection failed".into()),
+        ] {
+            let mut app = active_impedance_app();
+            app.state.connection = connection;
+            app.state.health = Default::default();
+            for event in [
+                WorkerEvent::Status(crate::health::tests::snapshot(99.0, Instant::now())),
+                WorkerEvent::StatusFailed("late status failure".into()),
+            ] {
+                app.apply_worker_event(EventEnvelope {
+                    session_id: app.state.session_id,
+                    request_id: app.state.request_id,
+                    cycle_id: None,
+                    event,
+                });
+                assert!(app.state.health.snapshot.is_none());
+                assert!(app.state.health.error.is_none());
+                assert!(!app.state.health.pending);
+            }
+        }
+    }
+
+    #[test]
+    fn about_keeps_connection_failures_visible_and_allows_reconnect() {
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            theme::setup(&ctx);
+            let mut app = active_impedance_app();
+            app.state.desktop.page = Page::About;
+            app.state.language = language;
+            app.state.host = "instrument.local".into();
+            let (sender, receiver) = mpsc::channel();
+            app.state.cmd_tx = Some(sender);
+            app.apply_event(WorkerEvent::ConnectionLost("health query timeout".into()));
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let text_position = |output: &egui::FullOutput, label: &str| {
+                output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+            };
+            let mut output = ctx.run_ui(input(), |ui| app.desktop_ui(ui));
+            output.textures_delta.clear();
+            for _ in 0..2 {
+                output = ctx.run_ui(input(), |ui| app.desktop_ui(ui));
+                output.textures_delta.clear();
+            }
+            let connect = text_position(&output, language.text(Text::Connect)).unwrap();
+            assert!(text_position(&output, language.text(Text::Error)).is_some());
+            assert!(text_position(&output, "42.0 C").is_none());
+            assert_eq!(
+                app.state.status_message.as_ref().unwrap().text(language),
+                "health query timeout"
+            );
+            let mut click = input();
+            click.events.push(egui::Event::PointerMoved(connect));
+            for pressed in [true, false] {
+                click.events.push(egui::Event::PointerButton {
+                    pos: connect,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            output = ctx.run_ui(click, |ui| app.desktop_ui(ui));
+            output.textures_delta.clear();
+            assert!(matches!(
+                receiver.try_recv().unwrap().command,
+                WorkerCommand::Connect { .. }
+            ));
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(app.state.connection, ConnectionState::Connecting);
+            output = ctx.run_ui(input(), |ui| app.desktop_ui(ui));
+            output.textures_delta.clear();
+            assert!(text_position(&output, language.text(Text::Connecting)).is_some());
+            app.apply_event(WorkerEvent::Disconnected);
+            output = ctx.run_ui(input(), |ui| app.desktop_ui(ui));
+            output.textures_delta.clear();
+            assert!(text_position(&output, language.text(Text::Connect)).is_none());
+            assert!(text_position(&output, language.text(Text::Error)).is_none());
+        }
     }
 
     #[test]

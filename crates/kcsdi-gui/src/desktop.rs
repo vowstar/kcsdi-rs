@@ -355,15 +355,23 @@ fn show_about(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label(egui::RichText::new(language.text(Text::DeviceDetails)).strong());
         if ui
             .add_enabled(
-                state.connection == ConnectionState::Connected,
+                state.connection == ConnectionState::Connected && !state.health.pending,
                 egui::Button::new(language.text(Text::Refresh)),
             )
             .clicked()
         {
             state.send(WorkerCommand::RefreshStatus);
         }
+        if state.connection == ConnectionState::Connected && state.health.pending {
+            ui.spinner()
+                .on_hover_text(language.text(Text::HealthUpdating));
+        }
     });
-    let Some(info) = &state.device_info else {
+    let Some(info) = state
+        .device_info
+        .as_ref()
+        .filter(|_| state.connection == ConnectionState::Connected)
+    else {
         ui.add_space(8.0);
         ui.weak(language.text(Text::DeviceInfoUnavailable));
         return;
@@ -381,21 +389,45 @@ fn show_about(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.monospace(value);
                 ui.end_row();
             }
-            if let Some(temperature) = state.temperature {
-                ui.label(language.text(Text::Temperature));
-                ui.monospace(format!("{temperature:.1} C"));
+            let now = std::time::Instant::now();
+            let health = &state.health;
+            let readings = health.snapshot.as_ref();
+            for (key, value) in [
+                (
+                    Text::Temperature,
+                    readings.map(|reading| format!("{:.1} C", reading.temperature)),
+                ),
+                (
+                    Text::ExternalPower,
+                    readings.map(|reading| format!("{:.2} V", reading.voltage.external)),
+                ),
+                (
+                    Text::Battery,
+                    readings.map(|reading| format!("{:.2} V", reading.voltage.battery)),
+                ),
+            ] {
+                ui.label(language.text(key));
+                let mut text =
+                    egui::RichText::new(value.unwrap_or_else(|| "--".into())).monospace();
+                if health.is_stale(now) || readings.is_none() {
+                    text = text.weak();
+                }
+                ui.add(egui::Label::new(text).truncate()).on_hover_text(
+                    crate::panels::status_bar::health_details(health, now, language),
+                );
                 ui.end_row();
             }
-            if let Some(voltage) = &state.voltage {
-                for (key, value) in [
-                    (Text::ExternalPower, voltage.external),
-                    (Text::Battery, voltage.battery),
-                ] {
-                    ui.label(language.text(key));
-                    ui.monospace(format!("{value:.2} V"));
-                    ui.end_row();
-                }
-            }
+            ui.label(language.text(Text::HealthStatus));
+            ui.add(
+                egui::Label::new(crate::panels::status_bar::health_caption(
+                    health, now, language,
+                ))
+                .truncate(),
+            )
+            .on_hover_text(crate::panels::status_bar::health_details(
+                health, now, language,
+            ));
+            ui.end_row();
         });
 }
 
@@ -490,6 +522,163 @@ fn show_delete_confirmation(ctx: &egui::Context, state: &mut AppState) {
 mod tests {
     use super::*;
     use crate::i18n::Language;
+
+    fn health_about_state(case: usize, language: Language) -> AppState {
+        let mut state = AppState {
+            language,
+            connection: match case {
+                8 => ConnectionState::Disconnected,
+                9 => ConnectionState::Connecting,
+                _ => ConnectionState::Connected,
+            },
+            health: crate::panels::status_bar::tests::example_health(case),
+            device_info: Some(kcsdi_core::data::DeviceInfo {
+                username: "bench".into(),
+                software: "V1.6.1".into(),
+                hardware: "V1.0".into(),
+                serial: "0000000001".into(),
+                copyright: String::new(),
+            }),
+            ..Default::default()
+        };
+        state.desktop.page = Page::About;
+        state
+    }
+
+    #[test]
+    fn about_health_states_have_fixed_rows_and_fit_both_languages_and_sizes() {
+        for language in Language::ALL {
+            for theme_mode in [ThemeMode::Dark, ThemeMode::Light] {
+                for size in [egui::vec2(960.0, 600.0), egui::vec2(1280.0, 850.0)] {
+                    for case in 0..10 {
+                        let ctx = egui::Context::default();
+                        theme::setup(&ctx);
+                        theme::apply(&ctx, theme_mode);
+                        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let mut state = health_about_state(case, language);
+                        for _ in 0..3 {
+                            let output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ui| show_home(ui, &mut state),
+                            );
+                            let mut labels = Vec::new();
+                            for shape in &output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                                    assert!(
+                                        screen.contains_rect(bounds),
+                                        "{language:?} {theme_mode:?} case{case}: {} {bounds:?}",
+                                        text.galley.text()
+                                    );
+                                    assert!(shape.clip_rect.contains_rect(bounds));
+                                    labels.push((text.galley.text(), bounds));
+                                }
+                            }
+                            if case < 8 {
+                                for key in [
+                                    Text::Temperature,
+                                    Text::ExternalPower,
+                                    Text::Battery,
+                                    Text::HealthStatus,
+                                ] {
+                                    assert!(
+                                        labels.iter().any(|(text, _)| *text == language.text(key))
+                                    );
+                                }
+                                let blank_count =
+                                    labels.iter().filter(|(text, _)| *text == "--").count();
+                                assert_eq!(
+                                    blank_count,
+                                    if matches!(case, 0 | 1 | 7) { 3 } else { 0 }
+                                );
+                                if matches!(case, 4..=6) {
+                                    assert!(labels.iter().any(|(text, _)| {
+                                        text.contains(language.text(Text::HealthStale))
+                                    }));
+                                }
+                            } else {
+                                assert!(
+                                    labels.iter().any(|(text, _)| *text
+                                        == language.text(Text::DeviceInfoUnavailable))
+                                );
+                                assert!(!labels.iter().any(|(text, _)| text.contains("42.0 C")));
+                            }
+                            output.drop_without_applying_deltas();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn about_refresh_is_disabled_while_a_request_is_pending() {
+        let ctx = egui::Context::default();
+        let mut state = health_about_state(3, Language::English);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        state.cmd_tx = Some(sender);
+        let frame = |state: &mut AppState, events, time| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 600.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| show_about(ui, state),
+            )
+        };
+        let output = frame(&mut state, vec![], 0.0);
+        let at = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Refresh" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap();
+        output.drop_without_applying_deltas();
+        for (round, pending) in [true, false].into_iter().enumerate() {
+            state.health.pending = pending;
+            for (index, events) in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                frame(&mut state, events, (round * 4 + index + 1) as f64 * 0.02)
+                    .drop_without_applying_deltas();
+            }
+            if pending {
+                assert!(receiver.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    receiver.try_recv().unwrap().command,
+                    WorkerCommand::RefreshStatus
+                ));
+            }
+        }
+    }
 
     #[test]
     fn profile_cards_stack_labels_and_keep_neighboring_cards_separate() {

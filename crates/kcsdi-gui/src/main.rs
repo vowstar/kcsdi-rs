@@ -13,6 +13,7 @@ mod config;
 mod desktop;
 mod device_worker;
 mod export;
+mod health;
 mod i18n;
 mod panels;
 mod preview;

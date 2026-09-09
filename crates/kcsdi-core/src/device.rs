@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::commands::{self, Cal, Format, Lo, ScanMode};
 use crate::control::{CancellationToken, POLL_INTERVAL};
-use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64};
+use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64, telemetry_values};
 use crate::error::{Error, Result};
 use crate::model::{self, Capabilities, Model, Rbw};
 use crate::protocol::{Packet, PacketParser, StreamEvent, StreamMode, StreamParser};
@@ -262,14 +262,7 @@ impl<T: Transport> Device<T> {
     pub fn temperature_controlled(&mut self, cancel: &CancellationToken) -> Result<f64> {
         let result = self
             .query_controlled(commands::TEMP, "temp", GENERIC_TIMEOUT, cancel)
-            .and_then(|packet| {
-                let field = packet
-                    .args
-                    .first()
-                    .and_then(|row| row.first())
-                    .ok_or_else(|| Error::Protocol("temp packet: empty body".into()))?;
-                parse_f64(field)
-            });
+            .and_then(|packet| telemetry_values(&packet, "temp").map(|[value]| value));
         self.record_result(result)
     }
 
@@ -2271,6 +2264,73 @@ mod tests {
             assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
             assert_eq!(dev.transport.sent, sent);
         }
+    }
+
+    #[test]
+    fn malformed_telemetry_retires_the_session_before_a_later_valid_reply() {
+        for name in ["temp", "voltage"] {
+            let header = format!("$start,{name}");
+            let valid = if name == "temp" { "$-12.5" } else { "$0,8.03" };
+            let invalid_bodies: &[&[&str]] = if name == "temp" {
+                &[
+                    &[],
+                    &["$47,48"],
+                    &["$47", "$48"],
+                    &["$NaN"],
+                    &["$-Inf"],
+                    &["$1e999"],
+                ]
+            } else {
+                &[
+                    &[],
+                    &["$12"],
+                    &["$12,8,7"],
+                    &["$12,8", "$12,8"],
+                    &["$NaN,8"],
+                    &["$12,+Inf"],
+                    &["$-1e999,8"],
+                ]
+            };
+            for body in invalid_bodies {
+                let mut lines = vec![header.as_str()];
+                lines.extend_from_slice(body);
+                lines.extend(["$end", header.as_str(), valid, "$end"]);
+                let mut dev = Device::new(MockTransport::with_lines(&lines));
+                let result = if name == "temp" {
+                    dev.temperature().map(|_| ())
+                } else {
+                    dev.voltage().map(|_| ())
+                };
+                assert!(matches!(result, Err(Error::Protocol(_))), "{name} {body:?}");
+                assert!(dev.requires_reconnect());
+                let remaining = dev.transport.incoming.clone();
+                let sent = dev.transport.sent.clone();
+                assert_eq!(remaining.len(), 3);
+                assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+                assert!(matches!(dev.voltage(), Err(Error::NotConnected)));
+                assert_eq!(dev.transport.incoming, remaining);
+                assert_eq!(dev.transport.sent, sent);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_signed_telemetry_keeps_the_session_usable() {
+        let mock = MockTransport::with_lines(&[
+            "$start,temp",
+            "$-12.5",
+            "$end",
+            "$start,voltage",
+            "$-0,-1.25",
+            "$end",
+        ]);
+        let mut dev = Device::new(mock);
+        assert_eq!(dev.temperature().unwrap(), -12.5);
+        let voltage = dev.voltage().unwrap();
+        assert_eq!(voltage.external.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(voltage.battery, -1.25);
+        assert!(!dev.requires_reconnect());
+        assert_eq!(dev.transport.sent_text(), "$temp\n$voltage\n");
     }
 
     #[test]
