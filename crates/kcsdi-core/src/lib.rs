@@ -15,6 +15,7 @@
 //! - [`error`]: shared error type.
 
 pub mod commands;
+pub mod control;
 pub mod data;
 pub mod device;
 pub mod error;

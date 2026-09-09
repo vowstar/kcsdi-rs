@@ -4,7 +4,7 @@
 //! Bottom status bar: transient messages and instrument health.
 
 use crate::i18n::{StatusMessage, Text};
-use crate::state::{AppState, ConnectionState, WorkerCommand};
+use crate::state::{AppState, ConnectionState, SweepState, WorkerCommand};
 
 /// Draw connection and health status. Return whether to open connection settings.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
@@ -28,26 +28,40 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                 ui.colored_label(crate::theme::SUCCESS, language.text(Text::Connected));
                 if state.any_running() && ui.small_button(language.text(Text::StopSweep)).clicked()
                 {
-                    state.spec.running = false;
-                    state.s11.running = false;
                     state.send(WorkerCommand::StopSweep);
                 }
                 if ui.small_button(language.text(Text::Disconnect)).clicked() {
-                    state.spec.running = false;
-                    state.s11.running = false;
                     state.send(WorkerCommand::Disconnect);
+                }
+                if state.sweep == SweepState::Stopping {
+                    ui.spinner();
+                    ui.label(language.text(Text::Stopping));
+                } else if let Some(preview) = &state.preview {
+                    ui.label(format!(
+                        "{} {}/{}",
+                        language.text(Text::SweepProgress),
+                        preview.data.points.len(),
+                        preview.expected_points
+                    ));
                 }
             }
             ConnectionState::Connecting => {
                 ui.spinner();
                 ui.label(language.text(Text::Connecting));
             }
+            ConnectionState::Disconnecting => {
+                ui.spinner();
+                ui.label(language.text(if state.worker_shutdown.is_cancelled() {
+                    Text::Closing
+                } else {
+                    Text::Disconnecting
+                }));
+            }
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
                 if ui.button(language.text(Text::Connect)).clicked() {
                     if state.host.trim().is_empty() {
                         open_connection = true;
                     } else {
-                        state.connection = ConnectionState::Connecting;
                         state.send(WorkerCommand::Connect {
                             host: state.host.clone(),
                             port: state.port,

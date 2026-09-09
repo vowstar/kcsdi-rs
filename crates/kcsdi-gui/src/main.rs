@@ -14,6 +14,7 @@ mod device_worker;
 mod export;
 mod i18n;
 mod panels;
+mod preview;
 mod state;
 mod theme;
 mod widgets;

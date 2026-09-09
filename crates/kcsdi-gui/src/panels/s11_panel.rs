@@ -6,7 +6,9 @@
 use kcsdi_core::commands::Cal;
 
 use crate::i18n::{Language, StatusMessage, Text};
-use crate::state::{AppState, ConnectionState, DEVICE_MODEL, S11Display, WorkerCommand};
+use crate::state::{
+    AppMode, AppState, ConnectionState, DEVICE_MODEL, S11Display, SweepState, WorkerCommand,
+};
 
 use super::sweep_controls::{
     self, BUTTON_HEIGHT, SweepEdit, SweepFields, choice_button, group_heading,
@@ -26,14 +28,17 @@ fn cal_label(cal: Cal, language: Language) -> &'static str {
 /// Draw the run and receiver controls at the top of the right pane.
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let connected = state.connection == ConnectionState::Connected;
-    let running = state.s11.running;
+    let running = state.running(AppMode::S11);
 
     ui.add_enabled_ui(connected, |ui| {
         run_button(ui, state, running);
     });
-    ui.add_enabled_ui(!running, |ui| {
-        receiver_fields(ui, state);
-    });
+    ui.add_enabled_ui(
+        !state.sweep_busy() && state.connection != ConnectionState::Disconnecting,
+        |ui| {
+            receiver_fields(ui, state);
+        },
+    );
 }
 
 /// Draw scale and display controls below the hold and marker controls.
@@ -57,32 +62,36 @@ pub fn show_display_controls(ui: &mut egui::Ui, state: &mut AppState) {
 /// Impedance. Switching re-fits the view because the Y range changes.
 pub fn show_trace_editor(ui: &mut egui::Ui, state: &mut AppState) {
     let previous = state.s11.display;
-    ui.horizontal_wrapped(|ui| {
-        for display in S11Display::ALL {
-            if ui
-                .selectable_value(
-                    &mut state.s11.display,
-                    display,
-                    display.label(state.language),
-                )
-                .changed()
-            {
-                state.s11.needs_fit = true;
-                state.s11.view_locked = false;
-                let (y_min, y_max) = display.default_y();
-                state
-                    .s11
-                    .view
-                    .reset(state.s11.start_hz, state.s11.stop_hz, y_min, y_max);
-            }
-        }
-    });
+    ui.add_enabled_ui(
+        state.sweep != SweepState::Stopping && state.connection != ConnectionState::Disconnecting,
+        |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for display in S11Display::ALL {
+                    if ui
+                        .selectable_value(
+                            &mut state.s11.display,
+                            display,
+                            display.label(state.language),
+                        )
+                        .changed()
+                    {
+                        state.s11.needs_fit = true;
+                        state.s11.view_locked = false;
+                        let (y_min, y_max) = display.default_y();
+                        state
+                            .s11
+                            .view
+                            .reset(state.s11.start_hz, state.s11.stop_hz, y_min, y_max);
+                    }
+                }
+            })
+        },
+    );
     if previous.wire_format() != state.s11.display.wire_format() {
-        if state.s11.running {
+        if state.running(AppMode::S11) {
             match state.s11.s11_params() {
                 Ok(params) => state.send(WorkerCommand::RunS11(params)),
                 Err(error) => {
-                    state.s11.running = false;
                     state.send(WorkerCommand::StopSweep);
                     state.status_message = Some(error.to_string().into());
                 }
@@ -96,33 +105,36 @@ pub fn show_trace_editor(ui: &mut egui::Ui, state: &mut AppState) {
 /// Draw linked frequency controls in the left pane, also while offline.
 pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
     group_heading(ui, state.language.text(Text::FrequencyRangeTab));
-    ui.add_enabled_ui(!state.s11.running, |ui| {
-        let s11 = &mut state.s11;
-        let edit = SweepFields {
-            start: &mut s11.start_hz,
-            stop: &mut s11.stop_hz,
-            center: &mut s11.center_hz,
-            span: &mut s11.span_hz,
-            points: &mut s11.points,
-        }
-        .show(
-            ui,
-            DEVICE_MODEL.capabilities().s11.range,
-            state.language,
-            "s11",
-        );
-        match edit {
-            SweepEdit::StartStop => s11.start_stop_changed(),
-            SweepEdit::CenterSpan => s11.center_span_changed(),
-            SweepEdit::None => {}
-        }
-        edit.sync_view(
-            &mut s11.view,
-            DEVICE_MODEL.capabilities().s11.range,
-            s11.start_hz,
-            s11.stop_hz,
-        );
-    });
+    ui.add_enabled_ui(
+        !state.sweep_busy() && state.connection != ConnectionState::Disconnecting,
+        |ui| {
+            let s11 = &mut state.s11;
+            let edit = SweepFields {
+                start: &mut s11.start_hz,
+                stop: &mut s11.stop_hz,
+                center: &mut s11.center_hz,
+                span: &mut s11.span_hz,
+                points: &mut s11.points,
+            }
+            .show(
+                ui,
+                DEVICE_MODEL.capabilities().s11.range,
+                state.language,
+                "s11",
+            );
+            match edit {
+                SweepEdit::StartStop => s11.start_stop_changed(),
+                SweepEdit::CenterSpan => s11.center_span_changed(),
+                SweepEdit::None => {}
+            }
+            edit.sync_view(
+                &mut s11.view,
+                DEVICE_MODEL.capabilities().s11.range,
+                s11.start_hz,
+                s11.stop_hz,
+            );
+        },
+    );
 }
 
 /// CAL selector and the optional RBW pushed before a run.
@@ -173,12 +185,15 @@ fn display_fields(ui: &mut egui::Ui, state: &mut AppState) {
 /// Full-width RUN/STOP toggle, green/primary at rest and red while running.
 fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
     let size = [ui.available_width(), BUTTON_HEIGHT];
-    if running {
+    if state.sweep == SweepState::Stopping {
+        ui.add_enabled_ui(false, |ui| {
+            ui.add_sized(size, egui::Button::new(state.language.text(Text::Stopping)));
+        });
+    } else if running {
         let button =
             egui::Button::new(egui::RichText::new(state.language.text(Text::StopSweep)).strong())
                 .fill(RED);
         if ui.add_sized(size, button).clicked() {
-            state.s11.running = false;
             state.send(WorkerCommand::StopSweep);
         }
     } else {
@@ -191,7 +206,6 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
         };
         if let Some(params) = sweep_controls::run_button(ui, params, state.language) {
             state.send(WorkerCommand::RunS11(params));
-            state.s11.running = true;
             state.s11.needs_fit = !state.s11.view_locked;
         }
     }
@@ -210,7 +224,6 @@ mod tests {
             mode: crate::state::AppMode::S11,
             s11: crate::state::S11State {
                 display: S11Display::Impedance,
-                running: true,
                 ..Default::default()
             },
             ..Default::default()

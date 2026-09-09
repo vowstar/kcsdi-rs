@@ -26,6 +26,10 @@ enum Outcome {
 }
 
 impl ExportState {
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub fn poll(&mut self) {
         let Some(receiver) = &self.pending else {
             return;
@@ -238,7 +242,7 @@ mod tests {
     #[test]
     fn export_events_do_not_change_measurement_state() {
         let mut state = crate::state::AppState::default();
-        state.s11.running = true;
+        state.sweep = crate::state::SweepState::Running(crate::state::AppMode::S11);
         for outcome in [
             Outcome::Cancelled,
             Outcome::Failed("disk full".into()),
@@ -252,7 +256,7 @@ mod tests {
             state.export.poll();
             assert!(state.export.pending.is_none());
             assert!(state.export.outcome.is_some());
-            assert!(state.s11.running);
+            assert!(state.running(crate::state::AppMode::S11));
             assert!(state.status_message.is_none());
         }
     }

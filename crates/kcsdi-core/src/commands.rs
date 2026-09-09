@@ -15,6 +15,9 @@ use crate::model::Rbw;
 /// Handshake byte: a single uppercase `C`, no framing (manual 2.4).
 pub const HANDSHAKE: &[u8] = b"C";
 
+/// Interrupt the current command (section 1.4).
+pub const ABORT: &[u8] = b"\x03";
+
 /// Exit remote-control mode (manual 3.2.16).
 pub const LOCAL: &str = "$local\n";
 

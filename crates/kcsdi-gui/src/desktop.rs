@@ -205,7 +205,7 @@ fn show_profiles(ui: &mut egui::Ui, state: &mut AppState) {
     let mut delete = None;
     let busy = matches!(
         state.connection,
-        ConnectionState::Connected | ConnectionState::Connecting
+        ConnectionState::Connected | ConnectionState::Connecting | ConnectionState::Disconnecting
     );
     ui.horizontal_wrapped(|ui| {
         for (index, profile) in state.desktop.settings.profiles.iter().enumerate() {
@@ -233,6 +233,7 @@ fn show_profiles(ui: &mut egui::Ui, state: &mut AppState) {
                                 match state.connection {
                                     ConnectionState::Connected => Text::Connected,
                                     ConnectionState::Connecting => Text::Connecting,
+                                    ConnectionState::Disconnecting => Text::Disconnecting,
                                     ConnectionState::Error(_) => Text::Error,
                                     ConnectionState::Disconnected => Text::Disconnected,
                                 }
@@ -283,7 +284,7 @@ fn open_profile(state: &mut AppState, index: usize) {
     };
     let busy = matches!(
         state.connection,
-        ConnectionState::Connected | ConnectionState::Connecting
+        ConnectionState::Connected | ConnectionState::Connecting | ConnectionState::Disconnecting
     );
     if busy && (state.host != profile.host || state.port != profile.port) {
         return;

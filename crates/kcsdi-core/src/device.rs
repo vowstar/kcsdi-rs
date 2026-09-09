@@ -12,6 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::commands::{self, Cal, Format, Lo, ScanMode};
+use crate::control::{CancellationToken, POLL_INTERVAL};
 use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64};
 use crate::error::{Error, Result};
 use crate::model::{self, Capabilities, Model, Rbw};
@@ -21,6 +22,27 @@ use crate::transport::{GENERIC_TIMEOUT, TcpTransport, Transport, remaining_timeo
 /// Conservative mode-control pacing, exercised on KC901V V1.6.1.
 /// This is not a documented minimum delay for every command.
 const COMMAND_GAP: Duration = Duration::from_millis(100);
+
+/// One host budget for interrupt synchronization or best-effort close.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn stop_command(mode: StreamMode) -> &'static str {
+    match mode {
+        StreamMode::S11 => commands::S11_STOP,
+        StreamMode::Spec => commands::SPEC_STOP,
+        _ => unreachable!("only S11 and SPEC sessions are implemented"),
+    }
+}
+
+/// A validated prefix, not a complete measurement. Only a successful sweep
+/// result is suitable for holds, analysis or export.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepProgress<'a> {
+    pub mode: StreamMode,
+    pub format: &'a str,
+    pub points: &'a [SweepPoint],
+    pub expected_points: u32,
+}
 
 /// Parameters of an S11 sweep.
 #[derive(Debug, Clone)]
@@ -54,6 +76,7 @@ pub struct SpecParams {
 pub struct Device<T: Transport> {
     transport: T,
     remote: bool,
+    release_on_close: bool,
     packets: PacketParser,
     streams: StreamParser,
     caps: Capabilities,
@@ -73,9 +96,19 @@ impl Device<TcpTransport> {
     /// packet does not reliably identify the model, so no auto-detection is
     /// implied by the KC901V default.
     pub fn connect_with_model(host: &str, port: u16, model: Model) -> Result<Self> {
-        let transport = TcpTransport::connect(host, port)?;
+        Self::connect_with_model_controlled(host, port, model, &CancellationToken::default())
+    }
+
+    /// Connect and handshake with cancellation between bounded I/O waits.
+    pub fn connect_with_model_controlled(
+        host: &str,
+        port: u16,
+        model: Model,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        let transport = TcpTransport::connect_controlled(host, port, cancel)?;
         let mut device = Self::with_model(transport, model);
-        device.handshake()?;
+        device.handshake_controlled(cancel)?;
         Ok(device)
     }
 }
@@ -91,6 +124,7 @@ impl<T: Transport> Device<T> {
         Self {
             transport,
             remote: false,
+            release_on_close: false,
             packets: PacketParser::new(),
             streams: StreamParser::new(),
             caps: model.capabilities(),
@@ -122,24 +156,51 @@ impl<T: Transport> Device<T> {
     /// `[KC901]<serial>` plain-text form (doc 1.4). A `ConFail` packet maps
     /// to [`Error::DeviceBusy`].
     pub fn handshake(&mut self) -> Result<String> {
+        self.handshake_controlled(&CancellationToken::default())
+    }
+
+    /// Perform the handshake without accepting a reply after cancellation.
+    pub fn handshake_controlled(&mut self, cancel: &CancellationToken) -> Result<String> {
+        cancel.check()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
-        let result = self.handshake_with_timeout(GENERIC_TIMEOUT);
+        let result = self.handshake_inner(GENERIC_TIMEOUT, cancel);
+        if matches!(result, Err(Error::Cancelled)) {
+            self.session_failed = true;
+        }
         self.record_result(result)
     }
 
+    #[cfg(test)]
     fn handshake_with_timeout(&mut self, timeout: Duration) -> Result<String> {
+        self.handshake_inner(timeout, &CancellationToken::default())
+    }
+
+    fn handshake_inner(&mut self, timeout: Duration, cancel: &CancellationToken) -> Result<String> {
+        cancel.check()?;
         let started = Instant::now();
-        self.transport.send(commands::HANDSHAKE)?;
+        self.transport
+            .send_with_timeout(commands::HANDSHAKE, timeout)?;
+        // A cancelled or late handshake reply must still release the remote
+        // session. ConFail explicitly means the handshake was refused.
+        self.release_on_close = true;
         loop {
-            let line = self.recv_before_timeout(started, timeout)?;
+            let line = self.recv_controlled(started, timeout, cancel)?;
             if let Some(serial) = line.strip_prefix("[KC901]") {
+                cancel.check()?;
                 self.remote = true;
                 return Ok(serial.trim().to_string());
             }
             let packet = self.packets.feed_line(&line)?;
             remaining_timeout(started, timeout)?;
+            if packet
+                .as_ref()
+                .is_some_and(|packet| packet.name == "ConFail")
+            {
+                self.release_on_close = false;
+            }
+            cancel.check()?;
             if let Some(packet) = packet {
                 match packet.name.as_str() {
                     "id" => {
@@ -167,16 +228,24 @@ impl<T: Transport> Device<T> {
 
     /// `$device` -> parsed identity information.
     pub fn device_info(&mut self) -> Result<DeviceInfo> {
+        self.device_info_controlled(&CancellationToken::default())
+    }
+
+    pub fn device_info_controlled(&mut self, cancel: &CancellationToken) -> Result<DeviceInfo> {
         let result = self
-            .query_packet(commands::DEVICE, "device", GENERIC_TIMEOUT)
+            .query_controlled(commands::DEVICE, "device", GENERIC_TIMEOUT, cancel)
             .and_then(|packet| DeviceInfo::from_packet(&packet));
         self.record_result(result)
     }
 
     /// `$temp` -> internal temperature in deg C.
     pub fn temperature(&mut self) -> Result<f64> {
+        self.temperature_controlled(&CancellationToken::default())
+    }
+
+    pub fn temperature_controlled(&mut self, cancel: &CancellationToken) -> Result<f64> {
         let result = self
-            .query_packet(commands::TEMP, "temp", GENERIC_TIMEOUT)
+            .query_controlled(commands::TEMP, "temp", GENERIC_TIMEOUT, cancel)
             .and_then(|packet| {
                 let field = packet
                     .args
@@ -190,8 +259,12 @@ impl<T: Transport> Device<T> {
 
     /// `$voltage` -> external and battery voltages.
     pub fn voltage(&mut self) -> Result<Voltage> {
+        self.voltage_controlled(&CancellationToken::default())
+    }
+
+    pub fn voltage_controlled(&mut self, cancel: &CancellationToken) -> Result<Voltage> {
         let result = self
-            .query_packet(commands::VOLTAGE, "voltage", GENERIC_TIMEOUT)
+            .query_controlled(commands::VOLTAGE, "voltage", GENERIC_TIMEOUT, cancel)
             .and_then(|packet| Voltage::from_packet(&packet));
         self.record_result(result)
     }
@@ -199,12 +272,23 @@ impl<T: Transport> Device<T> {
     /// Run an S11 sweep: `stop` -> `init` -> optional `$bw` -> `run`, then
     /// consume the data stream until `$end`.
     pub fn sweep_s11(&mut self, params: &S11Params) -> Result<SweepData> {
+        self.sweep_s11_controlled(params, &CancellationToken::default(), |_| {})
+    }
+
+    /// Collect a complete sweep while reporting replaceable validated prefixes.
+    pub fn sweep_s11_controlled(
+        &mut self,
+        params: &S11Params,
+        cancel: &CancellationToken,
+        progress: impl FnMut(SweepProgress<'_>),
+    ) -> Result<SweepData> {
+        cancel.check()?;
         params.validate(&self.caps)?;
         let wire_points = self.caps.wire_points(params.points)?;
         let result = (|| {
-            self.prepare_mode(StreamMode::S11)?;
+            self.prepare_mode(StreamMode::S11, cancel)?;
             if let Some(rbw) = params.rbw {
-                self.set_rbw(rbw)?;
+                self.set_rbw(rbw, cancel)?;
             }
             let run = commands::s11_run(
                 params.cal,
@@ -214,12 +298,14 @@ impl<T: Transport> Device<T> {
                 params.start_hz,
                 Some(params.stop_hz),
             );
-            self.transport.send(run.as_bytes())?;
-            self.collect_stream(
+            self.send_controlled(run.as_bytes(), cancel)?;
+            self.collect_controlled(
                 StreamMode::S11,
                 Some(params.format),
                 params.points,
                 self.sweep_timeout(params.points),
+                cancel,
+                progress,
             )
         })();
         self.finish_sweep(result)
@@ -228,13 +314,26 @@ impl<T: Transport> Device<T> {
     /// Run a spectrum sweep: `stop` -> `init` -> `$bw` -> `$specref` ->
     /// `run`, then consume the data stream until `$end`.
     pub fn sweep_spec(&mut self, params: &SpecParams) -> Result<SweepData> {
+        self.sweep_spec_controlled(params, &CancellationToken::default(), |_| {})
+    }
+
+    /// Collect a complete spectrum sweep with cancellation and prefix updates.
+    pub fn sweep_spec_controlled(
+        &mut self,
+        params: &SpecParams,
+        cancel: &CancellationToken,
+        progress: impl FnMut(SweepProgress<'_>),
+    ) -> Result<SweepData> {
+        cancel.check()?;
         params.validate(&self.caps)?;
         let wire_points = self.caps.wire_points(params.points)?;
         let result = (|| {
-            self.prepare_mode(StreamMode::Spec)?;
-            self.set_rbw(params.rbw)?;
-            self.transport
-                .send(commands::set_spec_ref(params.ref_level_dbm).as_bytes())?;
+            self.prepare_mode(StreamMode::Spec, cancel)?;
+            self.set_rbw(params.rbw, cancel)?;
+            self.send_controlled(
+                commands::set_spec_ref(params.ref_level_dbm).as_bytes(),
+                cancel,
+            )?;
             let run = commands::spec_run(
                 params.cal,
                 params.lo,
@@ -244,19 +343,27 @@ impl<T: Transport> Device<T> {
                 Some(params.stop_hz),
                 None,
             );
-            self.transport.send(run.as_bytes())?;
-            self.collect_stream(
+            self.send_controlled(run.as_bytes(), cancel)?;
+            self.collect_controlled(
                 StreamMode::Spec,
                 None,
                 params.points,
                 self.sweep_timeout(params.points),
+                cancel,
+                progress,
             )
         })();
         self.finish_sweep(result)
     }
 
-    fn set_rbw(&mut self, rbw: Rbw) -> Result<()> {
-        self.transport.send(commands::set_rbw(rbw).as_bytes())?;
+    fn send_controlled(&mut self, data: &[u8], cancel: &CancellationToken) -> Result<()> {
+        cancel.check()?;
+        self.transport.send(data)?;
+        cancel.check()
+    }
+
+    fn set_rbw(&mut self, rbw: Rbw, cancel: &CancellationToken) -> Result<()> {
+        self.send_controlled(commands::set_rbw(rbw).as_bytes(), cancel)?;
         self.last_rbw = Some(rbw);
         Ok(())
     }
@@ -269,6 +376,10 @@ impl<T: Transport> Device<T> {
     }
 
     fn finish_sweep(&mut self, result: Result<SweepData>) -> Result<SweepData> {
+        if matches!(result, Err(Error::Cancelled)) {
+            self.cancel_sweep(CLEANUP_TIMEOUT)?;
+            return Err(Error::Cancelled);
+        }
         let result = self.record_result(result);
         if result.is_err() {
             // Preserve the original failure. A fully framed device error can
@@ -276,10 +387,7 @@ impl<T: Transport> Device<T> {
             if self.stop_sweep().is_err() {
                 self.session_failed = true;
             }
-            self.active_mode = None;
-            self.last_rbw = None;
-            self.packets = PacketParser::new();
-            self.streams = StreamParser::new();
+            self.reset_measurement();
         }
         result
     }
@@ -288,12 +396,7 @@ impl<T: Transport> Device<T> {
     /// modes without err_S11Stop/err_SpecStop (section 12).
     pub fn stop_sweep(&mut self) -> Result<()> {
         if let Some(mode) = self.active_mode {
-            let command = match mode {
-                StreamMode::S11 => commands::S11_STOP,
-                StreamMode::Spec => commands::SPEC_STOP,
-                _ => unreachable!("only S11 and SPEC sessions are implemented"),
-            };
-            let result = self.transport.send(command.as_bytes());
+            let result = self.transport.send(stop_command(mode).as_bytes());
             self.record_result(result)?;
             sleep(COMMAND_GAP);
             self.active_mode = None;
@@ -301,7 +404,8 @@ impl<T: Transport> Device<T> {
         Ok(())
     }
 
-    fn prepare_mode(&mut self, mode: StreamMode) -> Result<()> {
+    fn prepare_mode(&mut self, mode: StreamMode, cancel: &CancellationToken) -> Result<()> {
+        cancel.check()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
@@ -313,8 +417,8 @@ impl<T: Transport> Device<T> {
         } else {
             // Front-panel or previous-session mode state is unknown.
             for command in [commands::S11_STOP, commands::SPEC_STOP] {
-                self.transport.send(command.as_bytes())?;
-                sleep(COMMAND_GAP);
+                self.send_controlled(command.as_bytes(), cancel)?;
+                cancel.pause(COMMAND_GAP)?;
             }
         }
         let init = match mode {
@@ -322,47 +426,136 @@ impl<T: Transport> Device<T> {
             StreamMode::Spec => commands::SPEC_INIT,
             _ => unreachable!("only S11 and SPEC sessions are implemented"),
         };
-        self.transport.send(init.as_bytes())?;
+        self.send_controlled(init.as_bytes(), cancel)?;
         self.active_mode = Some(mode);
-        sleep(COMMAND_GAP);
+        cancel.pause(COMMAND_GAP)?;
         Ok(())
+    }
+
+    fn reset_measurement(&mut self) {
+        self.active_mode = None;
+        self.last_rbw = None;
+        self.packets = PacketParser::new();
+        self.streams = StreamParser::new();
+    }
+
+    fn cancel_sweep(&mut self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        self.reset_measurement();
+        let result = (|| {
+            self.transport
+                .send_with_timeout(commands::ABORT, remaining_timeout(started, timeout)?)?;
+            self.transport.send_with_timeout(
+                commands::DEVICE.as_bytes(),
+                remaining_timeout(started, timeout)?,
+            )?;
+            // Synchronize against ordered command execution (sections 1.1
+            // and 1.4). Require a fresh identity reply after the interrupt,
+            // not merely a stop write or a leftover measurement end.
+            let packet =
+                self.expect_controlled("device", started, timeout, &CancellationToken::default())?;
+            DeviceInfo::from_packet(&packet)?;
+            Ok(())
+        })();
+        self.reset_measurement();
+        if result.is_err() {
+            self.session_failed = true;
+        }
+        result
     }
 
     /// Exit remote mode (`$local`). Best effort; also called from `Drop`.
     pub fn close(&mut self) {
-        if self.remote {
-            let _ = self.stop_sweep();
-            let _ = self.transport.send(commands::LOCAL.as_bytes());
+        self.session_failed = true;
+        if self.remote || self.release_on_close {
+            let started = Instant::now();
+            if let Some(mode) = self.active_mode {
+                let _ = self
+                    .transport
+                    .send_with_timeout(stop_command(mode).as_bytes(), CLEANUP_TIMEOUT);
+            }
+            if let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT) {
+                let _ = self
+                    .transport
+                    .send_with_timeout(commands::LOCAL.as_bytes(), remaining);
+            }
             self.remote = false;
+            self.release_on_close = false;
+            self.reset_measurement();
         }
     }
 
-    fn recv_before_timeout(&mut self, started: Instant, timeout: Duration) -> Result<String> {
-        let remaining = remaining_timeout(started, timeout)?;
-        let line = self.transport.recv_line(remaining.min(GENERIC_TIMEOUT))?;
-        remaining_timeout(started, timeout)?;
-        Ok(line)
+    fn recv_controlled(
+        &mut self,
+        started: Instant,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let line_started = Instant::now();
+        loop {
+            cancel.check()?;
+            let remaining = remaining_timeout(started, timeout)?
+                .min(remaining_timeout(line_started, GENERIC_TIMEOUT)?)
+                .min(POLL_INTERVAL);
+            let result = self.transport.recv_line(remaining);
+            remaining_timeout(started, timeout)?;
+            remaining_timeout(line_started, GENERIC_TIMEOUT)?;
+            match result {
+                Err(Error::Timeout) => cancel.check()?,
+                // Callers inspect complete framing before checking cancellation.
+                // A fully received handshake refusal must not be lost here.
+                result => return result,
+            }
+        }
     }
 
     /// Sending and reading share one budget. Unrelated replies do not extend it.
+    #[cfg(test)]
     fn query_packet(&mut self, command: &str, name: &str, timeout: Duration) -> Result<Packet> {
+        self.query_controlled(command, name, timeout, &CancellationToken::default())
+    }
+
+    fn query_controlled(
+        &mut self,
+        command: &str,
+        name: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Packet> {
+        cancel.check()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
         let started = Instant::now();
         let result = self
             .transport
-            .send(command.as_bytes())
-            .and_then(|()| self.expect_packet(name, started, timeout));
+            .send_with_timeout(command.as_bytes(), timeout)
+            .and_then(|()| self.expect_controlled(name, started, timeout, cancel));
+        if matches!(result, Err(Error::Cancelled)) {
+            // An interrupted query can leave a same-name reply pending.
+            self.session_failed = true;
+        }
         self.record_result(result)
     }
 
     /// Read until the expected packet completes. Device errors abort the query.
+    #[cfg(test)]
     fn expect_packet(&mut self, name: &str, started: Instant, timeout: Duration) -> Result<Packet> {
+        self.expect_controlled(name, started, timeout, &CancellationToken::default())
+    }
+
+    fn expect_controlled(
+        &mut self,
+        name: &str,
+        started: Instant,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Packet> {
         loop {
-            let line = self.recv_before_timeout(started, timeout)?;
+            let line = self.recv_controlled(started, timeout, cancel)?;
             let packet = self.packets.feed_line(&line)?;
             remaining_timeout(started, timeout)?;
+            cancel.check()?;
             if let Some(packet) = packet {
                 if packet.is_error() {
                     return Err(Error::Device(packet.name));
@@ -378,12 +571,32 @@ impl<T: Transport> Device<T> {
     /// Collect one complete frame with the requested schema and sample count.
     /// Reported frequencies remain authoritative, including repeated rounded
     /// values and endpoint overshoot (sections 4.2 and 12.4).
+    #[cfg(test)]
     fn collect_stream(
         &mut self,
         mode: StreamMode,
         format: Option<Format>,
         expected_points: u32,
         timeout: Duration,
+    ) -> Result<SweepData> {
+        self.collect_controlled(
+            mode,
+            format,
+            expected_points,
+            timeout,
+            &CancellationToken::default(),
+            |_| {},
+        )
+    }
+
+    fn collect_controlled(
+        &mut self,
+        mode: StreamMode,
+        format: Option<Format>,
+        expected_points: u32,
+        timeout: Duration,
+        cancel: &CancellationToken,
+        mut progress: impl FnMut(SweepProgress<'_>),
     ) -> Result<SweepData> {
         let started = Instant::now();
         let expected_format = format.map_or("", Format::as_str);
@@ -398,11 +611,12 @@ impl<T: Transport> Device<T> {
         };
         let mut points: Vec<SweepPoint> = Vec::new();
         loop {
-            let line = self.recv_before_timeout(started, timeout)?;
+            let line = self.recv_controlled(started, timeout, cancel)?;
             // Feed the packet parser too, so err_* packets interleaved with
             // a stream are still caught.
             let packet = self.packets.feed_line(&line)?;
             remaining_timeout(started, timeout)?;
+            cancel.check()?;
             if let Some(packet) = &packet {
                 if packet.is_error() {
                     return Err(Error::Device(packet.name.clone()));
@@ -430,6 +644,12 @@ impl<T: Transport> Device<T> {
                     // A new frame replaces an incomplete one. Never combine
                     // data from before and after parser resynchronization.
                     points.clear();
+                    progress(SweepProgress {
+                        mode,
+                        format: expected_format,
+                        points: &points,
+                        expected_points,
+                    });
                 }
                 Some(StreamEvent::Data {
                     mode: m, fields, ..
@@ -466,6 +686,12 @@ impl<T: Transport> Device<T> {
                     points.push(SweepPoint {
                         freq_hz: freq,
                         values,
+                    });
+                    progress(SweepProgress {
+                        mode,
+                        format: expected_format,
+                        points: &points,
+                        expected_points,
                     });
                 }
                 Some(StreamEvent::End { mode: m, .. }) if m == mode => {
@@ -512,6 +738,9 @@ mod tests {
         send_delay: Duration,
         read_delay: Duration,
         read_timeouts: Vec<Duration>,
+        write_timeouts: Vec<Duration>,
+        cancel_on_read: Option<(usize, CancellationToken)>,
+        cancel_on_send: Option<(usize, CancellationToken)>,
     }
 
     impl MockTransport {
@@ -524,6 +753,9 @@ mod tests {
                 send_delay: Duration::ZERO,
                 read_delay: Duration::ZERO,
                 read_timeouts: Vec::new(),
+                write_timeouts: Vec::new(),
+                cancel_on_read: None,
+                cancel_on_send: None,
             }
         }
 
@@ -542,6 +774,22 @@ mod tests {
                 self.incoming.push_back(format!("${frequency},-12.5"));
             }
             self.incoming.push_back("$end".into());
+        }
+
+        fn queue_identity(&mut self) {
+            self.incoming.extend(
+                [
+                    "$start,device",
+                    "$<KC901>",
+                    "$<-User @ :TEST>",
+                    "$<-Software ver:V1.6.1-->",
+                    "$<-Hardware ver:MB-V1.2-->",
+                    "$<-Serial num:000000000001-->",
+                    "$<-Copyright:KeXinShe-->",
+                    "$end",
+                ]
+                .map(str::to_owned),
+            );
         }
     }
 
@@ -569,25 +817,295 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn send(&mut self, data: &[u8]) -> Result<()> {
+        fn send_with_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
             self.send_calls += 1;
+            self.write_timeouts.push(timeout);
+            let started = Instant::now();
             if !self.send_delay.is_zero() {
                 sleep(self.send_delay);
             }
+            remaining_timeout(started, timeout)?;
             if self.fail_send == Some(self.send_calls) {
                 return Err(Error::NotConnected);
             }
             self.sent.extend_from_slice(data);
+            if let Some((call, cancel)) = &self.cancel_on_send
+                && *call == self.send_calls
+            {
+                cancel.cancel();
+            }
             Ok(())
         }
 
         fn recv_line(&mut self, timeout: Duration) -> Result<String> {
             self.read_timeouts.push(timeout);
+            if let Some((call, cancel)) = &self.cancel_on_read
+                && *call == self.read_timeouts.len()
+            {
+                cancel.cancel();
+            }
             if !self.read_delay.is_zero() {
                 sleep(self.read_delay);
             }
-            self.incoming.pop_front().ok_or(Error::Timeout)
+            match self.incoming.pop_front() {
+                Some(line) => Ok(line),
+                None => {
+                    sleep(timeout);
+                    Err(Error::Timeout)
+                }
+            }
         }
+    }
+
+    #[test]
+    fn pre_cancelled_operations_do_not_touch_the_session() {
+        let mut dev = Device::new(MockTransport::with_lines(&[]));
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert!(matches!(
+            dev.handshake_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.device_info_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.temperature_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.voltage_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.sweep_s11_controlled(&s11_params(3), &cancel, |_| panic!("no preview expected")),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.sweep_spec_controlled(&spec_params(3), &cancel, |_| panic!("no preview expected")),
+            Err(Error::Cancelled)
+        ));
+        assert!(dev.transport.sent.is_empty());
+        assert!(dev.transport.read_timeouts.is_empty());
+        assert!(!dev.requires_reconnect());
+    }
+
+    #[test]
+    fn cancelled_sweeps_discard_tails_and_require_a_fresh_identity_boundary() {
+        for mode in [StreamMode::S11, StreamMode::Spec] {
+            for cancel_after in [1, 3] {
+                let mut mock = MockTransport::with_lines(&[]);
+                mock.queue_sweep(mode, 3);
+                mock.queue_identity();
+                mock.queue_sweep(mode, 3);
+                let mut dev = Device::new(mock);
+                let cancel = CancellationToken::default();
+                let mut lengths = Vec::new();
+                let progress = |prefix: SweepProgress<'_>| {
+                    lengths.push(prefix.points.len());
+                    assert_eq!(prefix.mode, mode);
+                    assert_eq!(prefix.expected_points, 3);
+                    if prefix.points.len() == cancel_after {
+                        cancel.cancel();
+                    }
+                };
+                let result = match mode {
+                    StreamMode::S11 => dev.sweep_s11_controlled(&s11_params(3), &cancel, progress),
+                    StreamMode::Spec => {
+                        dev.sweep_spec_controlled(&spec_params(3), &cancel, progress)
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+                assert_eq!(lengths, (0..=cancel_after).collect::<Vec<_>>());
+                assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+                assert_eq!(dev.active_mode, None);
+                assert_eq!(dev.last_rbw, None);
+                assert!(!dev.requires_reconnect());
+                let data = match mode {
+                    StreamMode::S11 => dev.sweep_s11(&s11_params(3)),
+                    StreamMode::Spec => dev.sweep_spec(&spec_params(3)),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert_eq!(data.points.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_during_setup_does_not_start_a_sweep() {
+        for send in 1..=3 {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.cancel_on_send = Some((send, cancel.clone()));
+            mock.queue_identity();
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.sweep_s11_controlled(&s11_params(3), &cancel, |_| {}),
+                Err(Error::Cancelled)
+            ));
+            assert!(!dev.transport.sent_text().contains(",run,"));
+            assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+            assert!(!dev.requires_reconnect());
+        }
+    }
+
+    #[test]
+    fn an_end_marker_or_malformed_identity_does_not_confirm_cancellation() {
+        for lines in [
+            vec!["$start,s11,loss", "$5000,1", "$end"],
+            vec!["$start,device", "$incomplete identity", "$end"],
+            vec!["$start,err_cmd", "$error", "$end"],
+        ] {
+            let mut dev = Device::new(MockTransport::with_lines(&lines));
+            assert!(dev.cancel_sweep(Duration::from_millis(25)).is_err());
+            assert!(dev.requires_reconnect());
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent, sent);
+        }
+    }
+
+    #[test]
+    fn cancellation_cleanup_write_failure_retires_the_session() {
+        for send in 1..=2 {
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.fail_send = Some(send);
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.cancel_sweep(CLEANUP_TIMEOUT),
+                Err(Error::NotConnected)
+            ));
+            assert!(dev.requires_reconnect());
+            assert_eq!(dev.transport.send_calls, send);
+        }
+    }
+
+    #[test]
+    fn interrupted_queries_retire_pending_replies() {
+        let cancel = CancellationToken::default();
+        let mut mock = MockTransport::with_lines(&["$start,temp", "$47.3", "$end"]);
+        mock.cancel_on_read = Some((1, cancel.clone()));
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.temperature_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(dev.requires_reconnect());
+        assert_eq!(dev.transport.incoming.len(), 2);
+        assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+    }
+
+    #[test]
+    fn cancelled_handshake_is_released_but_refused_handshake_is_not() {
+        let cancel = CancellationToken::default();
+        let mut mock = MockTransport::with_lines(&["[KC901]000000000001"]);
+        mock.cancel_on_read = Some((1, cancel.clone()));
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.handshake_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(dev.requires_reconnect());
+        assert!(!dev.remote);
+        dev.close();
+        assert_eq!(dev.transport.sent_text(), "C$local\n");
+        let mut dev = Device::new(MockTransport::with_lines(&[
+            "$start,ConFail",
+            "$busy",
+            "$end",
+        ]));
+        assert!(matches!(dev.handshake(), Err(Error::DeviceBusy(_))));
+        dev.close();
+        assert_eq!(dev.transport.sent, b"C");
+    }
+
+    #[test]
+    fn cancellation_does_not_discard_a_fully_received_handshake_refusal() {
+        let cancel = CancellationToken::default();
+        let mut mock = MockTransport::with_lines(&["$start,ConFail", "$busy", "$end"]);
+        mock.cancel_on_read = Some((3, cancel.clone()));
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.handshake_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        dev.close();
+        assert_eq!(dev.transport.sent, b"C");
+    }
+
+    #[test]
+    fn closing_is_terminal_even_when_the_release_write_fails() {
+        for fail_send in [None, Some(1)] {
+            let mut dev = Device::new(MockTransport::with_lines(&[]));
+            dev.remote = true;
+            dev.transport.fail_send = fail_send;
+            dev.close();
+            assert!(dev.requires_reconnect());
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+            assert!(matches!(dev.handshake(), Err(Error::NotConnected)));
+            assert!(matches!(
+                dev.sweep_s11(&s11_params(3)),
+                Err(Error::NotConnected)
+            ));
+            assert_eq!(dev.transport.sent, sent);
+            assert!(dev.transport.read_timeouts.is_empty());
+        }
+    }
+
+    #[test]
+    fn close_writes_share_one_cleanup_budget() {
+        let mut dev = Device::new(MockTransport::with_lines(&[]));
+        dev.remote = true;
+        dev.active_mode = Some(StreamMode::S11);
+        dev.transport.send_delay = Duration::from_millis(3);
+        dev.close();
+        assert_eq!(dev.transport.write_timeouts.len(), 2);
+        assert_eq!(dev.transport.write_timeouts[0], CLEANUP_TIMEOUT);
+        assert!(dev.transport.write_timeouts[1] < CLEANUP_TIMEOUT);
+        assert_eq!(dev.transport.sent_text(), "$s11,stop\n$local\n");
+    }
+
+    #[test]
+    fn preview_restarts_replace_the_previous_prefix() {
+        let mock = MockTransport::with_lines(&[
+            "$start,s11,loss",
+            "$5000,999",
+            "$start,s11,loss",
+            "$5000,1",
+            "$6000,2",
+            "$7000,3",
+            "$end",
+        ]);
+        let mut dev = Device::new(mock);
+        let mut prefixes = Vec::new();
+        let data = dev
+            .sweep_s11_controlled(&s11_params(3), &CancellationToken::default(), |prefix| {
+                prefixes.push(
+                    prefix
+                        .points
+                        .iter()
+                        .map(|point| point.values[0])
+                        .collect::<Vec<_>>(),
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            prefixes,
+            [
+                vec![],
+                vec![999.0],
+                vec![],
+                vec![1.0],
+                vec![1.0, 2.0],
+                vec![1.0, 2.0, 3.0]
+            ]
+        );
+        assert_eq!(data.points.len(), 3);
     }
 
     #[test]
@@ -748,7 +1266,7 @@ mod tests {
             dev.transport
                 .read_timeouts
                 .iter()
-                .all(|&timeout| timeout == GENERIC_TIMEOUT)
+                .all(|&timeout| timeout == POLL_INTERVAL)
         );
     }
 
@@ -757,7 +1275,7 @@ mod tests {
             StreamMode::S11,
             Some(format),
             points,
-            GENERIC_TIMEOUT,
+            Duration::from_millis(100),
         )
     }
 

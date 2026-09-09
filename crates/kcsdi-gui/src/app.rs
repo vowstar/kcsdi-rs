@@ -13,7 +13,9 @@ use crate::desktop::{self, Page};
 use crate::device_worker;
 use crate::i18n::{self, Language, StatusMessage, Text};
 use crate::panels;
-use crate::state::{AppMode, AppState, ConnectionState, EventEnvelope, S11Display, WorkerEvent};
+use crate::state::{
+    AppMode, AppState, ConnectionState, EventEnvelope, S11Display, SweepState, WorkerEvent,
+};
 use crate::theme;
 use crate::widgets;
 
@@ -31,6 +33,8 @@ pub struct KcsdiApp {
     /// When the first unsaved change happened (debounce start).
     dirty_since: Option<Instant>,
     connection_open: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
+    closing: bool,
 }
 
 impl KcsdiApp {
@@ -39,15 +43,7 @@ impl KcsdiApp {
         theme::setup(&cc.egui_ctx);
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (evt_tx, evt_rx) = mpsc::channel();
-
-        let ctx = cc.egui_ctx.clone();
-        std::thread::Builder::new()
-            .name("device-worker".to_string())
-            .spawn(move || {
-                device_worker::device_worker(cmd_rx, evt_tx, ctx);
-            })
-            .expect("failed to spawn device worker thread");
+        let (evt_tx, evt_rx) = mpsc::sync_channel(device_worker::EVENT_CAPACITY);
 
         let cfg = crate::config::load();
         let mut state = AppState {
@@ -55,6 +51,13 @@ impl KcsdiApp {
             ..AppState::default()
         };
         cfg.apply_to(&mut state);
+        let ctx = cc.egui_ctx.clone();
+        let shutdown = state.worker_shutdown.clone();
+        let preview = state.preview_mailbox.clone();
+        let worker = std::thread::Builder::new()
+            .name("device-worker".to_string())
+            .spawn(move || device_worker::device_worker(cmd_rx, evt_tx, ctx, shutdown, preview))
+            .expect("failed to spawn device worker thread");
         state
             .spec
             .view
@@ -71,6 +74,8 @@ impl KcsdiApp {
             evt_rx,
             dirty_since: None,
             connection_open: false,
+            worker: Some(worker),
+            closing: false,
         }
     }
 
@@ -81,12 +86,69 @@ impl KcsdiApp {
         }
         if matches!(
             envelope.event,
-            WorkerEvent::SweepTrace(_) | WorkerEvent::Error(_)
+            WorkerEvent::SweepTrace(_) | WorkerEvent::SweepStopped | WorkerEvent::Error(_)
         ) && envelope.request_id != self.state.request_id
         {
             return;
         }
+        if let WorkerEvent::SweepTrace(data) = &envelope.event {
+            let Some(cycle) = envelope.cycle_id else {
+                return;
+            };
+            if !self.accepts_trace(data)
+                || self
+                    .state
+                    .last_completed_cycle
+                    .is_some_and(|last| cycle <= last)
+            {
+                return;
+            }
+            self.state.last_completed_cycle = Some(cycle);
+            if self
+                .state
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.cycle_id <= cycle)
+            {
+                self.state.preview = None;
+            }
+        }
         self.apply_event(envelope.event);
+    }
+
+    fn apply_preview(&mut self, preview: crate::preview::PreviewEnvelope) {
+        use kcsdi_core::protocol::StreamMode;
+        let expected = match self.state.mode {
+            AppMode::S11 => self.state.s11.points,
+            AppMode::Spec => self.state.spec.points,
+        };
+        let format_matches = match (self.state.mode, preview.data.mode) {
+            (AppMode::S11, StreamMode::S11) => {
+                preview.data.format == self.state.s11.display.wire_format().as_str()
+            }
+            (AppMode::Spec, StreamMode::Spec) => preview.data.format.is_empty(),
+            _ => false,
+        };
+        if self.state.connection != ConnectionState::Connected
+            || !self.state.running(self.state.mode)
+            || preview.session_id != self.state.session_id
+            || preview.request_id != self.state.request_id
+            || !format_matches
+            || preview.expected_points != expected
+            || preview.data.points.len() > expected as usize
+            || self
+                .state
+                .last_completed_cycle
+                .is_some_and(|last| preview.cycle_id <= last)
+            || self
+                .state
+                .preview
+                .as_ref()
+                .is_some_and(|last| preview.cycle_id < last.cycle_id)
+        {
+            return;
+        }
+        self.state.preview = Some(preview);
     }
 
     /// Apply an event after checking the identity of its source operation.
@@ -113,9 +175,15 @@ impl KcsdiApp {
                 if self.state.connection == ConnectionState::Connecting {
                     self.state.connection = ConnectionState::Error(msg.clone());
                 }
-                self.state.spec.running = false;
-                self.state.s11.running = false;
+                self.state.sweep = SweepState::Idle;
+                self.state.clear_preview();
                 self.state.status_message = Some(msg.into());
+            }
+            WorkerEvent::SweepStopped => {
+                if self.state.sweep == SweepState::Stopping {
+                    self.state.sweep = SweepState::Idle;
+                    self.state.clear_preview();
+                }
             }
             WorkerEvent::SweepTrace(data) => {
                 if !self.accepts_trace(&data) {
@@ -156,12 +224,12 @@ impl KcsdiApp {
         }
         match (self.state.mode, data.mode) {
             (AppMode::Spec, StreamMode::Spec) => {
-                self.state.spec.running
+                self.state.running(AppMode::Spec)
                     && data.format.is_empty()
                     && data.points.len() == self.state.spec.points as usize
             }
             (AppMode::S11, StreamMode::S11) => {
-                self.state.s11.running
+                self.state.running(AppMode::S11)
                     && data.format == self.state.s11.display.wire_format().as_str()
                     && data.points.len() == self.state.s11.points as usize
             }
@@ -174,8 +242,41 @@ impl KcsdiApp {
         self.state.device_info = None;
         self.state.temperature = None;
         self.state.voltage = None;
-        self.state.spec.running = false;
-        self.state.s11.running = false;
+        self.state.sweep = SweepState::Idle;
+        self.state.clear_preview();
+        self.state.acquisition_cancel.cancel();
+        self.state.session_cancel.cancel();
+    }
+
+    fn poll_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
+            self.closing = true;
+            self.state.send(crate::state::WorkerCommand::Shutdown);
+        }
+        if !self.closing {
+            return;
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint_after(Duration::from_millis(20));
+            return;
+        }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            warn!("device worker panicked during shutdown");
+        }
+        self.state.cmd_tx = None;
+        if self.state.export.is_pending() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     /// Save the config after a quiet period, so bursts of edits (dragging
     /// a frequency field) produce at most one write.
@@ -256,10 +357,37 @@ impl eframe::App for KcsdiApp {
         i18n::set_language(&ctx, self.state.language);
         theme::apply(&ctx, self.state.desktop.settings.theme);
         self.state.export.poll();
+        self.poll_close(&ctx);
 
         // Drain all pending events from the device worker.
-        while let Ok(evt) = self.evt_rx.try_recv() {
-            self.apply_worker_event(evt);
+        loop {
+            match self.evt_rx.try_recv() {
+                Ok(evt) => self.apply_worker_event(evt),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.worker.is_some() && !self.closing {
+                        self.state.worker_stopped();
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(preview) = self.state.preview_mailbox.take() {
+            self.apply_preview(preview);
+        }
+        if self.closing {
+            ui.disable();
+            egui::Window::new(self.state.language.text(Text::Closing))
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.spinner();
+                    ui.label(self.state.language.text(if self.state.export.is_pending() {
+                        Text::ExportBusy
+                    } else {
+                        Text::Disconnecting
+                    }));
+                });
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::F11)) {
@@ -269,7 +397,10 @@ impl eframe::App for KcsdiApp {
         if self.state.desktop.page == Page::Instrument {
             self.instrument_ui(ui);
         } else {
-            if self.state.connection == ConnectionState::Connected {
+            if matches!(
+                self.state.connection,
+                ConnectionState::Connected | ConnectionState::Disconnecting
+            ) {
                 egui::Panel::bottom("desktop_session_status").show(ui, |ui| {
                     if panels::status_bar::show(ui, &mut self.state) {
                         self.connection_open = true;
@@ -291,6 +422,22 @@ impl eframe::App for KcsdiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_config();
+        self.state.send(crate::state::WorkerCommand::Shutdown);
+        self.state.cmd_tx = None;
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            warn!("device worker panicked during exit");
+        }
+    }
+}
+
+impl Drop for KcsdiApp {
+    fn drop(&mut self) {
+        self.state.worker_shutdown.cancel();
+        self.state.session_cancel.cancel();
+        self.state.acquisition_cancel.cancel();
+        self.state.cmd_tx = None;
     }
 }
 
@@ -376,38 +523,60 @@ impl KcsdiApp {
 
     fn plot_ui(&mut self, ui: &mut egui::Ui) {
         let colors = theme::trace_colors(ui.visuals().dark_mode);
+        let preview = self
+            .state
+            .preview
+            .as_ref()
+            .map(|preview| &preview.data)
+            .filter(|data| !data.points.is_empty());
+        let partial = preview.is_some();
         match self.state.mode {
             AppMode::Spec => {
                 let spec = &mut self.state.spec;
-                let mut series: Vec<_> = spec
-                    .trace
-                    .as_ref()
-                    .map(|t| widgets::plot::Series {
-                        name: self.state.language.text(Text::Level),
-                        color: colors[1],
-                        visible: spec.visible,
-                        points: t
-                            .points
-                            .iter()
-                            .map(|p| (p.freq_hz, p.values.first().copied().unwrap_or(f64::NAN)))
-                            .collect(),
-                    })
+                let curve = |t: &kcsdi_core::data::SweepData| widgets::plot::Series {
+                    name: self.state.language.text(Text::Level),
+                    color: colors[1],
+                    visible: spec.visible,
+                    points: t
+                        .points
+                        .iter()
+                        .map(|p| (p.freq_hz, p.values.first().copied().unwrap_or(f64::NAN)))
+                        .collect(),
+                };
+                let overlays = if spec.visible {
+                    spec.analysis.overlay_series(&[0])
+                } else {
+                    Vec::new()
+                };
+                if spec.needs_fit
+                    && !spec.view_locked
+                    && let Some(complete) = spec.trace.as_ref()
+                {
+                    let mut series = vec![curve(complete)];
+                    series.extend(overlays.iter().cloned());
+                    widgets::plot::fit_view(
+                        &mut spec.view,
+                        &widgets::plot::PlotOptions {
+                            y_label: "dBm",
+                            log_x: spec.log_x,
+                            series,
+                        },
+                    );
+                    spec.needs_fit = false;
+                }
+                let mut series: Vec<_> = preview
+                    .or(spec.trace.as_ref())
+                    .map(curve)
                     .into_iter()
                     .collect();
                 let base_count = series.len();
-                if spec.visible {
-                    series.extend(spec.analysis.overlay_series(&[0]));
-                }
+                series.extend(overlays);
                 let mut opts = widgets::plot::PlotOptions {
                     y_label: "dBm",
                     log_x: spec.log_x,
                     series,
                 };
-                if spec.needs_fit && !spec.view_locked && spec.trace.is_some() {
-                    widgets::plot::fit_view(&mut spec.view, &opts);
-                    spec.needs_fit = false;
-                }
-                let interaction = if spec.analysis.markers().is_empty() {
+                let interaction = if partial || spec.analysis.markers().is_empty() {
                     widgets::plot::show(ui, &mut spec.view, &mut opts)
                 } else {
                     widgets::plot::show_with_markers(
@@ -432,31 +601,62 @@ impl KcsdiApp {
                 let s11 = &mut self.state.s11;
                 match s11.display {
                     S11Display::Smith => {
-                        let trace = s11.trace.as_ref().filter(|_| s11.visible);
+                        let trace = preview.or(s11.trace.as_ref()).filter(|_| s11.visible);
                         let held = s11.visible.then(|| s11.analysis.held_trace()).flatten();
+                        let markers = if partial {
+                            &mut []
+                        } else {
+                            s11.analysis.markers_mut()
+                        };
                         if held.is_some() {
                             widgets::smith::show_layers(
                                 ui,
                                 &mut s11.smith,
                                 trace,
                                 held.as_ref(),
-                                s11.analysis.markers_mut(),
+                                markers,
                             );
-                        } else if s11.analysis.markers().is_empty() {
+                        } else if markers.is_empty() {
                             widgets::smith::show(ui, &mut s11.smith, trace);
                         } else {
-                            widgets::smith::show_with_markers(
-                                ui,
-                                &mut s11.smith,
-                                trace,
-                                s11.analysis.markers_mut(),
-                            );
+                            widgets::smith::show_with_markers(ui, &mut s11.smith, trace, markers);
                         }
                     }
                     display => {
-                        let mut series = cartesian_series(
+                        let mut completed = cartesian_series(
                             display,
                             s11.trace.as_ref(),
+                            s11.impedance_visible,
+                            self.state.language,
+                        );
+                        for curve in &mut completed {
+                            curve.visible &= s11.visible;
+                        }
+                        let overlays = if s11.visible && !completed.is_empty() {
+                            let columns: &[usize] = match display {
+                                S11Display::Phase => &[1],
+                                S11Display::Impedance => &[0, 1, 2],
+                                _ => &[0],
+                            };
+                            s11.analysis.overlay_series(columns)
+                        } else {
+                            Vec::new()
+                        };
+                        if s11.needs_fit && !s11.view_locked && !completed.is_empty() {
+                            completed.extend(overlays.iter().cloned());
+                            widgets::plot::fit_view(
+                                &mut s11.view,
+                                &widgets::plot::PlotOptions {
+                                    y_label: display.y_label(),
+                                    log_x: s11.log_x,
+                                    series: completed,
+                                },
+                            );
+                            s11.needs_fit = false;
+                        }
+                        let mut series = cartesian_series(
+                            display,
+                            preview.or(s11.trace.as_ref()),
                             s11.impedance_visible,
                             self.state.language,
                         );
@@ -465,28 +665,21 @@ impl KcsdiApp {
                             curve.color = colors[i];
                             curve.visible &= s11.visible;
                         }
-                        if s11.visible && base_count > 0 {
-                            let columns: &[usize] = match display {
-                                S11Display::Phase => &[1],
-                                S11Display::Impedance => &[0, 1, 2],
-                                _ => &[0],
-                            };
-                            series.extend(s11.analysis.overlay_series(columns));
-                        }
+                        series.extend(overlays);
                         let mut opts = widgets::plot::PlotOptions {
                             y_label: display.y_label(),
                             log_x: s11.log_x,
                             series,
                         };
-                        if s11.needs_fit && !s11.view_locked && s11.trace.is_some() {
-                            widgets::plot::fit_view(&mut s11.view, &opts);
-                            s11.needs_fit = false;
-                        }
                         match widgets::plot::show_with_markers(
                             ui,
                             &mut s11.view,
                             &mut opts,
-                            s11.analysis.markers_mut(),
+                            if partial {
+                                &mut []
+                            } else {
+                                s11.analysis.markers_mut()
+                            },
                         ) {
                             widgets::plot::ViewLock::Locked => s11.view_locked = true,
                             widgets::plot::ViewLock::Unlocked => s11.view_locked = false,
@@ -671,6 +864,8 @@ mod tests {
             evt_rx,
             dirty_since: None,
             connection_open: false,
+            worker: None,
+            closing: false,
         }
     }
 
@@ -701,9 +896,9 @@ mod tests {
         let state = crate::state::AppState {
             connection: ConnectionState::Connected,
             mode: AppMode::S11,
+            sweep: SweepState::Running(AppMode::S11),
             s11: crate::state::S11State {
                 display: S11Display::Impedance,
-                running: true,
                 points: 3,
                 ..Default::default()
             },
@@ -735,11 +930,11 @@ mod tests {
             mode: AppMode::S11,
             session_id: 1,
             request_id: 1,
+            sweep: SweepState::Running(AppMode::S11),
             temperature: Some(42.0),
             s11: crate::state::S11State {
                 display: S11Display::Impedance,
                 points: 3,
-                running: true,
                 trace: Some(completed_impedance()),
                 needs_fit: false,
                 ..Default::default()
@@ -747,6 +942,305 @@ mod tests {
             status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
             ..Default::default()
         })
+    }
+
+    fn prefix(app: &KcsdiApp, cycle_id: u64, points: usize) -> crate::preview::PreviewEnvelope {
+        let mut data = completed_impedance();
+        data.points.truncate(points);
+        crate::preview::PreviewEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id,
+            data,
+            expected_points: 3,
+        }
+    }
+
+    #[test]
+    fn previews_and_completions_keep_separate_cycle_watermarks_and_snapshots() {
+        let mut app = active_impedance_app();
+        let mut newer = prefix(&app, 2, 2);
+        newer.data.points[0].values[0] = 900.0;
+        app.apply_preview(newer);
+        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+        assert!(!app.state.s11.needs_fit);
+        assert_eq!(app.state.last_completed_cycle, None);
+        let mut complete = completed_impedance();
+        complete.points[0].values[0] = 75.0;
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: Some(1),
+            event: WorkerEvent::SweepTrace(complete.clone()),
+        });
+        assert_eq!(app.state.s11.trace, Some(complete));
+        assert_eq!(app.state.last_completed_cycle, Some(1));
+        assert_eq!(app.state.preview.as_ref().unwrap().cycle_id, 2);
+        app.apply_preview(prefix(&app, 1, 2));
+        assert_eq!(app.state.preview.as_ref().unwrap().cycle_id, 2);
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: Some(2),
+            event: WorkerEvent::SweepTrace(completed_impedance()),
+        });
+        assert!(app.state.preview.is_none());
+        app.apply_preview(prefix(&app, 2, 2));
+        assert!(app.state.preview.is_none());
+        let obsolete = prefix(&app, 3, 2);
+        app.state.send(crate::state::WorkerCommand::StopSweep);
+        app.apply_preview(obsolete);
+        assert!(app.state.preview.is_none());
+        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+    }
+
+    #[test]
+    fn new_previews_do_not_starve_fitting_or_supply_its_measurements() {
+        for points in [0, 2] {
+            let mut app = active_impedance_app();
+            app.state.s11.needs_fit = true;
+            let mut pending = prefix(&app, 2, points);
+            for point in &mut pending.data.points {
+                point.values = vec![10_000.0, 10_000.0, 0.0];
+            }
+            app.apply_preview(pending);
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.plot_ui(ui),
+            );
+            output.textures_delta.clear();
+            assert!(!app.state.s11.needs_fit);
+            assert!(app.state.s11.view.y_max < 100.0);
+            assert!(app.state.s11.view.x_min <= 1_000_000.0);
+            assert!(app.state.s11.view.x_max >= 3_000_000.0);
+            assert!(app.state.preview.is_some());
+            assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+        }
+    }
+
+    #[test]
+    fn spectrum_fits_completed_data_while_a_new_prefix_is_visible() {
+        let mut app = test_app(AppState {
+            connection: ConnectionState::Connected,
+            sweep: SweepState::Running(AppMode::Spec),
+            ..Default::default()
+        });
+        let mut complete = completed_impedance();
+        complete.mode = StreamMode::Spec;
+        complete.format.clear();
+        for point in &mut complete.points {
+            point.values = vec![-20.0];
+        }
+        app.state.spec.points = 3;
+        app.state.spec.trace = Some(complete.clone());
+        let mut pending = complete.clone();
+        pending.points.truncate(2);
+        for point in &mut pending.points {
+            point.values = vec![10_000.0];
+        }
+        app.apply_preview(crate::preview::PreviewEnvelope {
+            session_id: 0,
+            request_id: 0,
+            cycle_id: 2,
+            data: pending,
+            expected_points: 3,
+        });
+        egui::Context::default()
+            .run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.plot_ui(ui),
+            )
+            .drop_without_applying_deltas();
+        assert!(!app.state.spec.needs_fit);
+        assert!(app.state.spec.view.y_max < 0.0);
+        assert_eq!(app.state.spec.trace, Some(complete));
+    }
+
+    #[test]
+    fn a_phase_preview_does_not_relabel_impedance_holds_or_change_export_data() {
+        let mut app = active_impedance_app();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 600.0));
+        let mut button = None;
+        for _ in 0..2 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.state.s11.analysis.controls(
+                        ui,
+                        Language::English,
+                        app.state.s11.trace.as_ref(),
+                    );
+                },
+            );
+            button = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "HOLD" => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    }
+                    _ => None,
+                })
+                .next_back();
+            output.drop_without_applying_deltas();
+        }
+        let pos = button.expect("hold button must be visible");
+        for pressed in [true, false] {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    app.state.s11.analysis.controls(
+                        ui,
+                        Language::English,
+                        app.state.s11.trace.as_ref(),
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            app.state.s11.analysis.held_trace(),
+            Some(completed_impedance())
+        );
+        app.state.s11.display = S11Display::Phase;
+        app.state.send(crate::state::WorkerCommand::RunS11(
+            app.state.s11.s11_params().unwrap(),
+        ));
+        let mut pending = prefix(&app, 2, 2);
+        pending.data.format = "ma".into();
+        for point in &mut pending.data.points {
+            point.values = vec![0.5, 10.0];
+        }
+        app.apply_preview(pending);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.plot_ui(ui),
+        );
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with("Hold "))));
+        output.drop_without_applying_deltas();
+        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+        assert_eq!(
+            app.state.s11.analysis.held_trace(),
+            Some(completed_impedance())
+        );
+    }
+
+    #[test]
+    fn stop_requires_the_current_workers_acknowledgement() {
+        let mut app = active_impedance_app();
+        let old_request = app.state.request_id;
+        app.state.send(crate::state::WorkerCommand::StopSweep);
+        assert_eq!(app.state.sweep, SweepState::Stopping);
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: old_request,
+            cycle_id: None,
+            event: WorkerEvent::SweepStopped,
+        });
+        assert_eq!(app.state.sweep, SweepState::Stopping);
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::SweepStopped,
+        });
+        assert_eq!(app.state.sweep, SweepState::Idle);
+        assert_eq!(app.state.connection, ConnectionState::Connected);
+        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+    }
+
+    #[test]
+    fn close_is_cancelled_until_the_owned_worker_finishes() {
+        let mut app = active_impedance_app();
+        let (commands, receiver) = mpsc::channel();
+        app.state.cmd_tx = Some(commands);
+        let (release, wait) = mpsc::channel();
+        app.worker = Some(std::thread::spawn(move || {
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        }));
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let mut output = ctx.run_ui(input, |ui| app.poll_close(ui.ctx()));
+            output.textures_delta.clear();
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+            assert!(!commands.contains(&egui::ViewportCommand::Close));
+            assert!(app.state.worker_shutdown.is_cancelled());
+        }
+        assert!(matches!(
+            receiver.try_recv().unwrap().command,
+            crate::state::WorkerCommand::Shutdown
+        ));
+        assert!(receiver.try_recv().is_err());
+        release.send(()).unwrap();
+        let started = Instant::now();
+        while !app.worker.as_ref().unwrap().is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.poll_close(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(app.worker.is_none());
+        assert!(app.state.cmd_tx.is_none());
+    }
+
+    #[test]
+    fn dropping_the_ui_cancels_all_worker_operations() {
+        let app = active_impedance_app();
+        let acquisition = app.state.acquisition_cancel.clone();
+        let session = app.state.session_cancel.clone();
+        let shutdown = app.state.worker_shutdown.clone();
+        drop(app);
+        assert!(acquisition.is_cancelled());
+        assert!(session.is_cancelled());
+        assert!(shutdown.is_cancelled());
     }
 
     #[test]
@@ -767,10 +1261,11 @@ mod tests {
             app.apply_worker_event(EventEnvelope {
                 session_id,
                 request_id,
+                cycle_id: Some(1),
                 event,
             });
             assert_eq!(app.state.s11.trace, Some(completed_impedance()));
-            assert!(app.state.s11.running);
+            assert!(app.state.running(AppMode::S11));
             assert!(!app.state.s11.needs_fit);
             assert!(matches!(
                 app.state.status_message,
@@ -780,6 +1275,7 @@ mod tests {
         app.apply_worker_event(EventEnvelope {
             session_id,
             request_id: app.state.request_id,
+            cycle_id: Some(2),
             event: WorkerEvent::SweepTrace(late.clone()),
         });
         assert_eq!(app.state.s11.trace, Some(late));
@@ -820,14 +1316,22 @@ mod tests {
                 app.apply_worker_event(EventEnvelope {
                     session_id: old_session,
                     request_id,
+                    cycle_id: None,
                     event,
                 });
-                assert_eq!(app.state.connection, ConnectionState::Connected);
+                assert_eq!(
+                    app.state.connection,
+                    if reconnect {
+                        ConnectionState::Connecting
+                    } else {
+                        ConnectionState::Disconnecting
+                    }
+                );
                 assert!(app.state.device_info.is_none());
                 assert_eq!(app.state.temperature, Some(42.0));
                 assert!(app.state.voltage.is_none());
                 assert_eq!(app.state.request_id, request_id);
-                assert!(app.state.s11.running);
+                assert!(!app.state.any_running());
                 assert_eq!(app.state.s11.trace, Some(completed_impedance()));
             }
         }
@@ -840,6 +1344,7 @@ mod tests {
         app.apply_worker_event(EventEnvelope {
             session_id: app.state.session_id,
             request_id: 1,
+            cycle_id: None,
             event: WorkerEvent::ConnectionLost("shared socket closed".into()),
         });
         assert!(matches!(app.state.connection, ConnectionState::Error(_)));
@@ -855,6 +1360,7 @@ mod tests {
         app.apply_worker_event(EventEnvelope {
             session_id: app.state.session_id,
             request_id: 1,
+            cycle_id: None,
             event: WorkerEvent::Status {
                 temperature: 43.0,
                 voltage: kcsdi_core::data::Voltage {
@@ -864,7 +1370,7 @@ mod tests {
             },
         });
         assert_eq!(app.state.temperature, Some(43.0));
-        assert!(app.state.s11.running);
+        assert!(app.state.running(AppMode::S11));
         assert_eq!(app.state.request_id, 3);
     }
 
@@ -874,10 +1380,10 @@ mod tests {
             let state = crate::state::AppState {
                 connection: ConnectionState::Connected,
                 mode: AppMode::S11,
+                sweep: SweepState::Running(AppMode::S11),
                 s11: crate::state::S11State {
                     display: S11Display::Smith,
                     points: 3,
-                    running: true,
                     trace: Some(completed_impedance()),
                     needs_fit: false,
                     ..Default::default()
@@ -890,7 +1396,7 @@ mod tests {
             late.points[0].values[0] = 123.0;
             match case {
                 0 => app.state.connection = ConnectionState::Disconnected,
-                1 => app.state.s11.running = false,
+                1 => app.state.sweep = SweepState::Idle,
                 2 => app.state.mode = AppMode::Spec,
                 3 => app.state.s11.display = S11Display::Phase,
                 4 => app.state.s11.points = 201,
@@ -918,10 +1424,10 @@ mod tests {
             let state = crate::state::AppState {
                 connection: ConnectionState::Connected,
                 mode: AppMode::S11,
+                sweep: SweepState::Running(AppMode::S11),
                 s11: crate::state::S11State {
                     display,
                     points: 3,
-                    running: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -936,9 +1442,9 @@ mod tests {
     fn spectrum_accepts_only_active_count_and_wire_format() {
         let state = crate::state::AppState {
             connection: ConnectionState::Connected,
+            sweep: SweepState::Running(AppMode::Spec),
             spec: crate::state::SpecState {
                 points: 3,
-                running: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -970,7 +1476,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        state.s11.running = true;
+        state.sweep = SweepState::Running(AppMode::S11);
         state.s11.trace = Some(SweepData {
             mode: StreamMode::S11,
             format: "z".into(),

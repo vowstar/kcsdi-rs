@@ -42,7 +42,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                         host: state.host.clone(),
                         port: state.port,
                     };
-                    state.connection = ConnectionState::Connecting;
                     state.send(cmd);
                 }
             }
@@ -52,13 +51,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ConnectionState::Connected => {
                 if ui.button(language.text(Text::Disconnect)).clicked() {
-                    if state.any_running() {
-                        state.spec.running = false;
-                        state.s11.running = false;
-                        state.send(WorkerCommand::StopSweep);
-                    }
                     state.send(WorkerCommand::Disconnect);
                 }
+            }
+            ConnectionState::Disconnecting => {
+                ui.add_enabled(false, egui::Button::new(language.text(Text::Disconnecting)));
+                ui.spinner();
             }
         }
 
@@ -68,6 +66,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ConnectionState::Connecting => (AMBER, language.text(Text::Connecting)),
             ConnectionState::Connected => (GREEN, language.text(Text::Connected)),
+            ConnectionState::Disconnecting => (AMBER, language.text(Text::Disconnecting)),
             ConnectionState::Error(_) => (RED, language.text(Text::Error)),
         };
         status_dot(ui, color);

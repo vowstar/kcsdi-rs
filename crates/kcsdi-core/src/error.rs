@@ -17,6 +17,10 @@ pub enum Error {
     #[error("operation timed out")]
     Timeout,
 
+    /// The caller cancelled the operation before it completed.
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// The byte stream did not match the documented protocol.
     #[error("protocol error: {0}")]
     Protocol(String),

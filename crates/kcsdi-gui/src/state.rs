@@ -9,12 +9,14 @@
 use std::sync::mpsc;
 
 use kcsdi_core::commands::{Cal, Format};
+use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::{DeviceInfo, SweepData, Voltage};
 use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::model::{Model, Rbw};
 use kcsdi_core::validation::frequency_hz;
 
 use crate::i18n::{Language, StatusMessage, Text};
+use crate::preview::{PreviewEnvelope, PreviewMailbox};
 use crate::widgets::plot::PlotView;
 use crate::widgets::smith::SmithView;
 
@@ -37,6 +39,8 @@ pub enum WorkerCommand {
     StopSweep,
     /// One-shot temperature/voltage refresh.
     RefreshStatus,
+    /// Release the device and terminate its worker.
+    Shutdown,
 }
 
 /// Events sent from the device worker thread to the UI.
@@ -52,6 +56,8 @@ pub enum WorkerEvent {
     Error(String),
     /// A completed sweep (SPEC or S11; see `SweepData::mode`).
     SweepTrace(SweepData),
+    /// The requested stop has finished on the worker.
+    SweepStopped,
     /// Temperature and voltage reading.
     Status { temperature: f64, voltage: Voltage },
 }
@@ -61,6 +67,7 @@ pub enum WorkerEvent {
 pub struct CommandEnvelope {
     pub session_id: u64,
     pub request_id: u64,
+    pub cancel: CancellationToken,
     pub command: WorkerCommand,
 }
 
@@ -69,6 +76,7 @@ pub struct CommandEnvelope {
 pub struct EventEnvelope {
     pub session_id: u64,
     pub request_id: u64,
+    pub cycle_id: Option<u64>,
     pub event: WorkerEvent,
 }
 
@@ -79,6 +87,7 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    Disconnecting,
     Error(String),
 }
 
@@ -88,6 +97,15 @@ pub enum AppMode {
     #[default]
     Spec,
     S11,
+}
+
+/// One acquisition belongs to the worker, regardless of the visible panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SweepState {
+    #[default]
+    Idle,
+    Running(AppMode),
+    Stopping,
 }
 
 /// S11 display formats, matching the reference interface tabs
@@ -189,8 +207,6 @@ pub struct SpecState {
     pub ref_level_dbm: i32,
     /// Logarithmic frequency axis for the spectrum plot.
     pub log_x: bool,
-    /// True while repeating sweeps are requested.
-    pub running: bool,
     /// Latest completed sweep.
     pub trace: Option<SweepData>,
     /// Plot viewport (frequency x level), owned by the plot widget.
@@ -216,7 +232,6 @@ impl Default for SpecState {
             rbw: Rbw::R10k,
             ref_level_dbm: -10,
             log_x: false,
-            running: false,
             trace: None,
             view: PlotView::new(start_hz, stop_hz, -100.0, 0.0),
             needs_fit: true,
@@ -261,8 +276,6 @@ pub struct S11State {
     pub impedance_visible: [bool; 3],
     /// Optional RBW pushed before the run (`$bw`).
     pub rbw: Option<Rbw>,
-    /// True while repeating sweeps are requested.
-    pub running: bool,
     /// Latest completed sweep.
     pub trace: Option<SweepData>,
     /// Cartesian plot viewport.
@@ -295,7 +308,6 @@ impl Default for S11State {
             log_x: false,
             impedance_visible: [true; 3],
             rbw: None,
-            running: false,
             trace: None,
             view: PlotView::new(start_hz, stop_hz, y_min, y_max),
             smith: SmithView::default(),
@@ -349,6 +361,14 @@ pub struct AppState {
     /// Session-only identities. Settings never restore an active request.
     pub session_id: u64,
     pub request_id: u64,
+    pub sweep: SweepState,
+    pub session_cancel: CancellationToken,
+    pub acquisition_cancel: CancellationToken,
+    pub worker_shutdown: CancellationToken,
+    /// Preview data never replaces completed snapshots used by analysis/export.
+    pub preview: Option<PreviewEnvelope>,
+    pub preview_mailbox: PreviewMailbox,
+    pub last_completed_cycle: Option<u64>,
     /// Command channel to the device worker thread.
     pub cmd_tx: Option<mpsc::Sender<CommandEnvelope>>,
 }
@@ -372,6 +392,13 @@ impl Default for AppState {
             status_message: None,
             session_id: 0,
             request_id: 0,
+            sweep: SweepState::Idle,
+            session_cancel: CancellationToken::default(),
+            acquisition_cancel: CancellationToken::default(),
+            worker_shutdown: CancellationToken::default(),
+            preview: None,
+            preview_mailbox: PreviewMailbox::default(),
+            last_completed_cycle: None,
             cmd_tx: None,
         }
     }
@@ -388,8 +415,6 @@ impl AppState {
     pub fn change_mode(&mut self, mode: AppMode) {
         if self.mode != mode {
             if self.any_running() {
-                self.spec.running = false;
-                self.s11.running = false;
                 self.send(WorkerCommand::StopSweep);
             }
             self.mode = mode;
@@ -400,31 +425,99 @@ impl AppState {
     pub fn send(&mut self, command: WorkerCommand) {
         if matches!(
             command,
-            WorkerCommand::Connect { .. } | WorkerCommand::Disconnect
+            WorkerCommand::Connect { .. } | WorkerCommand::Disconnect | WorkerCommand::Shutdown
         ) {
+            self.session_cancel.cancel();
+            self.acquisition_cancel.cancel();
+            self.session_cancel = CancellationToken::default();
             self.session_id = self
                 .session_id
                 .checked_add(1)
                 .expect("session ID exhausted");
         }
         if !matches!(command, WorkerCommand::RefreshStatus) {
+            self.clear_preview();
             self.request_id = self
                 .request_id
                 .checked_add(1)
                 .expect("request ID exhausted");
         }
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(CommandEnvelope {
-                session_id: self.session_id,
-                request_id: self.request_id,
-                command,
-            });
+        let cancel = match &command {
+            WorkerCommand::RunSpec(_) | WorkerCommand::RunS11(_) => {
+                self.acquisition_cancel.cancel();
+                self.acquisition_cancel = CancellationToken::default();
+                self.sweep = SweepState::Running(if matches!(command, WorkerCommand::RunSpec(_)) {
+                    AppMode::Spec
+                } else {
+                    AppMode::S11
+                });
+                self.acquisition_cancel.clone()
+            }
+            WorkerCommand::StopSweep => {
+                self.acquisition_cancel.cancel();
+                self.sweep = SweepState::Stopping;
+                CancellationToken::default()
+            }
+            WorkerCommand::Connect { .. } => {
+                self.sweep = SweepState::Idle;
+                self.connection = ConnectionState::Connecting;
+                self.session_cancel.clone()
+            }
+            WorkerCommand::Disconnect | WorkerCommand::Shutdown => {
+                self.sweep = SweepState::Idle;
+                self.connection = ConnectionState::Disconnecting;
+                if matches!(command, WorkerCommand::Shutdown) {
+                    self.worker_shutdown.cancel();
+                }
+                self.session_cancel.clone()
+            }
+            WorkerCommand::RefreshStatus => self.session_cancel.clone(),
+        };
+        if let Some(tx) = &self.cmd_tx
+            && tx
+                .send(CommandEnvelope {
+                    session_id: self.session_id,
+                    request_id: self.request_id,
+                    cancel,
+                    command,
+                })
+                .is_err()
+        {
+            self.worker_stopped();
         }
     }
 
     /// Whether any sweep is currently repeating.
     pub fn any_running(&self) -> bool {
-        self.spec.running || self.s11.running
+        matches!(self.sweep, SweepState::Running(_))
+    }
+
+    pub fn running(&self, mode: AppMode) -> bool {
+        self.sweep == SweepState::Running(mode)
+    }
+
+    pub fn sweep_busy(&self) -> bool {
+        self.sweep != SweepState::Idle
+    }
+
+    pub fn clear_preview(&mut self) {
+        self.preview = None;
+        self.preview_mailbox.clear();
+        self.last_completed_cycle = None;
+    }
+
+    pub fn worker_stopped(&mut self) {
+        self.session_cancel.cancel();
+        self.acquisition_cancel.cancel();
+        self.worker_shutdown.cancel();
+        self.sweep = SweepState::Idle;
+        self.clear_preview();
+        self.device_info = None;
+        self.temperature = None;
+        self.voltage = None;
+        let message = "Device worker stopped".to_string();
+        self.connection = ConnectionState::Error(message.clone());
+        self.status_message = Some(message.into());
     }
 }
 
@@ -475,23 +568,78 @@ mod tests {
     }
 
     #[test]
-    fn changing_mode_stops_the_old_job_and_clears_both_run_indicators() {
+    fn acquisition_and_session_cancellation_have_separate_lifetimes() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.send(WorkerCommand::Connect {
+            host: "instrument.local".into(),
+            port: 901,
+        });
+        let connect = rx.try_recv().unwrap();
+        state.send(WorkerCommand::RunS11(state.s11.s11_params().unwrap()));
+        let first = rx.try_recv().unwrap();
+        state.send(WorkerCommand::RefreshStatus);
+        let refresh = rx.try_recv().unwrap();
+        assert_eq!(refresh.request_id, first.request_id);
+        assert!(!first.cancel.is_cancelled());
+        state.send(WorkerCommand::RunS11(state.s11.s11_params().unwrap()));
+        let second = rx.try_recv().unwrap();
+        assert!(first.cancel.is_cancelled());
+        assert!(!second.cancel.is_cancelled());
+        assert!(!connect.cancel.is_cancelled());
+        assert!(!refresh.cancel.is_cancelled());
+        state.send(WorkerCommand::StopSweep);
+        let stop = rx.try_recv().unwrap();
+        assert!(second.cancel.is_cancelled());
+        assert!(!stop.cancel.is_cancelled());
+        assert!(!connect.cancel.is_cancelled());
+        assert!(!state.worker_shutdown.is_cancelled());
+        assert_eq!(state.sweep, SweepState::Stopping);
+        state.send(WorkerCommand::Disconnect);
+        assert!(connect.cancel.is_cancelled());
+        assert!(refresh.cancel.is_cancelled());
+        assert_eq!(state.connection, ConnectionState::Disconnecting);
+        assert!(!state.worker_shutdown.is_cancelled());
+        state.send(WorkerCommand::Shutdown);
+        assert!(state.worker_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn a_closed_command_channel_cannot_leave_a_run_indicator_active() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.send(WorkerCommand::RunSpec(state.spec.spec_params().unwrap()));
+        assert_eq!(state.sweep, SweepState::Idle);
+        assert!(matches!(state.connection, ConnectionState::Error(_)));
+        assert!(state.worker_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn changing_mode_waits_for_the_old_job_to_stop() {
         let (tx, rx) = mpsc::channel();
         let mut state = AppState {
             cmd_tx: Some(tx),
             ..AppState::default()
         };
-        state.spec.running = true;
+        state.sweep = SweepState::Running(AppMode::Spec);
         state.change_mode(AppMode::S11);
         assert_eq!(state.mode, AppMode::S11);
         assert!(!state.any_running());
+        assert_eq!(state.sweep, SweepState::Stopping);
         assert!(matches!(
             rx.try_recv().unwrap().command,
             WorkerCommand::StopSweep
         ));
         state.change_mode(AppMode::S11);
         assert!(rx.try_recv().is_err());
-        state.s11.running = true;
+        state.sweep = SweepState::Running(AppMode::S11);
         state.change_mode(AppMode::Spec);
         assert!(!state.any_running());
         assert!(matches!(

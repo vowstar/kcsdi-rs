@@ -9,13 +9,19 @@
 //! `ctx.request_repaint()` so the UI picks it up immediately.
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use kcsdi_core::Device;
+use kcsdi_core::control::CancellationToken;
+use kcsdi_core::data::SweepData;
 use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
+use crate::preview::{PreviewEnvelope, PreviewMailbox};
 use crate::state::{CommandEnvelope, DEVICE_MODEL, EventEnvelope, WorkerCommand, WorkerEvent};
+
+pub const EVENT_CAPACITY: usize = 16;
 
 /// A repeating sweep job requested by the UI.
 #[derive(Debug, Clone)]
@@ -27,6 +33,7 @@ enum SweepJob {
 #[derive(Debug, Clone)]
 struct SweepRequest {
     request_id: u64,
+    cancel: CancellationToken,
     job: SweepJob,
 }
 
@@ -41,6 +48,7 @@ impl WorkerIdentity {
         EventEnvelope {
             session_id: self.session_id,
             request_id: self.request_id,
+            cycle_id: None,
             event,
         }
     }
@@ -49,52 +57,140 @@ impl WorkerIdentity {
 /// Entry point of the `"device-worker"` thread.
 pub fn device_worker(
     cmd_rx: mpsc::Receiver<CommandEnvelope>,
-    evt_tx: mpsc::Sender<EventEnvelope>,
+    evt_tx: mpsc::SyncSender<EventEnvelope>,
     ctx: egui::Context,
+    shutdown: CancellationToken,
+    preview: PreviewMailbox,
 ) {
     let mut device: Option<Device<TcpTransport>> = None;
     let mut job: Option<SweepRequest> = None;
     let mut identity = WorkerIdentity::default();
+    let mut cycle_id = 0_u64;
 
     let emit = |evt: EventEnvelope| {
-        if evt_tx.send(evt).is_err() {
-            info!("UI went away, worker exiting");
-        }
-        ctx.request_repaint();
+        send_event(&evt_tx, evt, &shutdown, None, &ctx);
     };
 
-    loop {
+    'worker: loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
         if device.is_some() && job.is_some() {
             // Run one sweep, then drain any pending commands.
             let current = job.clone().expect("checked above");
+            if current.cancel.is_cancelled() {
+                job = None;
+                continue;
+            }
+            cycle_id = cycle_id.checked_add(1).expect("sweep cycle ID exhausted");
             let source = WorkerIdentity {
                 session_id: identity.session_id,
                 request_id: current.request_id,
             };
             let emit_result = |event| emit(source.event(event));
+            let mut last_preview = None;
+            let progress = |progress: kcsdi_core::device::SweepProgress<'_>| {
+                if current.cancel.is_cancelled()
+                    || shutdown.is_cancelled()
+                    || !preview_due(last_preview, progress.points.is_empty())
+                {
+                    return;
+                }
+                last_preview = Some(Instant::now());
+                preview.publish(PreviewEnvelope {
+                    session_id: source.session_id,
+                    request_id: source.request_id,
+                    cycle_id,
+                    data: SweepData {
+                        mode: progress.mode,
+                        format: progress.format.to_owned(),
+                        points: progress.points.to_vec(),
+                    },
+                    expected_points: progress.expected_points,
+                });
+                ctx.request_repaint();
+            };
             let dev = device.as_mut().expect("checked above");
             let result = match &current.job {
-                SweepJob::Spec(params) => dev.sweep_spec(params),
-                SweepJob::S11(params) => dev.sweep_s11(params),
+                SweepJob::Spec(params) => {
+                    dev.sweep_spec_controlled(params, &current.cancel, progress)
+                }
+                SweepJob::S11(params) => {
+                    dev.sweep_s11_controlled(params, &current.cancel, progress)
+                }
             };
             match result {
-                Ok(data) => emit_result(WorkerEvent::SweepTrace(data)),
+                Ok(data) => {
+                    let mut event = source.event(WorkerEvent::SweepTrace(data));
+                    event.cycle_id = Some(cycle_id);
+                    send_event(&evt_tx, event, &shutdown, Some(&current.cancel), &ctx);
+                }
                 Err(e) => {
-                    error!("sweep failed: {e}");
+                    if !matches!(e, kcsdi_core::Error::Cancelled) {
+                        error!("sweep failed: {e}");
+                    }
                     fail(e, "Sweep failed", &mut device, &mut job, &emit_result);
                 }
             }
             loop {
+                if shutdown.is_cancelled() {
+                    break 'worker;
+                }
                 match cmd_rx.try_recv() {
-                    Ok(cmd) => handle(cmd, &mut identity, &mut device, &mut job, &emit),
+                    Ok(cmd) => {
+                        if matches!(cmd.command, WorkerCommand::Shutdown) {
+                            break 'worker;
+                        }
+                        handle(cmd, &mut identity, &mut device, &mut job, &emit);
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => break 'worker,
                 }
             }
         } else {
             match cmd_rx.recv() {
-                Ok(cmd) => handle(cmd, &mut identity, &mut device, &mut job, &emit),
-                Err(_) => return,
+                Ok(cmd) => {
+                    if shutdown.is_cancelled() || matches!(cmd.command, WorkerCommand::Shutdown) {
+                        break;
+                    }
+                    handle(cmd, &mut identity, &mut device, &mut job, &emit);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    shutdown.cancel();
+    if let Some(mut dev) = device.take() {
+        dev.close();
+    }
+}
+
+fn preview_due(last: Option<Instant>, reset: bool) -> bool {
+    reset || last.is_none_or(|last| last.elapsed() >= Duration::from_millis(50))
+}
+
+/// Completed results are reliable while active, without blocking shutdown.
+fn send_event(
+    sender: &mpsc::SyncSender<EventEnvelope>,
+    mut event: EventEnvelope,
+    shutdown: &CancellationToken,
+    obsolete: Option<&CancellationToken>,
+    ctx: &egui::Context,
+) {
+    while !shutdown.is_cancelled() && !obsolete.is_some_and(CancellationToken::is_cancelled) {
+        match sender.try_send(event) {
+            Ok(()) => {
+                ctx.request_repaint();
+                return;
+            }
+            Err(mpsc::TrySendError::Full(pending)) => {
+                event = pending;
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                shutdown.cancel();
+                return;
             }
         }
     }
@@ -111,11 +207,12 @@ fn handle(
     let CommandEnvelope {
         session_id,
         request_id,
+        cancel,
         command,
     } = envelope;
     if matches!(
         command,
-        WorkerCommand::Connect { .. } | WorkerCommand::Disconnect
+        WorkerCommand::Connect { .. } | WorkerCommand::Disconnect | WorkerCommand::Shutdown
     ) {
         if session_id <= identity.session_id {
             return;
@@ -143,23 +240,26 @@ fn handle(
             // Drop an old session before opening the device's single
             // control connection, including reconnect after a failure.
             *device = None;
-            match Device::connect_with_model(&host, port, DEVICE_MODEL).and_then(|mut dev| {
-                let info = dev.device_info()?;
-                Ok((dev, info))
-            }) {
+            match Device::connect_with_model_controlled(&host, port, DEVICE_MODEL, &cancel)
+                .and_then(|mut dev| {
+                    let info = dev.device_info_controlled(&cancel)?;
+                    Ok((dev, info))
+                }) {
                 Ok((dev, info)) => {
                     info!("connected to {host}:{port}, serial {}", info.serial);
                     *device = Some(dev);
                     emit(WorkerEvent::Connected(info));
                 }
                 Err(e) => {
-                    error!("connect to {host}:{port} failed: {e}");
                     *device = None;
-                    emit(WorkerEvent::Error(format!("Connect failed: {e}")));
+                    if !matches!(e, kcsdi_core::Error::Cancelled) {
+                        error!("connect to {host}:{port} failed: {e}");
+                        emit(WorkerEvent::Error(format!("Connect failed: {e}")));
+                    }
                 }
             }
         }
-        WorkerCommand::Disconnect => {
+        WorkerCommand::Disconnect | WorkerCommand::Shutdown => {
             *job = None;
             if let Some(mut dev) = device.take() {
                 dev.close();
@@ -167,10 +267,24 @@ fn handle(
             emit(WorkerEvent::Disconnected);
         }
         WorkerCommand::RunSpec(params) => {
-            start_sweep(SweepJob::Spec(params), request_id, device, job, &emit);
+            start_sweep(
+                SweepJob::Spec(params),
+                request_id,
+                cancel,
+                device,
+                job,
+                &emit,
+            );
         }
         WorkerCommand::RunS11(params) => {
-            start_sweep(SweepJob::S11(params), request_id, device, job, &emit);
+            start_sweep(
+                SweepJob::S11(params),
+                request_id,
+                cancel,
+                device,
+                job,
+                &emit,
+            );
         }
         WorkerCommand::StopSweep => {
             *job = None;
@@ -178,13 +292,15 @@ fn handle(
                 && let Err(e) = dev.stop_sweep()
             {
                 fail(e, "Stop failed", device, job, &emit);
+            } else {
+                emit(WorkerEvent::SweepStopped);
             }
         }
         WorkerCommand::RefreshStatus => {
             if let Some(dev) = device.as_mut() {
                 match dev
-                    .temperature()
-                    .and_then(|t| dev.voltage().map(|v| (t, v)))
+                    .temperature_controlled(&cancel)
+                    .and_then(|t| dev.voltage_controlled(&cancel).map(|v| (t, v)))
                 {
                     Ok((temperature, voltage)) => {
                         emit(WorkerEvent::Status {
@@ -202,11 +318,14 @@ fn handle(
 fn start_sweep(
     next: SweepJob,
     request_id: u64,
+    cancel: CancellationToken,
     device: &mut Option<Device<TcpTransport>>,
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
-    if device.is_none() {
+    if cancel.is_cancelled() {
+        *job = None;
+    } else if device.is_none() {
         fail(
             kcsdi_core::Error::NotConnected,
             "Run failed",
@@ -217,6 +336,7 @@ fn start_sweep(
     } else {
         *job = Some(SweepRequest {
             request_id,
+            cancel,
             job: next,
         });
     }
@@ -236,7 +356,7 @@ fn fail<T: kcsdi_core::transport::Transport>(
             dev.close();
         }
         emit(WorkerEvent::ConnectionLost(message));
-    } else {
+    } else if !matches!(error, kcsdi_core::Error::Cancelled) {
         emit(WorkerEvent::Error(message));
     }
 }
@@ -258,7 +378,184 @@ mod tests {
     use std::cell::RefCell;
 
     fn request(job: SweepJob) -> SweepRequest {
-        SweepRequest { request_id: 0, job }
+        SweepRequest {
+            request_id: 0,
+            cancel: CancellationToken::default(),
+            job,
+        }
+    }
+
+    #[test]
+    fn frame_resets_bypass_the_preview_throttle() {
+        let now = Instant::now();
+        assert!(!preview_due(Some(now), false));
+        assert!(preview_due(Some(now), true));
+        assert!(preview_due(None, false));
+    }
+
+    #[test]
+    fn reliable_results_wait_for_capacity_without_being_dropped() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let source = WorkerIdentity {
+            session_id: 1,
+            request_id: 1,
+        };
+        sender
+            .send(source.event(WorkerEvent::SweepStopped))
+            .unwrap();
+        let shutdown = CancellationToken::default();
+        let worker_shutdown = shutdown.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send_event(
+                &sender,
+                source.event(WorkerEvent::SweepStopped),
+                &worker_shutdown,
+                None,
+                &egui::Context::default(),
+            );
+            done_tx.send(()).unwrap();
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        receiver.recv().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap().event,
+            WorkerEvent::SweepStopped
+        ));
+        assert!(!shutdown.is_cancelled());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_and_shutdown_can_escape_a_full_result_queue() {
+        for cancel_request in [false, true] {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let source = WorkerIdentity::default();
+            sender
+                .send(source.event(WorkerEvent::SweepStopped))
+                .unwrap();
+            let shutdown = CancellationToken::default();
+            let request = CancellationToken::default();
+            let worker_shutdown = shutdown.clone();
+            let worker_request = request.clone();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                send_event(
+                    &sender,
+                    source.event(WorkerEvent::SweepStopped),
+                    &worker_shutdown,
+                    Some(&worker_request),
+                    &egui::Context::default(),
+                );
+                done_tx.send(()).unwrap();
+            });
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            if cancel_request {
+                request.cancel();
+            } else {
+                shutdown.cancel();
+            }
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            receiver.recv().unwrap();
+            assert!(receiver.try_recv().is_err());
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_ui_stops_reliable_event_delivery() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let shutdown = CancellationToken::default();
+        send_event(
+            &sender,
+            WorkerIdentity::default().event(WorkerEvent::SweepStopped),
+            &shutdown,
+            None,
+            &egui::Context::default(),
+        );
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_runs_are_skipped_and_stop_acknowledges_its_own_request() {
+        let mut identity = WorkerIdentity {
+            session_id: 1,
+            request_id: 1,
+        };
+        let mut device = None;
+        let mut job = None;
+        let events = RefCell::new(Vec::new());
+        let token = CancellationToken::default();
+        token.cancel();
+        handle(
+            CommandEnvelope {
+                session_id: 1,
+                request_id: 2,
+                cancel: token,
+                command: WorkerCommand::RunS11(
+                    crate::state::S11State::default().s11_params().unwrap(),
+                ),
+            },
+            &mut identity,
+            &mut device,
+            &mut job,
+            &|event| events.borrow_mut().push(event),
+        );
+        assert!(job.is_none());
+        assert!(events.borrow().is_empty());
+        handle(
+            CommandEnvelope {
+                session_id: 1,
+                request_id: 3,
+                cancel: CancellationToken::default(),
+                command: WorkerCommand::StopSweep,
+            },
+            &mut identity,
+            &mut device,
+            &mut job,
+            &|event| events.borrow_mut().push(event),
+        );
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, 3);
+        assert_eq!(events[0].cycle_id, None);
+        assert!(matches!(events[0].event, WorkerEvent::SweepStopped));
+    }
+
+    #[test]
+    fn shutdown_wakes_and_joins_an_idle_worker() {
+        let (sender, receiver) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(EVENT_CAPACITY);
+        let shutdown = CancellationToken::default();
+        let worker_shutdown = shutdown.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            device_worker(
+                receiver,
+                events,
+                egui::Context::default(),
+                worker_shutdown,
+                PreviewMailbox::default(),
+            );
+            done_tx.send(()).unwrap();
+        });
+        shutdown.cancel();
+        let _ = sender.send(CommandEnvelope {
+            session_id: 1,
+            request_id: 1,
+            cancel: CancellationToken::default(),
+            command: WorkerCommand::Shutdown,
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -297,6 +594,7 @@ mod tests {
                 CommandEnvelope {
                     session_id,
                     request_id,
+                    cancel: CancellationToken::default(),
                     command,
                 },
                 &mut identity,
@@ -313,6 +611,7 @@ mod tests {
             CommandEnvelope {
                 session_id: 5,
                 request_id: 10,
+                cancel: CancellationToken::default(),
                 command: WorkerCommand::Disconnect,
             },
             &mut identity,
@@ -344,6 +643,7 @@ mod tests {
                 CommandEnvelope {
                     session_id: 1,
                     request_id: 2,
+                    cancel: CancellationToken::default(),
                     command,
                 },
                 &mut identity,
@@ -392,6 +692,7 @@ mod tests {
         };
         let mut job = Some(SweepRequest {
             request_id: 7,
+            cancel: CancellationToken::default(),
             job: SweepJob::S11(crate::state::S11State::default().s11_params().unwrap()),
         });
         let events = RefCell::new(Vec::new());
@@ -399,6 +700,7 @@ mod tests {
             CommandEnvelope {
                 session_id: 2,
                 request_id: 7,
+                cancel: CancellationToken::default(),
                 command: WorkerCommand::RefreshStatus,
             },
             &mut identity,
@@ -480,6 +782,7 @@ mod tests {
             CommandEnvelope {
                 session_id: 0,
                 request_id: 0,
+                cancel: CancellationToken::default(),
                 command: WorkerCommand::RefreshStatus,
             },
             &mut WorkerIdentity::default(),
@@ -505,7 +808,7 @@ mod tests {
             sends: usize,
         }
         impl kcsdi_core::transport::Transport for CleanupFailure {
-            fn send(&mut self, _: &[u8]) -> kcsdi_core::Result<()> {
+            fn send_with_timeout(&mut self, _: &[u8], _: Duration) -> kcsdi_core::Result<()> {
                 self.sends += 1;
                 if self.sends == 5 {
                     Err(Error::NotConnected)

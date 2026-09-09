@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::control::{CancellationToken, POLL_INTERVAL};
 use crate::error::{Error, Result};
 
 /// Host budget for name resolution and TCP connection setup.
@@ -37,11 +38,13 @@ impl Drop for ResolverGuard {
 
 /// The OS resolver cannot be cancelled. Permit at most one outstanding lookup,
 /// even when its caller has timed out. This helper never opens a device socket.
-fn resolve_with_timeout(
+fn resolve_controlled(
     lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
     started: Instant,
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> Result<Vec<SocketAddr>> {
+    cancel.check()?;
     remaining_timeout(started, timeout)?;
     RESOLVER_BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -52,6 +55,7 @@ fn resolve_with_timeout(
             )
         })?;
     let guard = ResolverGuard;
+    cancel.check()?;
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("host-lookup".into())
@@ -61,27 +65,37 @@ fn resolve_with_timeout(
             drop(resolver_guard);
             let _ = sender.send(result);
         })?;
-    let addresses = receiver
-        .recv_timeout(remaining_timeout(started, timeout)?)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => Error::Timeout,
-            mpsc::RecvTimeoutError::Disconnected => {
-                Error::Io(io::Error::other("host lookup terminated without a result"))
+    loop {
+        cancel.check()?;
+        let remaining = remaining_timeout(started, timeout)?;
+        let result = receiver.recv_timeout(remaining.min(POLL_INTERVAL));
+        cancel.check()?;
+        remaining_timeout(started, timeout)?;
+        match result {
+            Ok(addresses) => return Ok(addresses?),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Io(io::Error::other(
+                    "host lookup terminated without a result",
+                )));
             }
-        })?;
-    remaining_timeout(started, timeout)?;
-    Ok(addresses?)
+        }
+    }
 }
 
-fn connect_addresses(
+fn connect_addresses_controlled(
     addresses: impl IntoIterator<Item = SocketAddr>,
     started: Instant,
     timeout: Duration,
+    cancel: &CancellationToken,
     mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
 ) -> Result<TcpStream> {
+    cancel.check()?;
     let mut last_error = None;
     for address in addresses {
+        cancel.check()?;
         let result = connect(&address, remaining_timeout(started, timeout)?);
+        cancel.check()?;
         remaining_timeout(started, timeout)?;
         match result {
             Ok(stream) => return Ok(stream),
@@ -96,7 +110,12 @@ fn connect_addresses(
 /// Byte transport for the KC901 text protocol.
 pub trait Transport {
     /// Send raw bytes (usually one command line including `\n`).
-    fn send(&mut self, data: &[u8]) -> Result<()>;
+    fn send(&mut self, data: &[u8]) -> Result<()> {
+        self.send_with_timeout(data, GENERIC_TIMEOUT)
+    }
+
+    /// Send raw bytes within one total budget, including partial writes.
+    fn send_with_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()>;
 
     /// Receive one line. The returned string has no trailing `\n` (a stray
     /// `\r` is also stripped). Returns [`Error::Timeout`] when no newline
@@ -115,16 +134,28 @@ impl TcpTransport {
     /// Resolve and connect to `host:port` within one 5 s budget.
     /// Literal IP addresses bypass the OS resolver.
     pub fn connect(host: &str, port: u16) -> Result<Self> {
-        Self::connect_with_timeout(host, port, CONNECT_TIMEOUT)
+        Self::connect_controlled(host, port, &CancellationToken::default())
     }
 
-    fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Self> {
+    /// Cancellation interrupts the resolver wait and is checked between TCP
+    /// attempts. An active native connect can use the remaining setup budget.
+    pub fn connect_controlled(host: &str, port: u16, cancel: &CancellationToken) -> Result<Self> {
+        Self::connect_with_control(host, port, CONNECT_TIMEOUT, cancel)
+    }
+
+    fn connect_with_control(
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        cancel.check()?;
         let started = Instant::now();
         let addresses = if let Ok(address) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(address, port)]
         } else {
             let host = host.to_owned();
-            resolve_with_timeout(
+            resolve_controlled(
                 move || {
                     (host.as_str(), port)
                         .to_socket_addrs()
@@ -132,10 +163,18 @@ impl TcpTransport {
                 },
                 started,
                 timeout,
+                cancel,
             )?
         };
-        let stream = connect_addresses(addresses, started, timeout, TcpStream::connect_timeout)?;
+        let stream = connect_addresses_controlled(
+            addresses,
+            started,
+            timeout,
+            cancel,
+            TcpStream::connect_timeout,
+        )?;
         stream.set_nodelay(true)?;
+        cancel.check()?;
         remaining_timeout(started, timeout)?;
         Ok(Self {
             stream,
@@ -149,7 +188,9 @@ impl TcpTransport {
         self.buf.clear();
         let _ = self.stream.shutdown(Shutdown::Both);
     }
+}
 
+impl Transport for TcpTransport {
     fn send_with_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
         if self.failed {
             return Err(Error::NotConnected);
@@ -164,12 +205,6 @@ impl TcpTransport {
             self.invalidate();
         }
         result
-    }
-}
-
-impl Transport for TcpTransport {
-    fn send(&mut self, data: &[u8]) -> Result<()> {
-        self.send_with_timeout(data, GENERIC_TIMEOUT)
     }
 
     fn recv_line(&mut self, timeout: Duration) -> Result<String> {
@@ -258,6 +293,29 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    fn resolve_with_timeout(
+        lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+        started: Instant,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>> {
+        resolve_controlled(lookup, started, timeout, &CancellationToken::default())
+    }
+
+    fn connect_addresses(
+        addresses: impl IntoIterator<Item = SocketAddr>,
+        started: Instant,
+        timeout: Duration,
+        connect: impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+    ) -> Result<TcpStream> {
+        connect_addresses_controlled(
+            addresses,
+            started,
+            timeout,
+            &CancellationToken::default(),
+            connect,
+        )
+    }
+
     fn spawn_server<F: FnOnce(TcpStream) + Send + 'static>(
         f: F,
     ) -> (u16, std::thread::JoinHandle<()>) {
@@ -268,6 +326,28 @@ mod tests {
             f(sock);
         });
         (port, thread)
+    }
+
+    #[test]
+    fn ordinary_send_uses_the_generic_timed_transport_method() {
+        #[derive(Default)]
+        struct TimedSend(Option<Duration>);
+
+        impl Transport for TimedSend {
+            fn send_with_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
+                assert_eq!(data, b"C");
+                self.0 = Some(timeout);
+                Ok(())
+            }
+
+            fn recv_line(&mut self, _timeout: Duration) -> Result<String> {
+                unreachable!()
+            }
+        }
+
+        let mut transport = TimedSend::default();
+        transport.send(b"C").unwrap();
+        assert_eq!(transport.0, Some(GENERIC_TIMEOUT));
     }
 
     #[test]
@@ -337,6 +417,138 @@ mod tests {
         let (port, server) = spawn_server(|_| {});
         drop(TcpTransport::connect("localhost", port).unwrap());
         server.join().unwrap();
+
+        // Keep all live resolver-gate scenarios in this test so concurrent
+        // tests cannot race over the process-wide outstanding lookup limit.
+        let cancel = CancellationToken::default();
+        let resolver_cancel = cancel.clone();
+        let (release, wait) = mpsc::channel();
+        let began = Instant::now();
+        let result = resolve_controlled(
+            move || {
+                resolver_cancel.cancel();
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+                Ok(vec![address])
+            },
+            began,
+            Duration::from_secs(5),
+            &cancel,
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(RESOLVER_BUSY.load(Ordering::Acquire));
+        let result = resolve_with_timeout(
+            || panic!("a cancelled lookup still owns the resolver slot"),
+            Instant::now(),
+            Duration::from_secs(2),
+        );
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        let (port, server) = spawn_server(|_| {});
+        drop(TcpTransport::connect("127.0.0.1", port).unwrap());
+        server.join().unwrap();
+        release.send(()).unwrap();
+        let released = Instant::now();
+        while RESOLVER_BUSY.load(Ordering::Acquire) {
+            assert!(released.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let fresh_address: SocketAddr = "127.0.0.1:902".parse().unwrap();
+        assert_eq!(
+            resolve_with_timeout(
+                move || Ok(vec![fresh_address]),
+                Instant::now(),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            vec![fresh_address]
+        );
+    }
+
+    #[test]
+    fn cancelled_connection_does_not_start_a_lookup_or_socket() {
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert!(matches!(
+            resolve_controlled(
+                || panic!("a cancelled lookup must not start"),
+                Instant::now(),
+                CONNECT_TIMEOUT,
+                &cancel,
+            ),
+            Err(Error::Cancelled)
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for host in ["127.0.0.1", "localhost"] {
+            assert!(matches!(
+                TcpTransport::connect_controlled(host, port, &cancel),
+                Err(Error::Cancelled)
+            ));
+        }
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn cancellation_prevents_further_address_attempts() {
+        let address: SocketAddr = "127.0.0.1:901".parse().unwrap();
+        let cancel = CancellationToken::default();
+        let mut attempts = 0;
+        let result = connect_addresses_controlled(
+            [address; 3],
+            Instant::now(),
+            CONNECT_TIMEOUT,
+            &cancel,
+            |_, _| {
+                attempts += 1;
+                cancel.cancel();
+                Err(io::ErrorKind::ConnectionRefused.into())
+            },
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            connect_addresses_controlled(
+                [address],
+                Instant::now(),
+                CONNECT_TIMEOUT,
+                &cancel,
+                |_, _| panic!("a cancelled socket attempt must not start"),
+            ),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cancellation_drops_a_socket_returned_by_the_active_attempt() {
+        let (port, server) = spawn_server(|mut socket| {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).unwrap(), 0);
+        });
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut socket =
+            Some(TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap());
+        let cancel = CancellationToken::default();
+        let result = connect_addresses_controlled(
+            [address],
+            Instant::now(),
+            CONNECT_TIMEOUT,
+            &cancel,
+            |_, _| {
+                cancel.cancel();
+                Ok(socket.take().unwrap())
+            },
+        );
+        drop(socket);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        server.join().unwrap();
     }
 
     #[test]
@@ -350,7 +562,12 @@ mod tests {
             Err(Error::Timeout)
         ));
         assert!(matches!(
-            TcpTransport::connect_with_timeout("127.0.0.1", 901, Duration::ZERO),
+            TcpTransport::connect_with_control(
+                "127.0.0.1",
+                901,
+                Duration::ZERO,
+                &CancellationToken::default(),
+            ),
             Err(Error::Timeout)
         ));
     }
