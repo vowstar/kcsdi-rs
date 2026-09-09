@@ -10,13 +10,19 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke};
 use kcsdi_core::data::SweepData;
 
-use super::plot::{Marker, chart_color, stroke_width, wheel_factor};
+use super::plot::{
+    Marker, MarkerBadge, MarkerLabelLayout, chart_color, draw_marker_badge, marker_color,
+    marker_text, stroke_width, wheel_factor,
+};
 use crate::i18n::{Text, language};
 #[cfg(test)]
 use crate::theme::trace_colors;
 
 /// Nominal system impedance in ohms.
 pub const Z0: f64 = kcsdi_core::touchstone::REFERENCE_OHMS;
+
+/// Frequency, resistance, reactance, and the complex reflection coefficient.
+type SmithPoint = (f64, f64, f64, f64, f64);
 
 /// Viewport of the Smith chart: zoom around the center.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +40,9 @@ pub struct SmithLayer<'a> {
     pub label: String,
     pub trace: Option<&'a SweepData>,
     pub held: Option<&'a SweepData>,
+    /// Complete complex data for the chosen Current or HOLD marker target.
+    /// None means no target. Scalar envelopes must not be supplied here.
+    pub marker_trace: Option<&'a SweepData>,
     pub color: Color32,
     pub line_width: f32,
     pub markers: &'a mut [Marker],
@@ -174,6 +183,7 @@ pub fn show_layers(
         label: String::new(),
         trace,
         held,
+        marker_trace: trace,
         color: trace_colors(ui.visuals().dark_mode)[0],
         line_width: 1.5,
         markers,
@@ -200,16 +210,28 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
         .iter()
         .map(|layer| trace_points(layer.trace))
         .collect();
+    let marker_points: Vec<_> = layers
+        .iter()
+        .map(|layer| trace_points(layer.marker_trace))
+        .collect();
+    let badges = smith_marker_badges(
+        ui.painter(),
+        &Mapping::new(chart_rect, view),
+        chart_rect,
+        layers,
+        &marker_points,
+    );
     let mut marker_input = false;
-    for (layer, points) in layers.iter_mut().zip(&points) {
+    for (index, layer) in layers.iter_mut().enumerate() {
         marker_input |= ui
             .push_id(("smith_layer", layer.id), |ui| {
                 interact_markers(
                     ui,
                     &Mapping::new(chart_rect, view),
                     chart_rect,
-                    points,
+                    &marker_points[index],
                     layer.markers,
+                    &badges[index],
                 )
             })
             .inner;
@@ -218,10 +240,16 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
         handle_input(ui, view, chart_rect, &response);
     }
     let mapping = Mapping::new(chart_rect, view);
+    let badges = smith_marker_badges(ui.painter(), &mapping, chart_rect, layers, &marker_points);
     let painter = ui.painter();
     let clipped = painter.with_clip_rect(chart_rect);
     draw_grid(&clipped, &mapping);
-    draw_grid_labels(&clipped, &mapping, chart_rect);
+    draw_grid_labels_avoiding(
+        &clipped,
+        &mapping,
+        chart_rect,
+        badges.iter().flatten().map(|badge| badge.rect).collect(),
+    );
     for (row, text) in [
         format!("{} | Z0 = {Z0} ohm", language(ui.ctx()).text(Text::Smith)),
         "r = R/Z0   x = X/Z0".to_string(),
@@ -252,7 +280,6 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
         };
         draw_trace_width(&clipped, &mapping, &held, held_color, layer.line_width);
         draw_trace_width(&clipped, &mapping, points, layer.color, layer.line_width);
-        draw_markers(&clipped, &mapping, points, layer.markers, &layer.label);
         if !layer.label.is_empty() {
             clipped.text(
                 Pos2::new(
@@ -264,6 +291,22 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
                 FontId::monospace(LABEL_FONT_SIZE),
                 layer.color,
             );
+        }
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        draw_markers(
+            &clipped,
+            &mapping,
+            &marker_points[index],
+            layer.markers,
+            &badges[index],
+        );
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        for badge in &badges[index] {
+            if let Some(marker) = layer.markers.iter().find(|marker| marker.id == badge.id) {
+                draw_marker_badge(&clipped, badge, marker);
+            }
         }
     }
     if !has_data {
@@ -303,10 +346,10 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
     }
 }
 
-fn marker_point<'a>(
-    points: &'a [(f64, f64, f64, f64, f64)],
-    marker: &Marker,
-) -> Option<&'a (f64, f64, f64, f64, f64)> {
+fn marker_point<'a>(points: &'a [SmithPoint], marker: &Marker) -> Option<&'a SmithPoint> {
+    if !marker.frequency_hz.is_finite() {
+        return None;
+    }
     points
         .iter()
         .filter(|p| p.0.is_finite() && p.3.is_finite() && p.4.is_finite())
@@ -317,12 +360,95 @@ fn marker_point<'a>(
         })
 }
 
+fn smith_marker_badges(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    rect: Rect,
+    layers: &[SmithLayer<'_>],
+    points: &[Vec<SmithPoint>],
+) -> Vec<Vec<MarkerBadge>> {
+    let mut occupied = Vec::new();
+    for (index, layer) in layers.iter().enumerate() {
+        if !layer.label.is_empty() {
+            let size = painter
+                .layout_no_wrap(
+                    layer.label.clone(),
+                    FontId::monospace(LABEL_FONT_SIZE),
+                    layer.color,
+                )
+                .size();
+            occupied.push(Rect::from_min_size(
+                Pos2::new(
+                    rect.right() - 8.0 - size.x,
+                    rect.top() + 4.0 + index as f32 * 16.0,
+                ),
+                size,
+            ));
+        }
+        for marker in layer.markers.iter() {
+            if let Some(point) = marker_point(&points[index], marker) {
+                let at = mapping.to_screen(point.3, point.4);
+                if rect.contains(at) {
+                    occupied.push(Rect::from_center_size(at, egui::vec2(22.0, 22.0)));
+                }
+            }
+        }
+    }
+    let mut layout = MarkerLabelLayout::new(rect, occupied);
+    let mut badges: Vec<Vec<MarkerBadge>> = (0..layers.len()).map(|_| Vec::new()).collect();
+    // The selected layer is last. Give its selected marker the first caption.
+    for index in (0..layers.len()).rev() {
+        let layer = &layers[index];
+        for marker in layer
+            .markers
+            .iter()
+            .filter(|m| m.selected)
+            .chain(layer.markers.iter().filter(|m| !m.selected))
+        {
+            let Some(point) = marker_point(&points[index], marker) else {
+                continue;
+            };
+            let at = mapping.to_screen(point.3, point.4);
+            if !rect.contains(at) {
+                continue;
+            }
+            let text = marker_text((!layer.label.is_empty()).then_some(layer.id), marker);
+            let size = painter
+                .layout_no_wrap(
+                    text.clone(),
+                    FontId::monospace(12.0),
+                    marker_color(painter, marker),
+                )
+                .size()
+                + egui::vec2(6.0, 4.0);
+            let positions = (0..4).flat_map(|ring| {
+                let gap = 14.0 + ring as f32 * (size.y + 3.0);
+                [
+                    Pos2::new(at.x + gap, at.y - size.y - gap),
+                    Pos2::new(at.x - size.x - gap, at.y - size.y - gap),
+                    Pos2::new(at.x + gap, at.y + gap),
+                    Pos2::new(at.x - size.x - gap, at.y + gap),
+                ]
+            });
+            if let Some(rect) = layout.place(size, positions) {
+                badges[index].push(MarkerBadge {
+                    id: marker.id,
+                    text,
+                    rect,
+                });
+            }
+        }
+    }
+    badges
+}
+
 fn interact_markers(
     ui: &egui::Ui,
     mapping: &Mapping,
     rect: Rect,
-    points: &[(f64, f64, f64, f64, f64)],
+    points: &[SmithPoint],
     markers: &mut [Marker],
+    badges: &[MarkerBadge],
 ) -> bool {
     let mut selected = None;
     let mut busy = false;
@@ -334,16 +460,31 @@ fn interact_markers(
         if !rect.contains(at) {
             continue;
         }
-        let response = ui
+        let mut response = ui
             .interact(
-                Rect::from_center_size(at, egui::vec2(22.0, 22.0)),
+                Rect::from_center_size(at, egui::vec2(22.0, 22.0))
+                    .intersect(rect)
+                    .intersect(ui.clip_rect()),
                 ui.id().with(("smith_marker", marker.id)),
                 Sense::click_and_drag(),
             )
             .on_hover_cursor(egui::CursorIcon::Grab);
+        if let Some(badge) = badges.iter().find(|badge| badge.id == marker.id) {
+            response = response.union(
+                ui.interact(
+                    badge.rect.intersect(rect).intersect(ui.clip_rect()),
+                    ui.id().with(("smith_marker_label", marker.id)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab),
+            );
+        }
         busy |= response.hovered() || response.dragged();
         if response.clicked() || response.dragged() {
             selected = Some(marker.id);
+        }
+        if response.drag_started() || response.dragged() {
+            marker.auto_peak = false;
         }
         if response.dragged()
             && let Some(pos) = response.interact_pointer_pos()
@@ -351,7 +492,7 @@ fn interact_markers(
             let (u, v) = mapping.to_gamma(pos);
             if let Some(point) = points
                 .iter()
-                .filter(|p| p.3.is_finite() && p.4.is_finite())
+                .filter(|p| p.0.is_finite() && p.3.is_finite() && p.4.is_finite())
                 .min_by(|a, b| {
                     ((a.3 - u).powi(2) + (a.4 - v).powi(2))
                         .total_cmp(&((b.3 - u).powi(2) + (b.4 - v).powi(2)))
@@ -372,32 +513,23 @@ fn interact_markers(
 fn draw_markers(
     painter: &egui::Painter,
     mapping: &Mapping,
-    points: &[(f64, f64, f64, f64, f64)],
+    points: &[SmithPoint],
     markers: &[Marker],
-    label: &str,
+    badges: &[MarkerBadge],
 ) {
     for marker in markers {
         let Some(point) = marker_point(points, marker) else {
             continue;
         };
         let at = mapping.to_screen(point.3, point.4);
-        let color = if marker.selected {
-            painter.ctx().global_style().visuals.selection.stroke.color
-        } else {
-            chart_color(painter.ctx(), TEXT_COLOR)
-        };
+        if !painter.clip_rect().contains(at) {
+            continue;
+        }
+        let color = marker_color(painter, marker);
         painter.circle_stroke(at, 5.0, Stroke::new(1.5, color));
-        painter.text(
-            at + egui::vec2(7.0, -7.0),
-            Align2::LEFT_BOTTOM,
-            format!(
-                "{label}{}M{}",
-                if label.is_empty() { "" } else { " " },
-                marker.id
-            ),
-            FontId::monospace(12.0),
-            color,
-        );
+        if let Some(badge) = badges.iter().find(|badge| badge.id == marker.id) {
+            painter.line_segment([at, badge.rect.center()], Stroke::new(0.7, color));
+        }
     }
 }
 
@@ -453,7 +585,7 @@ fn handle_input(ui: &egui::Ui, view: &mut SmithView, rect: Rect, response: &egui
 
 /// (freq_hz, R, X, gamma_u, gamma_v) for each sweep point. Invalid
 /// samples retain a non-finite gamma so the trace keeps its gaps.
-fn trace_points(trace: Option<&SweepData>) -> Vec<(f64, f64, f64, f64, f64)> {
+fn trace_points(trace: Option<&SweepData>) -> Vec<SmithPoint> {
     let mut out = Vec::new();
     let Some(data) = trace else {
         return out;
@@ -513,10 +645,19 @@ fn draw_grid(painter: &egui::Painter, mapping: &Mapping) {
 /// Normalized resistance labels sit on the real axis. Reactance labels
 /// sit at the unit-circle ends of their arcs, positive above the axis.
 /// Reference loads and region captions share the same collision check.
+#[cfg(test)]
 fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
+    draw_grid_labels_avoiding(painter, mapping, rect, Vec::new());
+}
+
+fn draw_grid_labels_avoiding(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    rect: Rect,
+    mut occupied: Vec<Rect>,
+) {
     let language = language(painter.ctx());
     let font = FontId::monospace(LABEL_FONT_SIZE);
-    let mut occupied: Vec<Rect> = Vec::new();
     let mut label = |text: String, at: Pos2, align: Align2| {
         let galley =
             painter.layout_no_wrap(text, font.clone(), chart_color(painter.ctx(), TEXT_COLOR));
@@ -627,7 +768,7 @@ fn draw_grid_labels(painter: &egui::Painter, mapping: &Mapping, rect: Rect) {
 /// Gamma polyline of the sweep. Uncalibrated data can exceed |gamma| =
 /// 1; such points are drawn as-is (the clip rect bounds them).
 #[cfg(test)]
-fn draw_trace(painter: &egui::Painter, mapping: &Mapping, points: &[(f64, f64, f64, f64, f64)]) {
+fn draw_trace(painter: &egui::Painter, mapping: &Mapping, points: &[SmithPoint]) {
     let color = trace_colors(painter.ctx().global_style().visuals.dark_mode)[0];
     draw_trace_width(painter, mapping, points, color, 1.5);
 }
@@ -635,7 +776,7 @@ fn draw_trace(painter: &egui::Painter, mapping: &Mapping, points: &[(f64, f64, f
 fn draw_trace_width(
     painter: &egui::Painter,
     mapping: &Mapping,
-    points: &[(f64, f64, f64, f64, f64)],
+    points: &[SmithPoint],
     color: Color32,
     width: f32,
 ) {
@@ -660,7 +801,7 @@ fn draw_trace_width(
 fn draw_hover_label(
     painter: &egui::Painter,
     mapping: &Mapping,
-    points: &[(f64, f64, f64, f64, f64)],
+    points: &[SmithPoint],
     rect: Rect,
     chart_rect: Rect,
     response: &egui::Response,
@@ -770,6 +911,7 @@ mod tests {
                 label: "T2".into(),
                 trace: Some(&first),
                 held: Some(&held),
+                marker_trace: Some(&first),
                 color: Color32::RED,
                 line_width: 3.0,
                 markers: &mut [],
@@ -779,6 +921,7 @@ mod tests {
                 label: "T4".into(),
                 trace: Some(&second),
                 held: None,
+                marker_trace: Some(&second),
                 color: Color32::GREEN,
                 line_width: 5.0,
                 markers: &mut [],
@@ -788,6 +931,7 @@ mod tests {
                 label: "T8".into(),
                 trace: Some(&scalar),
                 held: Some(&scalar),
+                marker_trace: Some(&scalar),
                 color: Color32::BLUE,
                 line_width: 7.0,
                 markers: &mut [],
@@ -837,6 +981,7 @@ mod tests {
                 frequency_hz: 1e6,
                 selected: false,
                 reference: false,
+                auto_peak: false,
             }]
         };
         let mut first_markers = marker();
@@ -848,6 +993,7 @@ mod tests {
                 label: "T2".into(),
                 trace: Some(&first),
                 held: None,
+                marker_trace: Some(&first),
                 color: Color32::RED,
                 line_width: 3.0,
                 markers: &mut first_markers,
@@ -857,6 +1003,7 @@ mod tests {
                 label: "T4".into(),
                 trace: Some(&second),
                 held: None,
+                marker_trace: Some(&second),
                 color: Color32::GREEN,
                 line_width: 5.0,
                 markers: &mut second_markers,
@@ -901,6 +1048,260 @@ mod tests {
     }
 
     #[test]
+    fn coincident_smith_captions_remain_distinct_and_name_the_reference() {
+        let ctx = egui::Context::default();
+        let data = trace_with_resistances(&[50.0, 100.0]);
+        let mut first = [Marker {
+            id: 1,
+            frequency_hz: 1e6,
+            reference: true,
+            ..Default::default()
+        }];
+        let mut second = [Marker {
+            id: 1,
+            frequency_hz: 1e6,
+            ..Default::default()
+        }];
+        let mut view = SmithView::default();
+        let mut layers = [
+            SmithLayer {
+                id: 2,
+                label: "T2".into(),
+                trace: Some(&data),
+                held: None,
+                marker_trace: Some(&data),
+                color: Color32::RED,
+                line_width: 1.5,
+                markers: &mut first,
+            },
+            SmithLayer {
+                id: 4,
+                label: "T4".into(),
+                trace: Some(&data),
+                held: None,
+                marker_trace: Some(&data),
+                color: Color32::GREEN,
+                line_width: 1.5,
+                markers: &mut second,
+            },
+        ];
+        let output = multi_frame(&ctx, &mut view, &mut layers, vec![], 0.0);
+        let labels = text_shapes(&output);
+        let first_bounds = labels.iter().find(|(text, _)| text == "T2 M1R").unwrap().1;
+        let second_bounds = labels.iter().find(|(text, _)| text == "T4 M1").unwrap().1;
+        assert!(!first_bounds.intersects(second_bounds));
+        let pos = first_bounds.center();
+        output.drop_without_applying_deltas();
+        for (index, events) in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            multi_frame(
+                &ctx,
+                &mut view,
+                &mut layers,
+                events,
+                (index + 1) as f64 * 0.02,
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(layers[0].markers[0].selected);
+        assert!(!layers[1].markers[0].selected);
+    }
+
+    #[test]
+    fn smith_marker_badges_do_not_partially_cover_grid_annotations() {
+        let ctx = egui::Context::default();
+        let data = SweepData {
+            mode: kcsdi_core::protocol::StreamMode::S11,
+            format: "z".into(),
+            points: vec![kcsdi_core::data::SweepPoint {
+                freq_hz: 26e6,
+                values: vec![20.0_f64.hypot(25.0), 20.0, 25.0],
+            }],
+        };
+        let mut markers = [Marker {
+            id: 1,
+            frequency_hz: 26e6,
+            ..Default::default()
+        }];
+        let mut layers = [SmithLayer {
+            id: 2,
+            label: "T2".into(),
+            trace: Some(&data),
+            held: None,
+            marker_trace: Some(&data),
+            color: Color32::RED,
+            line_width: 1.5,
+            markers: &mut markers,
+        }];
+        let output = multi_frame(&ctx, &mut SmithView::default(), &mut layers, vec![], 0.0);
+        let texts = text_shapes(&output);
+        let marker = texts.iter().find(|(text, _)| text == "T2 M1").unwrap().1;
+        for (text, rect) in &texts {
+            if text != "T2 M1" {
+                assert!(!marker.intersects(*rect), "marker overlaps {text}");
+            }
+        }
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn smith_marker_uses_only_the_explicit_complex_target() {
+        let current = trace_with_resistances(&[50.0, 100.0]);
+        let held = trace_with_resistances(&[25.0, 150.0]);
+        let scalar = SweepData {
+            format: "vswr".into(),
+            ..current.clone()
+        };
+        let chart = Rect::from_min_max(
+            Pos2::new(0.0, HEADER_HEIGHT),
+            Pos2::new(600.0, 600.0 - FOOTER_HEIGHT),
+        );
+        for (target, expected) in [
+            (Some(&current), Some(0.0)),
+            (Some(&held), Some(-1.0 / 3.0)),
+            (Some(&scalar), None),
+            (None, None),
+        ] {
+            let mut view = SmithView::default();
+            let mapping = Mapping::new(chart, &view);
+            let mut markers = [Marker {
+                id: 1,
+                frequency_hz: 1e6,
+                ..Default::default()
+            }];
+            let mut layers = [SmithLayer {
+                id: 2,
+                label: "T2".into(),
+                trace: Some(&current),
+                held: Some(&held),
+                marker_trace: target,
+                color: Color32::RED,
+                line_width: 1.5,
+                markers: &mut markers,
+            }];
+            let output = multi_frame(
+                &egui::Context::default(),
+                &mut view,
+                &mut layers,
+                vec![],
+                0.0,
+            );
+            let circles: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    Shape::Circle(circle) if circle.radius == 5.0 => Some(circle.center),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                circles,
+                expected
+                    .map(|u| mapping.to_screen(u, 0.0))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                text_shapes(&output).iter().any(|(text, _)| text == "T2 M1"),
+                expected.is_some()
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn held_marker_drag_snaps_to_held_data_and_cancels_auto_peak() {
+        for (destination, expected_frequency) in [(-1.0 / 3.0 + 0.05, 1e6), (0.5, 2e6)] {
+            let ctx = egui::Context::default();
+            let current = trace_with_resistances(&[100.0, 50.0]);
+            let held = trace_with_resistances(&[25.0, 150.0]);
+            let mut markers = [Marker {
+                id: 1,
+                frequency_hz: 1e6,
+                auto_peak: true,
+                ..Default::default()
+            }];
+            let mut layers = [SmithLayer {
+                id: 2,
+                label: "T2".into(),
+                trace: Some(&current),
+                held: Some(&held),
+                marker_trace: Some(&held),
+                color: Color32::RED,
+                line_width: 1.5,
+                markers: &mut markers,
+            }];
+            let mut view = SmithView::default();
+            let chart = Rect::from_min_max(
+                Pos2::new(0.0, HEADER_HEIGHT),
+                Pos2::new(600.0, 600.0 - FOOTER_HEIGHT),
+            );
+            let mapping = Mapping::new(chart, &view);
+            let from = mapping.to_screen(-1.0 / 3.0, 0.0);
+            let to = mapping.to_screen(destination, 0.0);
+            for (index, events) in [
+                vec![],
+                vec![egui::Event::PointerMoved(from)],
+                vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                multi_frame(&ctx, &mut view, &mut layers, events, index as f64 * 0.02)
+                    .drop_without_applying_deltas();
+            }
+            assert_eq!(layers[0].markers[0].frequency_hz, expected_frequency);
+            assert!(!layers[0].markers[0].auto_peak);
+            assert_eq!(view, SmithView::default());
+        }
+    }
+
+    #[test]
+    fn nonfinite_marker_frequency_has_no_smith_target() {
+        let points = trace_points(Some(&trace_with_resistances(&[50.0])));
+        for frequency_hz in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                marker_point(
+                    &points,
+                    &Marker {
+                        frequency_hz,
+                        ..Default::default()
+                    }
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn multi_smith_hover_names_the_nearest_trace() {
         let ctx = egui::Context::default();
         let first = trace_with_resistances(&[25.0, 50.0]);
@@ -912,6 +1313,7 @@ mod tests {
                 label: "T2".into(),
                 trace: Some(&first),
                 held: None,
+                marker_trace: Some(&first),
                 color: Color32::RED,
                 line_width: 3.0,
                 markers: &mut [],
@@ -921,6 +1323,7 @@ mod tests {
                 label: "T4".into(),
                 trace: Some(&second),
                 held: None,
+                marker_trace: Some(&second),
                 color: Color32::GREEN,
                 line_width: 5.0,
                 markers: &mut [],
@@ -1008,6 +1411,7 @@ mod tests {
             frequency_hz: 1e6,
             selected: true,
             reference: false,
+            auto_peak: true,
         }];
         for (index, events) in [
             vec![],
@@ -1041,6 +1445,7 @@ mod tests {
             .drop_without_applying_deltas();
         }
         assert_eq!(markers[0].frequency_hz, 3e6);
+        assert!(!markers[0].auto_peak);
         assert_eq!(view, SmithView::default());
     }
 

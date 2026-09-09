@@ -211,6 +211,7 @@ impl TraceState {
         let (low, high) = settings.display.default_y();
         let mut analysis = AnalysisTools::default();
         analysis.set_trace_id(id.0);
+        analysis.set_smith(settings.display.is_smith());
         let columns = settings.display.columns();
         analysis.set_column((columns.len() == 1).then(|| columns[0]));
         Self {
@@ -237,6 +238,7 @@ impl TraceState {
         let columns = settings.display.columns();
         self.analysis
             .set_column((columns.len() == 1).then(|| columns[0]));
+        self.analysis.set_smith(settings.display.is_smith());
         self.settings = settings;
     }
 
@@ -407,6 +409,39 @@ impl Workspace {
             })
     }
 
+    /// Explicit C=M acquisition edit. Keep the span unless a mode boundary
+    /// requires a smaller symmetric sweep around the marker (section 8.3).
+    pub fn center_on_marker(&mut self, frequency: f64) -> kcsdi_core::Result<()> {
+        let invalid = || {
+            kcsdi_core::Error::InvalidParameter(
+                "marker center cannot form a valid sweep for the visible traces".into(),
+            )
+        };
+        let limits = self.visible_range();
+        let center = frequency_hz(frequency, "marker center")? as f64;
+        let start = frequency_hz(self.range.start_hz, "start")?;
+        let stop = frequency_hz(self.range.stop_hz, "stop")?;
+        if !limits.contains_sweep(start, stop) {
+            return Err(invalid());
+        }
+        let half_span = (center - limits.min_hz as f64).min(limits.max_hz as f64 - center);
+        if half_span < limits.min_span_hz as f64 / 2.0 {
+            return Err(invalid());
+        }
+        let span = (stop - start) as f64;
+        let span = span.min(half_span * 2.0);
+        let start = (center - span / 2.0).ceil() as u64;
+        let stop = (center + span / 2.0).ceil() as u64;
+        if !limits.contains_sweep(start, stop) {
+            return Err(invalid());
+        }
+        self.range = SweepRange::new(start as f64, stop as f64, self.range.points);
+        self.x_view.x_min = self.range.start_hz;
+        self.x_view.x_max = self.range.stop_hz;
+        self.ensure_log_x_view();
+        Ok(())
+    }
+
     pub fn clear_previews(&mut self) {
         for trace in &mut self.traces {
             trace.preview = None;
@@ -461,6 +496,63 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_center_keeps_span_and_y_scale_and_shrinks_only_at_limits() {
+        let mut workspace = Workspace {
+            range: SweepRange::new(100e6, 500e6, 201),
+            ..Default::default()
+        };
+        let view = workspace.traces[0].view;
+        workspace.center_on_marker(600e6).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(400e6, 800e6, 201));
+        assert_eq!(workspace.x_view.x_min, 400e6);
+        assert_eq!(workspace.x_view.x_max, 800e6);
+        assert_eq!(workspace.traces[0].view, view);
+
+        workspace.center_on_marker(100e6).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(0.0, 200e6, 201));
+        workspace.center_on_marker(6_999_999_500.0).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(6_999_999_000.0, 7e9, 201));
+        workspace.plan().unwrap();
+    }
+
+    #[test]
+    fn marker_center_intersects_visible_mode_limits_and_rejects_invalid_edits() {
+        let mut workspace = Workspace::default();
+        workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::ReturnLoss),
+                ..Default::default()
+            })
+            .unwrap();
+        workspace.center_on_marker(5500.0).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(5000.0, 6000.0, 201));
+        workspace.plan().unwrap();
+        for center in [0.0, 5499.0, 7e9, -1.0, f64::NAN, f64::INFINITY] {
+            let old = workspace.range;
+            assert!(workspace.center_on_marker(center).is_err());
+            assert_eq!(workspace.range, old);
+        }
+        workspace.range.stop_hz = 4000.0;
+        assert!(workspace.center_on_marker(1e6).is_err());
+        assert_eq!(workspace.range.stop_hz, 4000.0);
+    }
+
+    #[test]
+    fn marker_center_preserves_odd_integer_span_and_valid_log_view() {
+        let mut workspace = Workspace {
+            range: SweepRange::new(10_000.0, 11_001.0, 3),
+            ..Default::default()
+        };
+        workspace.center_on_marker(20_000.0).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(19_500.0, 20_501.0, 3));
+        workspace.log_x = true;
+        workspace.center_on_marker(500.0).unwrap();
+        assert_eq!(workspace.range, SweepRange::new(0.0, 1000.0, 3));
+        assert!(workspace.x_view.x_min > 0.0);
+        assert_eq!(workspace.x_view.x_max, 1000.0);
+    }
 
     #[test]
     fn add_editors_choose_distinct_colors_without_changing_existing_styles() {

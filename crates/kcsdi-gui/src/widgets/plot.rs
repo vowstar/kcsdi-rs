@@ -25,12 +25,91 @@ pub struct Series<'a> {
 }
 
 /// A user marker remains attached to measured frequency when the view changes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Marker {
     pub id: u32,
     pub frequency_hz: f64,
     pub selected: bool,
     pub reference: bool,
+    #[serde(default)]
+    pub auto_peak: bool,
+}
+
+pub(super) struct MarkerBadge {
+    pub id: u32,
+    pub text: String,
+    pub rect: Rect,
+}
+
+/// Shared, bounded caption placement for Cartesian and Smith markers.
+pub(super) struct MarkerLabelLayout {
+    bounds: Rect,
+    occupied: Vec<Rect>,
+}
+
+impl MarkerLabelLayout {
+    pub fn new(bounds: Rect, occupied: Vec<Rect>) -> Self {
+        Self { bounds, occupied }
+    }
+
+    pub fn place(
+        &mut self,
+        size: egui::Vec2,
+        positions: impl IntoIterator<Item = Pos2>,
+    ) -> Option<Rect> {
+        if size.x > self.bounds.width() || size.y > self.bounds.height() {
+            return None;
+        }
+        for pos in positions {
+            let rect = Rect::from_min_size(
+                Pos2::new(
+                    pos.x
+                        .clamp(self.bounds.left(), self.bounds.right() - size.x),
+                    pos.y,
+                ),
+                size,
+            );
+            if self.bounds.contains_rect(rect)
+                && self
+                    .occupied
+                    .iter()
+                    .all(|other| !other.expand(2.0).intersects(rect))
+            {
+                self.occupied.push(rect);
+                return Some(rect);
+            }
+        }
+        None
+    }
+}
+
+pub(super) fn marker_text(trace: Option<u64>, marker: &Marker) -> String {
+    format!(
+        "{}M{}{}",
+        trace.map_or_else(String::new, |id| format!("T{id} ")),
+        marker.id,
+        if marker.reference { "R" } else { "" }
+    )
+}
+
+pub(super) fn marker_color(painter: &egui::Painter, marker: &Marker) -> Color32 {
+    if marker.selected {
+        painter.ctx().global_style().visuals.selection.stroke.color
+    } else {
+        chart_color(painter.ctx(), TEXT_COLOR)
+    }
+}
+
+pub(super) fn draw_marker_badge(painter: &egui::Painter, badge: &MarkerBadge, marker: &Marker) {
+    painter.rect_filled(badge.rect, 2.0, chart_color(painter.ctx(), BG_COLOR));
+    painter.text(
+        badge.rect.center(),
+        Align2::CENTER_CENTER,
+        &badge.text,
+        FontId::monospace(12.0),
+        marker_color(painter, marker),
+    );
 }
 
 /// What to draw, prepared by the caller each frame.
@@ -530,31 +609,32 @@ pub fn show_multi(
     sync_layer_x(layers, active);
     let legend = multi_legend_rect(ui.painter(), layers, plot_rect);
     let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
+    let badges = multi_marker_badges(ui.painter(), layers, active, plot_rect, legend);
     let mut marker_input = false;
-    if !over_legend {
-        // Last hit target wins at overlapping marker positions.
-        for index in (0..layers.len())
-            .filter(|&index| index != active)
-            .chain(std::iter::once(active))
-        {
-            let layer = &mut layers[index];
-            marker_input |= ui
-                .push_id(("cartesian_layer", layer.id), |ui| {
-                    interact_markers(
-                        ui,
-                        &Mapping::new(layer.view, layer.options.log_x, plot_rect),
-                        &layer.options,
-                        layer.markers,
-                    )
-                })
-                .inner;
-        }
+    // Captions avoid the legend. Keep an existing drag alive when it crosses it.
+    for index in (0..layers.len())
+        .filter(|&index| index != active)
+        .chain(std::iter::once(active))
+    {
+        let layer = &mut layers[index];
+        marker_input |= ui
+            .push_id(("cartesian_layer", layer.id), |ui| {
+                interact_markers(
+                    ui,
+                    &Mapping::new(layer.view, layer.options.log_x, plot_rect),
+                    &layer.options,
+                    layer.markers,
+                    &badges[index],
+                )
+            })
+            .inner;
     }
     if !over_legend && !marker_input {
         let layer = &mut layers[active];
         locks[active].1 = handle_input(ui, layer.view, &layer.options, plot_rect, &response);
     }
     sync_layer_x(layers, active);
+    let badges = multi_marker_badges(ui.painter(), layers, active, plot_rect, legend);
     let layer = &layers[active];
     let mapping = Mapping::new(layer.view, layer.options.log_x, plot_rect);
     let caption = format!("{} {}", layer.label, layer.options.y_label);
@@ -583,8 +663,18 @@ pub fn show_multi(
                 .any(|&(x, y)| usable_x(layer.options.log_x, x) && y.is_finite());
             draw_series_width(&clipped, &mapping, series, layer.line_width);
         }
+    }
+    for layer in layers.iter() {
         if layer.options.visible_series().any(|s| !s.points.is_empty()) {
-            draw_markers_label(&clipped, &mapping, layer.markers, &layer.label);
+            let mapping = Mapping::new(layer.view, layer.options.log_x, plot_rect);
+            draw_markers(&clipped, &mapping, layer.markers, &[]);
+        }
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        for badge in &badges[index] {
+            if let Some(marker) = layer.markers.iter().find(|marker| marker.id == badge.id) {
+                draw_marker_badge(&clipped, badge, marker);
+            }
         }
     }
     if !has_data {
@@ -638,6 +728,104 @@ fn sync_layer_x(layers: &mut [CartesianLayer<'_>], active: usize) {
     }
 }
 
+fn multi_marker_badges(
+    painter: &egui::Painter,
+    layers: &[CartesianLayer<'_>],
+    active: usize,
+    rect: Rect,
+    legend: Rect,
+) -> Vec<Vec<MarkerBadge>> {
+    let layer = &layers[active];
+    let caption = format!("{} {}", layer.label, layer.options.y_label);
+    let (_, caption) = y_tick_labels(painter, layer.view, caption.trim());
+    let heading = painter.layout_no_wrap(
+        caption,
+        FontId::monospace(LABEL_FONT_SIZE),
+        chart_color(painter.ctx(), TEXT_COLOR),
+    );
+    let mut layout = MarkerLabelLayout::new(
+        rect,
+        vec![
+            legend,
+            Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 2.0), heading.size()),
+        ],
+    );
+    let mut badges: Vec<Vec<MarkerBadge>> = (0..layers.len()).map(|_| Vec::new()).collect();
+    // Allocate readable captions to the selected trace first, then the others.
+    for index in std::iter::once(active).chain((0..layers.len()).filter(|&i| i != active)) {
+        let layer = &layers[index];
+        if layer.options.visible_series().any(|series| {
+            series
+                .points
+                .iter()
+                .any(|&(x, y)| usable_x(layer.options.log_x, x) && y.is_finite())
+        }) {
+            badges[index] = cartesian_marker_badges(
+                painter,
+                &Mapping::new(layer.view, layer.options.log_x, rect),
+                layer.markers,
+                Some(layer.id),
+                &mut layout,
+            );
+        }
+    }
+    badges
+}
+
+fn cartesian_marker_badges(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    markers: &[Marker],
+    trace: Option<u64>,
+    layout: &mut MarkerLabelLayout,
+) -> Vec<MarkerBadge> {
+    let mut badges = Vec::new();
+    for marker in markers
+        .iter()
+        .filter(|m| m.selected)
+        .chain(markers.iter().filter(|m| !m.selected))
+    {
+        if !usable_x(mapping.log_x, marker.frequency_hz) {
+            continue;
+        }
+        let x = mapping.to_screen(marker.frequency_hz, mapping.y_min).x;
+        if x < mapping.rect.left() || x > mapping.rect.right() {
+            continue;
+        }
+        let text = marker_text(trace, marker);
+        let size = painter
+            .layout_no_wrap(
+                text.clone(),
+                FontId::monospace(12.0),
+                marker_color(painter, marker),
+            )
+            .size()
+            + egui::vec2(6.0, 4.0);
+        // Prefer the top. Bottom lanes keep markers accessible below tall legends.
+        let positions = [false, true].into_iter().flat_map(|bottom| {
+            (0..6).map(move |row| {
+                let offset = 3.0 + row as f32 * (size.y + 3.0);
+                Pos2::new(
+                    x - size.x / 2.0,
+                    if bottom {
+                        mapping.rect.bottom() - size.y - offset
+                    } else {
+                        mapping.rect.top() + offset
+                    },
+                )
+            })
+        });
+        if let Some(rect) = layout.place(size, positions) {
+            badges.push(MarkerBadge {
+                id: marker.id,
+                text,
+                rect,
+            });
+        }
+    }
+    badges
+}
+
 #[cfg(test)]
 pub fn show_with_markers(
     ui: &mut egui::Ui,
@@ -661,11 +849,19 @@ pub fn show_with_markers(
     ensure_x_view(view, opts);
     let legend = legend_rect(ui.painter(), opts, plot_rect);
     let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
+    let badges = cartesian_marker_badges(
+        ui.painter(),
+        &Mapping::new(view, opts.log_x, plot_rect),
+        markers,
+        None,
+        &mut MarkerLabelLayout::new(plot_rect, vec![legend]),
+    );
     let marker_input = interact_markers(
         ui,
         &Mapping::new(view, opts.log_x, plot_rect),
         opts,
         markers,
+        &badges,
     );
     let lock = if over_legend || marker_input {
         ViewLock::Unchanged
@@ -709,7 +905,14 @@ pub fn show_with_markers(
         .visible_series()
         .any(|series| !series.points.is_empty())
     {
-        draw_markers(ui.painter(), &mapping, markers);
+        let badges = cartesian_marker_badges(
+            ui.painter(),
+            &mapping,
+            markers,
+            None,
+            &mut MarkerLabelLayout::new(plot_rect, vec![legend]),
+        );
+        draw_markers(ui.painter(), &mapping, markers, &badges);
     }
     lock
 }
@@ -719,6 +922,7 @@ fn interact_markers(
     mapping: &Mapping,
     opts: &PlotOptions,
     markers: &mut [Marker],
+    badges: &[MarkerBadge],
 ) -> bool {
     if !opts
         .visible_series()
@@ -736,10 +940,10 @@ fn interact_markers(
         if x < mapping.rect.left() || x > mapping.rect.right() {
             continue;
         }
-        let rect = Rect::from_center_size(
-            Pos2::new(x, mapping.rect.top() + 12.0),
-            egui::vec2(30.0, 24.0),
-        );
+        let Some(badge) = badges.iter().find(|badge| badge.id == marker.id) else {
+            continue;
+        };
+        let rect = badge.rect.intersect(mapping.rect).intersect(ui.clip_rect());
         let response = ui
             .interact(
                 rect,
@@ -750,6 +954,9 @@ fn interact_markers(
         busy |= response.hovered() || response.dragged();
         if response.clicked() || response.dragged() {
             selected = Some(marker.id);
+        }
+        if response.drag_started() || response.dragged() {
+            marker.auto_peak = false;
         }
         if response.dragged()
             && let Some(pos) = response.interact_pointer_pos()
@@ -774,42 +981,34 @@ fn interact_markers(
     busy
 }
 
-#[cfg(test)]
-fn draw_markers(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker]) {
-    draw_markers_label(painter, mapping, markers, "");
-}
-
-fn draw_markers_label(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker], label: &str) {
+fn draw_markers(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    markers: &[Marker],
+    badges: &[MarkerBadge],
+) {
     let painter = painter.with_clip_rect(mapping.rect);
     for marker in markers {
         if !usable_x(mapping.log_x, marker.frequency_hz) {
             continue;
         }
         let x = mapping.to_screen(marker.frequency_hz, mapping.y_min).x;
-        let color = if marker.selected {
-            painter.ctx().global_style().visuals.selection.stroke.color
-        } else {
-            chart_color(painter.ctx(), TEXT_COLOR)
-        };
+        if x < mapping.rect.left() || x > mapping.rect.right() {
+            continue;
+        }
+        let color = marker_color(&painter, marker);
         painter.line_segment(
             [
-                Pos2::new(x, mapping.rect.top() + 24.0),
+                Pos2::new(x, mapping.rect.top()),
                 Pos2::new(x, mapping.rect.bottom()),
             ],
             Stroke::new(0.7, color),
         );
-        painter.text(
-            Pos2::new(x, mapping.rect.top() + 3.0),
-            Align2::CENTER_TOP,
-            format!(
-                "{label}{}M{}{}",
-                if label.is_empty() { "" } else { " " },
-                marker.id,
-                if marker.reference { "R" } else { "" }
-            ),
-            FontId::monospace(12.0),
-            color,
-        );
+    }
+    for badge in badges {
+        if let Some(marker) = markers.iter().find(|marker| marker.id == badge.id) {
+            draw_marker_badge(&painter, badge, marker);
+        }
     }
 }
 
@@ -1539,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_marker_numbers_prefer_the_selected_trace() {
+    fn coincident_markers_have_distinct_captions_and_hit_targets() {
         let ctx = egui::Context::default();
         let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
         let mut second = first;
@@ -1549,6 +1748,7 @@ mod tests {
                 frequency_hz,
                 selected: false,
                 reference: false,
+                auto_peak: false,
             }]
         };
         let mut first_markers = marker(1.5e6);
@@ -1559,9 +1759,210 @@ mod tests {
         ];
         layers[0].markers = &mut first_markers;
         layers[1].markers = &mut second_markers;
+        layers[0].label = "T2 S21 Group delay".into();
+        let (_, output) = multi_frame(&ctx, &mut layers, Some(2), vec![], 0.0);
+        let captions: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) if ["T2 M1", "T4 M1"].contains(&text.galley.text()) => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(captions.len(), 2);
+        assert!(!captions[0].intersects(captions[1]));
+        output.drop_without_applying_deltas();
         click_multi_text(&ctx, &mut layers, "T2 M1", 0.0);
         assert!(layers[0].markers[0].selected);
         assert!(!layers[1].markers[0].selected);
+        layers[0].markers[0].selected = false;
+        click_multi_text(&ctx, &mut layers, "T4 M1", 1.0);
+        assert!(!layers[0].markers[0].selected);
+        assert!(layers[1].markers[0].selected);
+    }
+
+    #[test]
+    fn marker_defaults_restore_partial_and_older_definitions() {
+        let marker: Marker = toml::from_str("id = 3\nfrequency_hz = 25000000.0\n").unwrap();
+        assert_eq!(marker.id, 3);
+        assert_eq!(marker.frequency_hz, 25e6);
+        assert!(!marker.selected && !marker.reference && !marker.auto_peak);
+        let older: Marker = toml::from_str(
+            "id = 1\nfrequency_hz = 1000000.0\nselected = true\nreference = false\n",
+        )
+        .unwrap();
+        assert!(older.selected);
+        assert!(!older.auto_peak);
+        let saved = toml::to_string(&Marker {
+            auto_peak: true,
+            ..older
+        })
+        .unwrap();
+        assert!(toml::from_str::<Marker>(&saved).unwrap().auto_peak);
+    }
+
+    #[test]
+    fn caption_layout_clips_edges_and_omits_exhausted_space() {
+        let bounds = Rect::from_min_size(Pos2::new(20.0, 30.0), egui::vec2(100.0, 60.0));
+        let mut layout = MarkerLabelLayout::new(bounds, vec![]);
+        let size = egui::vec2(50.0, 20.0);
+        let first = layout.place(size, [Pos2::new(-100.0, 30.0)]).unwrap();
+        let second = layout.place(size, [Pos2::new(1000.0, 60.0)]).unwrap();
+        assert!(bounds.contains_rect(first) && bounds.contains_rect(second));
+        assert!(!first.intersects(second));
+        assert!(layout.place(size, [first.min, second.min]).is_none());
+        assert!(layout.place(size, [Pos2::new(20.0, 0.0)]).is_none());
+    }
+
+    #[test]
+    fn marker_caption_uses_free_space_below_a_tall_legend() {
+        let ctx = egui::Context::default();
+        let mut view = PlotView::new(1e6, 3e6, 0.0, 100.0);
+        let mut markers = [Marker {
+            id: 1,
+            frequency_hz: 3e6,
+            selected: true,
+            ..Default::default()
+        }];
+        let mut layers = [test_layer(2, &mut view, &[(1e6, 10.0), (3e6, 20.0)])];
+        layers[0].markers = &mut markers;
+        layers[0].options.series = vec![layers[0].options.series[0].clone(); 14];
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let rect = Rect::from_min_max(
+                    Pos2::new(MARGIN_LEFT, MARGIN_TOP),
+                    Pos2::new(600.0 - MARGIN_RIGHT, 400.0 - MARGIN_BOTTOM),
+                );
+                let legend = multi_legend_rect(ui.painter(), &layers, rect);
+                let badges = multi_marker_badges(ui.painter(), &layers, 0, rect, legend);
+                assert_eq!(badges[0].len(), 1);
+                assert!(rect.contains_rect(badges[0][0].rect));
+                assert!(badges[0][0].rect.top() > legend.bottom());
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn same_frequency_drag_disables_auto_peak_even_when_crossing_the_legend() {
+        for legend_rows in [1, 14] {
+            let frequency = if legend_rows == 1 { 2e6 } else { 3e6 };
+            let ctx = egui::Context::default();
+            let original = PlotView::new(1e6, 3e6, 0.0, 100.0);
+            let mut view = original;
+            let mut markers = [Marker {
+                id: 1,
+                frequency_hz: frequency,
+                auto_peak: true,
+                ..Default::default()
+            }];
+            let mut layers = [test_layer(
+                2,
+                &mut view,
+                &[(1e6, 10.0), (2e6, 20.0), (3e6, 30.0)],
+            )];
+            layers[0].markers = &mut markers;
+            layers[0].options.series = vec![layers[0].options.series[0].clone(); legend_rows];
+            let (_, output) = multi_frame(&ctx, &mut layers, Some(2), vec![], 0.0);
+            let from = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == "T2 M1" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            output.drop_without_applying_deltas();
+            let to = if legend_rows == 1 {
+                from + egui::vec2(0.0, 12.0)
+            } else {
+                Pos2::new(from.x, 60.0)
+            };
+            for (index, events) in [
+                vec![egui::Event::PointerMoved(from)],
+                vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (locks, output) = multi_frame(
+                    &ctx,
+                    &mut layers,
+                    Some(2),
+                    events,
+                    (index + 1) as f64 * 0.02,
+                );
+                assert_eq!(locks[0].1, ViewLock::Unchanged);
+                output.drop_without_applying_deltas();
+            }
+            assert_eq!(layers[0].markers[0].frequency_hz, frequency);
+            assert!(!layers[0].markers[0].auto_peak);
+            assert_eq!(*layers[0].view, original);
+        }
+    }
+
+    #[test]
+    fn hidden_offscreen_and_clipped_marker_regions_do_not_take_input() {
+        for (visible, frequency, pos) in [
+            (false, 1e6, Pos2::new(60.0, 20.0)),
+            (true, 0.5e6, Pos2::new(60.0, 20.0)),
+            (true, 1e6, Pos2::new(MARGIN_LEFT - 4.0, 20.0)),
+        ] {
+            let ctx = egui::Context::default();
+            let mut view = PlotView::new(1e6, 3e6, 0.0, 100.0);
+            let mut markers = [Marker {
+                id: 1,
+                frequency_hz: frequency,
+                ..Default::default()
+            }];
+            let mut layers = [test_layer(2, &mut view, &[(1e6, 10.0), (3e6, 20.0)])];
+            layers[0].markers = &mut markers;
+            layers[0].options.series[0].visible = visible;
+            for (index, events) in [
+                vec![],
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                multi_frame(&ctx, &mut layers, Some(2), events, index as f64 * 0.02)
+                    .1
+                    .drop_without_applying_deltas();
+            }
+            assert!(!layers[0].markers[0].selected);
+        }
     }
 
     #[test]
@@ -2289,6 +2690,7 @@ mod tests {
             frequency_hz: 3e6,
             selected: true,
             reference: false,
+            auto_peak: true,
         }];
         let from = Pos2::new(320.0, 20.0);
         let to = Pos2::new(540.0, 20.0);
@@ -2326,6 +2728,7 @@ mod tests {
             .drop_without_applying_deltas();
         }
         assert_eq!(markers[0].frequency_hz, 5e6);
+        assert!(!markers[0].auto_peak);
         assert_eq!(view, original);
     }
 

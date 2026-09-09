@@ -23,16 +23,18 @@ use kcsdi_core::commands::{Cal, Lo};
 use kcsdi_core::model::Rbw;
 
 use crate::acquisition::{MAX_TRACES, TraceId};
+use crate::analysis_tools::AnalysisConfig;
 use crate::desktop::{DesktopConfig, DeviceProfile};
 use crate::i18n::LanguagePreference;
 use crate::state::{AppMode, AppState, S11Display, S21Display};
+use crate::widgets::{plot::PlotView, smith::SmithView};
 use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Workspace};
 
 /// Environment variable that overrides the config file path.
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 
 fn legacy_config_version() -> u32 {
     1
@@ -68,7 +70,7 @@ pub struct LegacySweeps {
     pub s11: S11,
 }
 
-/// Trace definitions only. Measurements are never written to user settings.
+/// Workspace definitions only. Measurements are never written to user settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceConfig {
@@ -79,6 +81,10 @@ pub struct WorkspaceConfig {
     pub selected: Option<TraceId>,
     pub next_id: u64,
     pub traces: Vec<TraceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_view: Option<XViewConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smith_view: Option<SmithViewConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +100,121 @@ pub struct TraceConfig {
     pub color: [u8; 4],
     pub line_width: f32,
     pub impedance_visible: [bool; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_view: Option<YViewConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct XViewConfig {
+    pub min: f64,
+    pub max: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct YViewConfig {
+    pub min: f64,
+    pub max: f64,
+    pub divisions: usize,
+    pub locked: bool,
+}
+
+impl Default for YViewConfig {
+    fn default() -> Self {
+        Self {
+            min: 0.0,
+            max: 1.0,
+            divisions: 8,
+            locked: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmithViewConfig {
+    pub zoom: f64,
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl Default for SmithViewConfig {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+        }
+    }
+}
+
+fn valid_span(min: f64, max: f64) -> bool {
+    min.is_finite() && max.is_finite() && max > min && (max - min).is_finite()
+}
+
+impl YViewConfig {
+    fn valid(self) -> bool {
+        valid_span(self.min, self.max)
+            && (self.min + self.max).is_finite()
+            && (self.max - self.min) / self.divisions.clamp(2, 30) as f64 > 0.0
+    }
+}
+
+impl XViewConfig {
+    fn valid(self, log_x: bool) -> bool {
+        valid_span(self.min, self.max)
+            && (!log_x || (self.min > 0.0 && self.max.log10() > self.min.log10()))
+    }
+
+    fn for_range(range: &SweepRange, log_x: bool) -> Self {
+        let mut view = Self {
+            min: range.start_hz,
+            max: range.stop_hz,
+        };
+        if log_x && valid_span(view.min, view.max) && view.min <= 0.0 && view.max > 0.0 {
+            let step = (view.max - view.min) / f64::from(range.points.saturating_sub(1).max(1));
+            view.min = if step > 0.0 && step < view.max {
+                step
+            } else {
+                view.max / 10.0
+            };
+        }
+        if view.valid(log_x) {
+            view
+        } else {
+            let range = SweepRange::default();
+            Self {
+                min: range.start_hz,
+                max: range.stop_hz,
+            }
+        }
+    }
+}
+
+impl SmithViewConfig {
+    fn restore(self) -> SmithView {
+        // Leave room for the widget's largest zoom and large pixel viewports.
+        // Pan has no UI bound, but converting the mapped coordinates must not overflow f32.
+        let pan_limit = f64::from(f32::MAX) / (200.0 * 1_000_000.0);
+        let pan = |offset: f64| {
+            if offset.is_finite() && offset.abs() <= pan_limit {
+                offset
+            } else {
+                0.0
+            }
+        };
+        SmithView {
+            zoom: if self.zoom.is_finite() {
+                self.zoom.clamp(0.2, 200.0)
+            } else {
+                1.0
+            },
+            dx: pan(self.dx),
+            dy: pan(self.dy),
+        }
+    }
 }
 
 impl Default for WorkspaceConfig {
@@ -130,7 +251,61 @@ impl TraceConfig {
             color: settings.color.to_array(),
             line_width: settings.line_width,
             impedance_visible: settings.impedance_visible,
+            y_view: None,
+            analysis: None,
         }
+    }
+
+    fn from_trace(trace: &TraceState) -> Self {
+        let mut config = Self::from_settings(trace.id, &trace.settings);
+        let valid_y = YViewConfig {
+            min: trace.view.y_min,
+            max: trace.view.y_max,
+            divisions: trace.view.y_divisions,
+            locked: trace.view_locked,
+        }
+        .valid();
+        let (min, max) = if valid_y {
+            (trace.view.y_min, trace.view.y_max)
+        } else {
+            trace.settings.display.default_y()
+        };
+        config.y_view = Some(YViewConfig {
+            min,
+            max,
+            divisions: trace.view.y_divisions.clamp(2, 30),
+            locked: valid_y && trace.view_locked,
+        });
+        config.analysis = Some(trace.analysis.config());
+        config
+    }
+
+    fn restore(&self, range: &SweepRange, x_view: XViewConfig) -> TraceState {
+        let mut trace = TraceState::new(self.id, self.settings(), range);
+        trace.view.x_min = x_view.min;
+        trace.view.x_max = x_view.max;
+        if let Some(view) = self.y_view {
+            trace.view.y_divisions = view.divisions.clamp(2, 30);
+            if view.valid() {
+                trace.view.y_min = view.min;
+                trace.view.y_max = view.max;
+                trace.view_locked = view.locked;
+                trace.needs_fit = !view.locked;
+            }
+        }
+        if let Some(analysis) = &self.analysis {
+            trace.analysis.restore_config(analysis);
+            let display = trace.settings.display;
+            trace.analysis.set_column(
+                display
+                    .columns()
+                    .first()
+                    .copied()
+                    .filter(|_| display.columns().len() == 1),
+            );
+            trace.analysis.set_smith(display.is_smith());
+        }
+        trace
     }
 
     fn settings(&self) -> TraceSettings {
@@ -167,6 +342,21 @@ impl TraceConfig {
 
 impl WorkspaceConfig {
     fn from_workspace(workspace: &Workspace) -> Self {
+        let x_view = XViewConfig {
+            min: workspace.x_view.x_min,
+            max: workspace.x_view.x_max,
+        };
+        let x_view = if x_view.valid(workspace.log_x) {
+            x_view
+        } else {
+            XViewConfig::for_range(&workspace.range, workspace.log_x)
+        };
+        let smith = SmithViewConfig {
+            zoom: workspace.smith.zoom,
+            dx: workspace.smith.dx,
+            dy: workspace.smith.dy,
+        }
+        .restore();
         Self {
             start_hz: workspace.range.start_hz,
             stop_hz: workspace.range.stop_hz,
@@ -174,10 +364,16 @@ impl WorkspaceConfig {
             log_x: workspace.log_x,
             selected: workspace.selected,
             next_id: workspace.next_id,
+            x_view: Some(x_view),
+            smith_view: Some(SmithViewConfig {
+                zoom: smith.zoom,
+                dx: smith.dx,
+                dy: smith.dy,
+            }),
             traces: workspace
                 .traces
                 .iter()
-                .map(|trace| TraceConfig::from_settings(trace.id, &trace.settings))
+                .map(TraceConfig::from_trace)
                 .collect(),
         }
     }
@@ -186,6 +382,12 @@ impl WorkspaceConfig {
         let mut workspace =
             Workspace::empty(SweepRange::new(self.start_hz, self.stop_hz, self.points));
         workspace.log_x = self.log_x;
+        let x_view = self
+            .x_view
+            .filter(|view| view.valid(self.log_x))
+            .unwrap_or_else(|| XViewConfig::for_range(&workspace.range, self.log_x));
+        workspace.x_view = PlotView::new(x_view.min, x_view.max, 0.0, 1.0);
+        workspace.smith = self.smith_view.unwrap_or_default().restore();
         for trace in &self.traces {
             if workspace.traces.len() == MAX_TRACES {
                 warn!("ignoring workspace definitions beyond the ten-trace limit");
@@ -202,11 +404,9 @@ impl WorkspaceConfig {
                 continue;
             }
             workspace.next_id = workspace.next_id.max(trace.id.0 + 1);
-            workspace.traces.push(TraceState::new(
-                trace.id,
-                trace.settings(),
-                &workspace.range,
-            ));
+            workspace
+                .traces
+                .push(trace.restore(&workspace.range, x_view));
         }
         workspace.next_id = workspace.next_id.max(self.next_id);
         workspace.selected = self
@@ -445,7 +645,7 @@ impl AppConfig {
             AppMode::Spec | AppMode::S21 => spec,
             AppMode::S11 => s11,
         });
-        workspace
+        WorkspaceConfig::from_workspace(&workspace).restore()
     }
 }
 
@@ -509,6 +709,374 @@ pub fn save(cfg: &AppConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis_tools::{MarkerTarget, OverlayVisibilityConfig};
+    use crate::widgets::plot::Marker;
+
+    #[test]
+    fn version_three_keeps_workspace_identity_and_uses_its_range_for_missing_views() {
+        let config: AppConfig = toml::from_str(
+            r#"
+version = 3
+[workspace]
+start_hz = 2000000.0
+stop_hz = 9000000.0
+points = 101
+selected = 55
+next_id = 88
+[[workspace.traces]]
+id = 55
+display = "s21_delay"
+visible = false
+"#,
+        )
+        .unwrap();
+        assert!(config.workspace.x_view.is_none());
+        assert!(config.workspace.traces[0].y_view.is_none());
+        assert!(config.workspace.traces[0].analysis.is_none());
+        let mut state = AppState::default();
+        config.apply_to(&mut state);
+        assert_eq!(state.workspace.traces.len(), 1);
+        assert_eq!(state.workspace.selected, Some(TraceId(55)));
+        assert_eq!(state.workspace.next_id, 88);
+        assert!(!state.workspace.traces[0].settings.visible);
+        assert_eq!(
+            (state.workspace.x_view.x_min, state.workspace.x_view.x_max),
+            (2e6, 9e6)
+        );
+        let trace = &state.workspace.traces[0];
+        assert_eq!(
+            (trace.view.y_min, trace.view.y_max),
+            S21Display::Delay.default_y()
+        );
+        assert!(!trace.view_locked);
+        assert!(trace.needs_fit);
+        assert_eq!(
+            state.connection,
+            crate::state::ConnectionState::Disconnected
+        );
+        assert_eq!(state.sweep, crate::state::SweepState::Idle);
+        assert!(state.legacy_sweeps.is_none());
+        assert!(state.desktop.settings.profiles.is_empty());
+        let saved = AppConfig::from_state(&state);
+        assert_eq!(saved.version, 4);
+        assert!(saved.workspace.x_view.is_some());
+        assert!(saved.workspace.traces[0].analysis.is_some());
+    }
+
+    #[test]
+    fn analysis_and_views_round_trip_without_acquired_rows_or_running_state() {
+        use crate::acquisition::CompletedSweep;
+        use kcsdi_core::data::{SweepData, SweepPoint};
+        use kcsdi_core::protocol::StreamMode;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let mut state = AppState::default();
+        state.workspace.range = SweepRange::new(1e6, 2e6, 3);
+        state.workspace.x_view = PlotView::new(1.1e6, 1.9e6, 0.0, 1.0);
+        state.workspace.log_x = true;
+        state.workspace.smith = SmithView {
+            zoom: 2.5,
+            dx: -0.12,
+            dy: 0.27,
+        };
+        let trace = &mut state.workspace.traces[0];
+        trace.update_settings(TraceSettings {
+            display: TraceDisplay::S21(S21Display::Delay),
+            ..Default::default()
+        });
+        trace.view.y_min = -7.123456e-12;
+        trace.view.y_max = 8.234567e-12;
+        trace.view.y_divisions = 6;
+        trace.view_locked = true;
+        trace.analysis.restore_config(&AnalysisConfig {
+            markers: vec![
+                Marker {
+                    id: 7,
+                    frequency_hz: 1e6,
+                    selected: false,
+                    reference: true,
+                    auto_peak: false,
+                },
+                Marker {
+                    id: 9,
+                    frequency_hz: 2e6,
+                    selected: true,
+                    reference: false,
+                    auto_peak: false,
+                },
+            ],
+            next_id: 15,
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            target: MarkerTarget::Hold,
+            overlay_visibility: vec![OverlayVisibilityConfig {
+                format: "delay".into(),
+                kind: 1,
+                column: 0,
+                visible: false,
+            }],
+            ..Default::default()
+        });
+        let snapshot = CompletedSweep {
+            settings: trace.settings.acquisition(&state.workspace.range).unwrap(),
+            session_id: 812,
+            completed_at: SystemTime::UNIX_EPOCH,
+            data: SweepData {
+                mode: StreamMode::S21,
+                format: "delay".into(),
+                points: (0..3)
+                    .map(|index| SweepPoint {
+                        freq_hz: 1e6 + f64::from(index) * 0.5e6,
+                        values: vec![f64::from(index) * 1e-12],
+                    })
+                    .collect(),
+            },
+        };
+        trace.analysis.observe(&snapshot);
+        assert!(trace.analysis.held_trace().is_some());
+        trace.completed = Some(Arc::new(snapshot.clone()));
+        trace.last_completed_cycle = Some(91);
+        let expected_analysis = trace.analysis.config();
+        let expected_y = trace.view;
+        state.sweep = crate::state::SweepState::Running;
+        state.active_plan = state.workspace.plan().ok();
+        state.session_id = 812;
+        state.request_id = 51;
+        let before = AppConfig::from_state(&state);
+        let encoded = toml::to_string_pretty(&before).unwrap();
+        for runtime_field in [
+            "session_id",
+            "request_id",
+            "completed",
+            "values",
+            "held =",
+            "maxima",
+            "minima",
+            "active_plan",
+            "running",
+            "preview",
+        ] {
+            assert!(
+                !encoded.contains(runtime_field),
+                "unexpected runtime field: {runtime_field}"
+            );
+        }
+        let loaded: AppConfig = toml::from_str(&encoded).unwrap();
+        let mut restored = AppState::default();
+        loaded.apply_to(&mut restored);
+        assert_eq!(AppConfig::from_state(&restored), before);
+        assert_eq!(restored.workspace.x_view, state.workspace.x_view);
+        assert_eq!(restored.workspace.smith, state.workspace.smith);
+        assert_eq!(
+            restored.connection,
+            crate::state::ConnectionState::Disconnected
+        );
+        assert_eq!(restored.sweep, crate::state::SweepState::Idle);
+        assert!(restored.active_plan.is_none());
+        assert_eq!((restored.session_id, restored.request_id), (0, 0));
+        let trace = &mut restored.workspace.traces[0];
+        assert_eq!(
+            (trace.view.y_min, trace.view.y_max, trace.view.y_divisions),
+            (expected_y.y_min, expected_y.y_max, expected_y.y_divisions)
+        );
+        assert!(trace.view_locked);
+        assert!(!trace.needs_fit);
+        assert!(trace.completed.is_none());
+        assert!(trace.preview.is_none());
+        assert!(trace.last_completed_cycle.is_none());
+        assert_eq!(trace.analysis.config(), expected_analysis);
+        assert!(trace.analysis.held_trace().is_none());
+        assert!(trace.analysis.marker_trace().is_none());
+        assert!(trace.analysis.overlay_series(&[0]).is_empty());
+        let mut fresh = snapshot;
+        fresh.session_id = 1;
+        fresh.data.points[0].values[0] = 9.876543e-12;
+        trace.analysis.observe(&fresh);
+        assert_eq!(
+            trace.analysis.held_trace().unwrap().points[0].values[0],
+            9.876543e-12
+        );
+        assert_eq!(
+            (trace.view.y_min, trace.view.y_max),
+            (expected_y.y_min, expected_y.y_max)
+        );
+    }
+
+    #[test]
+    fn invalid_views_fall_back_without_rewriting_invalid_acquisition_fields() {
+        for (min, max) in [
+            (f64::NAN, 1.0),
+            (0.0, f64::INFINITY),
+            (3.0, 3.0),
+            (2.0, 1.0),
+            (-f64::MAX, f64::MAX),
+        ] {
+            let config = WorkspaceConfig {
+                start_hz: -10.0,
+                stop_hz: -20.0,
+                x_view: Some(XViewConfig { min, max }),
+                traces: vec![TraceConfig {
+                    display: "s21_delay".into(),
+                    y_view: Some(YViewConfig {
+                        min,
+                        max,
+                        divisions: 0,
+                        locked: true,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let restored = config.restore();
+            assert_eq!(
+                (restored.range.start_hz, restored.range.stop_hz),
+                (-10.0, -20.0)
+            );
+            assert!(restored.plan().is_err());
+            assert!(valid_span(restored.x_view.x_min, restored.x_view.x_max));
+            let trace = &restored.traces[0];
+            assert_eq!(
+                (trace.view.y_min, trace.view.y_max),
+                S21Display::Delay.default_y()
+            );
+            assert_eq!(trace.view.y_divisions, 2);
+            assert!(!trace.view_locked);
+            assert!(trace.needs_fit);
+        }
+    }
+
+    #[test]
+    fn tiny_delay_views_and_unlocked_views_keep_their_fit_policy() {
+        for locked in [false, true] {
+            let view = YViewConfig {
+                min: -3e-18,
+                max: 5e-18,
+                divisions: usize::MAX,
+                locked,
+            };
+            let config = WorkspaceConfig {
+                traces: vec![TraceConfig {
+                    display: "s21_delay".into(),
+                    y_view: Some(view),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let restored = config.restore();
+            let trace = &restored.traces[0];
+            assert_eq!((trace.view.y_min, trace.view.y_max), (view.min, view.max));
+            assert_eq!(trace.view.y_divisions, 30);
+            assert_eq!(trace.view_locked, locked);
+            assert_eq!(trace.needs_fit, !locked);
+        }
+    }
+
+    #[test]
+    fn log_view_recovery_keeps_the_configured_full_stop_and_accepts_linear_pan() {
+        let config = WorkspaceConfig {
+            start_hz: 0.0,
+            stop_hz: 1e6,
+            points: 201,
+            log_x: true,
+            x_view: Some(XViewConfig {
+                min: -1e6,
+                max: 0.0,
+            }),
+            ..Default::default()
+        };
+        let restored = config.restore();
+        assert_eq!((restored.x_view.x_min, restored.x_view.x_max), (5e3, 1e6));
+        assert_eq!(restored.range.start_hz, 0.0);
+        let linear = WorkspaceConfig {
+            log_x: false,
+            ..config
+        }
+        .restore();
+        assert_eq!((linear.x_view.x_min, linear.x_view.x_max), (-1e6, 0.0));
+        assert!(
+            !XViewConfig {
+                min: 1e300,
+                max: f64::from_bits(1e300_f64.to_bits() + 1)
+            }
+            .valid(true)
+        );
+    }
+
+    #[test]
+    fn smith_view_normalizes_nonfinite_and_overflowing_coordinates() {
+        assert_eq!(
+            SmithViewConfig {
+                zoom: f64::NAN,
+                dx: f64::INFINITY,
+                dy: 1e300
+            }
+            .restore(),
+            SmithView::default()
+        );
+        assert_eq!(
+            SmithViewConfig {
+                zoom: 0.01,
+                dx: -0.7,
+                dy: 0.3
+            }
+            .restore(),
+            SmithView {
+                zoom: 0.2,
+                dx: -0.7,
+                dy: 0.3
+            }
+        );
+        assert_eq!(
+            SmithViewConfig {
+                zoom: 1000.0,
+                ..Default::default()
+            }
+            .restore()
+            .zoom,
+            200.0
+        );
+    }
+
+    #[test]
+    fn restored_analysis_cannot_override_projection_columns_or_smith_restrictions() {
+        let analysis = AnalysisConfig {
+            markers: vec![Marker {
+                id: 8,
+                frequency_hz: 1e6,
+                selected: true,
+                reference: true,
+                auto_peak: true,
+            }],
+            column: 2,
+            target: MarkerTarget::Maximum,
+            ..Default::default()
+        };
+        let config = WorkspaceConfig {
+            traces: vec![
+                TraceConfig {
+                    id: TraceId(1),
+                    display: "s21_phase".into(),
+                    analysis: Some(analysis.clone()),
+                    ..Default::default()
+                },
+                TraceConfig {
+                    id: TraceId(2),
+                    display: "smith".into(),
+                    analysis: Some(analysis),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let restored = config.restore();
+        assert_eq!(restored.traces[0].analysis.config().column, 1);
+        let smith = restored.traces[1].analysis.config();
+        assert_eq!(smith.target, MarkerTarget::Current);
+        assert!(!smith.markers[0].reference);
+        assert!(!smith.markers[0].auto_peak);
+    }
 
     #[test]
     fn transmission_definitions_round_trip_without_reusing_s11_keys() {

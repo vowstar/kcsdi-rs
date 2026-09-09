@@ -527,6 +527,7 @@ impl KcsdiApp {
             .iter_mut()
             .filter(|trace| trace.settings.visible && !trace.settings.display.is_smith())
         {
+            trace.analysis.set_language(language);
             let complete = trace
                 .completed
                 .clone()
@@ -679,6 +680,10 @@ impl KcsdiApp {
                         .overlays_compatible()
                         .then(|| trace.analysis.held_trace())
                         .flatten(),
+                    trace
+                        .overlays_compatible()
+                        .then(|| trace.analysis.marker_trace())
+                        .flatten(),
                 )
             })
             .collect();
@@ -687,23 +692,26 @@ impl KcsdiApp {
             .iter_mut()
             .filter(|trace| trace.settings.visible && trace.settings.display.is_smith())
             .zip(prepared.iter())
-            .map(|(trace, (data, held))| widgets::smith::SmithLayer {
-                id: trace.id.0,
-                label: format!("T{}", trace.id.0),
-                trace: data.as_ref(),
-                held: held.as_ref(),
-                color: displayed_color(trace.settings.color, ui.visuals().dark_mode),
-                line_width: trace.settings.line_width,
-                markers: if trace
-                    .preview
-                    .as_ref()
-                    .is_some_and(|preview| !preview.data.points.is_empty())
-                {
-                    &mut []
-                } else {
-                    trace.analysis.markers_mut()
+            .map(
+                |(trace, (data, held, marker_data))| widgets::smith::SmithLayer {
+                    id: trace.id.0,
+                    label: format!("T{}", trace.id.0),
+                    trace: data.as_ref(),
+                    held: held.as_ref(),
+                    marker_trace: marker_data.as_ref(),
+                    color: displayed_color(trace.settings.color, ui.visuals().dark_mode),
+                    line_width: trace.settings.line_width,
+                    markers: if trace
+                        .preview
+                        .as_ref()
+                        .is_some_and(|preview| !preview.data.points.is_empty())
+                    {
+                        &mut []
+                    } else {
+                        trace.analysis.markers_mut()
+                    },
                 },
-            })
+            )
             .collect();
         layers
             .sort_by_key(|layer| Some(crate::acquisition::TraceId(layer.id)) == workspace.selected);
@@ -802,6 +810,8 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .show(ui, |ui| {
                     let editable = state.sweep != SweepState::Stopping
                         && state.connection != ConnectionState::Disconnecting;
+                    let sweep_center = state.workspace.range.center_hz;
+                    let mut marker_center = None;
                     if let Some(trace) = state.workspace.selected_mut() {
                         ui.push_id(trace.id.0, |ui| {
                             ui.label(format!(
@@ -827,17 +837,25 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             trace
                                 .analysis
                                 .set_column((columns.len() == 1).then(|| columns[0]));
-                            trace.analysis.controls_for_display(
-                                ui,
-                                language,
-                                complete.as_deref(),
-                                trace.settings.display.is_smith(),
-                            );
+                            ui.add_enabled_ui(editable, |ui| {
+                                marker_center = trace.analysis.controls_for_display(
+                                    ui,
+                                    language,
+                                    complete.as_deref(),
+                                    trace.settings.display.is_smith(),
+                                    sweep_center,
+                                );
+                            });
                             if trace.completed.is_some() && complete.is_none() {
                                 ui.label(language.text(Text::RunForDisplay));
                             }
                             panels::workspace_panel::display_fields(ui, trace, language);
                         });
+                    }
+                    if let Some(frequency) = marker_center
+                        && let Err(error) = state.workspace.center_on_marker(frequency)
+                    {
+                        state.status_message = Some(error.to_string().into());
                     }
                     ui.label(language.text(Text::Display));
                     if widgets::plot::log_x_control(ui, &mut state.workspace.log_x) {
@@ -1174,6 +1192,116 @@ mod tests {
     }
 
     #[test]
+    fn marker_center_replaces_only_active_acquisition_and_rejects_old_deliveries() {
+        let mut app = active_impedance_app();
+        let old_delivery = completion(&app, 0, 2);
+        let old_cancel = app.state.acquisition_cancel.clone();
+        let old_request = app.state.request_id;
+        let old_data = complete_data(&app);
+        app.state.workspace.center_on_marker(3e6).unwrap();
+        app.state.reconcile_plan();
+        assert!(old_cancel.is_cancelled());
+        assert!(app.state.request_id > old_request);
+        assert_eq!(app.state.workspace.range.center_hz, 3e6);
+        assert_eq!(app.state.workspace.range.span_hz, 1e6);
+        app.apply_worker_event(old_delivery);
+        assert_eq!(complete_data(&app), old_data);
+
+        app.state.send(WorkerCommand::StopSweep);
+        app.state.sweep = SweepState::Idle;
+        let request = app.state.request_id;
+        app.state.workspace.center_on_marker(4e6).unwrap();
+        app.state.reconcile_plan();
+        assert_eq!(app.state.request_id, request);
+        assert_eq!(app.state.sweep, SweepState::Idle);
+        assert!(app.state.active_plan.is_none());
+    }
+
+    #[test]
+    fn automatic_marker_tracks_only_accepted_complete_snapshots_without_restarting() {
+        use crate::analysis_tools::AnalysisConfig;
+        use crate::widgets::plot::Marker;
+        let mut app = active_impedance_app();
+        app.state
+            .workspace
+            .selected_mut()
+            .unwrap()
+            .analysis
+            .restore_config(&AnalysisConfig {
+                markers: vec![Marker {
+                    id: 1,
+                    frequency_hz: 1_500_000.0,
+                    selected: true,
+                    auto_peak: true,
+                    ..Default::default()
+                }],
+                column: 1,
+                ..Default::default()
+            });
+        let request = app.state.request_id;
+        let mut partial = prefix(&app, 0, 2, 2);
+        partial.data.points[1].values[1] = 1000.0;
+        app.apply_preview(partial);
+        assert_eq!(
+            app.state.workspace.selected().unwrap().analysis.markers()[0].frequency_hz,
+            1_500_000.0
+        );
+        let mut delivery = completion(&app, 0, 2);
+        if let WorkerEvent::SweepTrace(result) = &mut delivery.event {
+            Arc::make_mut(&mut result.snapshot).data.points[2].values[1] = 100.0;
+        }
+        app.apply_worker_event(delivery);
+        assert_eq!(
+            app.state.workspace.selected().unwrap().analysis.markers()[0].frequency_hz,
+            2_000_000.0
+        );
+        app.apply_worker_event(completion(&app, 0, 1));
+        assert_eq!(
+            app.state.workspace.selected().unwrap().analysis.markers()[0].frequency_hz,
+            2_000_000.0
+        );
+        app.state.reconcile_plan();
+        assert_eq!(app.state.request_id, request);
+    }
+
+    #[test]
+    fn restored_manual_delay_view_survives_first_completed_render() {
+        for locked in [false, true] {
+            let mut original = active_impedance_app();
+            let trace = original.state.workspace.selected_mut().unwrap();
+            let mut settings = trace.settings.clone();
+            settings.display = TraceDisplay::S21(S21Display::Delay);
+            trace.update_settings(settings);
+            trace.view.y_min = -2e-18;
+            trace.view.y_max = 6e-18;
+            trace.view.y_divisions = 16;
+            trace.view_locked = locked;
+            original.state.workspace.x_view.x_min = 1_100_000.0;
+            original.state.workspace.x_view.x_max = 1_900_000.0;
+            let saved = AppConfig::from_state(&original.state);
+            let mut state = AppState::default();
+            saved.apply_to(&mut state);
+            assert_eq!(state.sweep, SweepState::Idle);
+            assert_eq!(state.connection, ConnectionState::Disconnected);
+            state.connection = ConnectionState::Connected;
+            state.session_id = 1;
+            state.send(WorkerCommand::RunWorkspace(state.workspace.plan().unwrap()));
+            let mut app = test_app(state);
+            app.apply_worker_event(completion(&app, 0, 1));
+            plot_frame(&mut app);
+            let view = &app.state.workspace.selected().unwrap().view;
+            assert_eq!((view.x_min, view.x_max), (1_100_000.0, 1_900_000.0));
+            assert_eq!(view.y_divisions, 16);
+            if locked {
+                assert_eq!((view.y_min, view.y_max), (-2e-18, 6e-18));
+            } else {
+                assert!(view.y_min < -5e-9);
+                assert!(view.y_max > -5e-9);
+            }
+        }
+    }
+
+    #[test]
     fn transmission_series_keep_signed_raw_values_and_seconds_in_both_languages() {
         for (display, format, values, expected, unit) in [
             (S21Display::Phase, "ma", vec![0.5, -90.0], -90.0, "deg"),
@@ -1505,6 +1633,7 @@ mod tests {
                             Language::English,
                             trace.completed.as_deref(),
                             display.is_smith(),
+                            300e6,
                         );
                     },
                 )

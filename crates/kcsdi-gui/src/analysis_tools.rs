@@ -6,13 +6,58 @@
 
 use egui::Color32;
 use kcsdi_core::data::SweepData;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::acquisition::CompletedSweep;
 use crate::i18n::{Language, Text};
 use crate::widgets::plot::{Marker, Series, format_value};
 
 const MAX_MARKERS: usize = 10;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerTarget {
+    Hold,
+    Maximum,
+    Minimum,
+    #[default]
+    #[serde(other)]
+    Current,
+}
+
+impl MarkerTarget {
+    fn label(self, language: Language) -> &'static str {
+        language.text(match self {
+            Self::Current => Text::AnalysisCurrent,
+            Self::Hold => Text::AnalysisHold,
+            Self::Maximum => Text::AnalysisMaxHold,
+            Self::Minimum => Text::AnalysisMinHold,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayVisibilityConfig {
+    pub format: String,
+    pub kind: usize,
+    pub column: usize,
+    pub visible: bool,
+}
+
+/// User settings only. Measurement rows and hold buffers are session data.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalysisConfig {
+    pub markers: Vec<Marker>,
+    pub next_id: u32,
+    pub hold: bool,
+    pub max_hold: bool,
+    pub min_hold: bool,
+    pub column: usize,
+    pub target: MarkerTarget,
+    pub overlay_visibility: Vec<OverlayVisibilityConfig>,
+}
 
 #[derive(Default)]
 pub struct AnalysisTools {
@@ -28,6 +73,9 @@ pub struct AnalysisTools {
     trace_id: u64,
     column: usize,
     fixed_column: Option<usize>,
+    restored_column: bool,
+    target: MarkerTarget,
+    smith: bool,
     language: Language,
     overlay_visibility: BTreeMap<(String, usize, usize), bool>,
     rendered_overlays: Vec<(String, usize, usize)>,
@@ -41,7 +89,104 @@ enum Search {
     Right,
 }
 
+enum TargetRows<'a> {
+    Current(&'a SweepData),
+    Stored(&'a [Vec<f64>]),
+}
+
+impl TargetRows<'_> {
+    fn get(&self, index: usize) -> Option<&[f64]> {
+        match self {
+            Self::Current(trace) => Some(&trace.points.get(index)?.values),
+            Self::Stored(rows) => Some(rows.get(index)?.as_slice()),
+        }
+    }
+}
+
 impl AnalysisTools {
+    pub fn config(&self) -> AnalysisConfig {
+        AnalysisConfig {
+            markers: self.markers.clone(),
+            next_id: self.next_id,
+            hold: self.hold,
+            max_hold: self.max_hold,
+            min_hold: self.min_hold,
+            column: self.column,
+            target: self.target,
+            overlay_visibility: self
+                .overlay_visibility
+                .iter()
+                .map(
+                    |((format, kind, column), &visible)| OverlayVisibilityConfig {
+                        format: format.clone(),
+                        kind: *kind,
+                        column: *column,
+                        visible,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    pub fn restore_config(&mut self, config: &AnalysisConfig) {
+        self.latest = None;
+        self.reset_holds();
+        self.rendered_overlays.clear();
+        let mut ids = BTreeSet::new();
+        self.markers = config
+            .markers
+            .iter()
+            .filter(|marker| {
+                marker.id != 0
+                    && marker.frequency_hz.is_finite()
+                    && marker.frequency_hz >= 0.0
+                    && ids.insert(marker.id)
+            })
+            .take(MAX_MARKERS)
+            .cloned()
+            .collect();
+        let selected = self
+            .markers
+            .iter()
+            .position(|marker| marker.selected)
+            .unwrap_or(0);
+        let reference = self.markers.iter().position(|marker| marker.reference);
+        for (index, marker) in self.markers.iter_mut().enumerate() {
+            marker.selected = index == selected;
+            marker.reference = Some(index) == reference;
+        }
+        self.next_id = config.next_id.max(
+            self.markers
+                .iter()
+                .map(|marker| marker.id)
+                .max()
+                .unwrap_or(0),
+        );
+        self.hold = config.hold;
+        self.max_hold = config.max_hold;
+        self.min_hold = config.min_hold;
+        self.column = self.fixed_column.unwrap_or(config.column.min(2));
+        self.restored_column = true;
+        self.target = config.target;
+        self.overlay_visibility = config
+            .overlay_visibility
+            .iter()
+            .filter(|entry| {
+                entry.kind < 3
+                    && entry.column < 3
+                    && ["", "ri", "ma", "z", "loss", "vswr", "delay"]
+                        .contains(&entry.format.as_str())
+            })
+            .map(|entry| {
+                (
+                    (entry.format.clone(), entry.kind, entry.column),
+                    entry.visible,
+                )
+            })
+            .collect();
+        self.set_smith(self.smith);
+    }
+
     /// Called once for each complete measured sweep, never for partial data.
     pub fn observe(&mut self, snapshot: &CompletedSweep) {
         let trace = &snapshot.data;
@@ -51,21 +196,46 @@ impl AnalysisTools {
                 && same_grid(&old.data, trace)
         }) {
             self.reset_holds();
-            self.column = self
-                .fixed_column
-                .unwrap_or_else(|| usize::from(trace.format == "ma"));
+            if self.latest.as_ref().map_or(!self.restored_column, |old| {
+                old.data.mode != trace.mode || old.data.format != trace.format
+            }) {
+                self.column = self
+                    .fixed_column
+                    .unwrap_or_else(|| usize::from(trace.format == "ma"));
+            }
             for marker in &mut self.markers {
                 if let Some(index) = nearest(trace, marker.frequency_hz) {
                     marker.frequency_hz = trace.points[index].freq_hz;
                 }
             }
         }
-        if self.hold && self.held.is_none() {
+        self.refresh_holds(trace);
+        self.latest = Some(snapshot.clone());
+        self.restored_column = false;
+        self.refresh_auto_peaks(trace);
+    }
+
+    fn refresh_auto_peaks(&mut self, trace: &SweepData) {
+        if !self.smith {
+            let peak = self.extremum(trace, Search::Maximum, 0.0);
+            if let Some(frequency) = peak {
+                for marker in &mut self.markers {
+                    if marker.auto_peak {
+                        marker.frequency_hz = frequency;
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_holds(&mut self, trace: &SweepData) {
+        if !self.hold {
+            self.held = None;
+        } else if self.held.is_none() {
             self.held = Some(values(trace));
         }
         update_envelope(&mut self.maxima, self.max_hold, trace, true);
         update_envelope(&mut self.minima, self.min_hold, trace, false);
-        self.latest = Some(snapshot.clone());
     }
 
     pub fn set_trace_id(&mut self, trace_id: u64) {
@@ -76,6 +246,33 @@ impl AnalysisTools {
         self.fixed_column = column;
         if let Some(column) = column {
             self.column = column;
+        }
+    }
+
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
+    }
+
+    pub fn set_smith(&mut self, smith: bool) {
+        self.smith = smith;
+        if smith {
+            if matches!(self.target, MarkerTarget::Maximum | MarkerTarget::Minimum) {
+                self.target = MarkerTarget::Current;
+            }
+            for marker in &mut self.markers {
+                marker.auto_peak = false;
+                marker.reference = false;
+            }
+        }
+    }
+
+    /// Smith marker positions use measured rows from the explicit target.
+    /// Scalar envelopes are not complex measurements.
+    pub fn marker_trace(&self) -> Option<SweepData> {
+        match self.target {
+            MarkerTarget::Current => Some(self.latest.as_ref()?.data.clone()),
+            MarkerTarget::Hold => self.held_trace(),
+            MarkerTarget::Maximum | MarkerTarget::Minimum => None,
         }
     }
 
@@ -169,8 +366,10 @@ impl AnalysisTools {
         language: Language,
         trace: Option<&CompletedSweep>,
         smith: bool,
-    ) {
-        self.language = language;
+        sweep_center_hz: f64,
+    ) -> Option<f64> {
+        self.set_language(language);
+        self.set_smith(smith);
         ui.separator();
         ui.vertical_centered(|ui| {
             ui.strong(language.text(Text::AnalysisHold));
@@ -205,11 +404,20 @@ impl AnalysisTools {
                 }
             }
         });
-        if changed && let Some(trace) = trace {
+        if changed {
             if !self.hold {
                 self.held = None;
             }
-            self.observe(trace);
+            if !self.max_hold {
+                self.maxima = None;
+            }
+            if !self.min_hold {
+                self.minima = None;
+            }
+            if let Some(trace) = trace {
+                self.refresh_holds(&trace.data);
+                self.refresh_auto_peaks(&trace.data);
+            }
         }
         if ui
             .small_button(language.text(Text::AnalysisReset))
@@ -217,7 +425,8 @@ impl AnalysisTools {
         {
             self.reset_holds();
             if let Some(trace) = trace {
-                self.observe(trace);
+                self.refresh_holds(&trace.data);
+                self.refresh_auto_peaks(&trace.data);
             }
         }
         ui.separator();
@@ -227,23 +436,71 @@ impl AnalysisTools {
         let trace = trace
             .map(|snapshot| &snapshot.data)
             .filter(|t| t.points.iter().any(|p| p.freq_hz.is_finite()));
-        self.marker_buttons(ui, language, trace);
+        let previous_target = self.target;
+        self.target_control(ui, language);
+        self.marker_buttons(ui, language, trace, sweep_center_hz);
         let Some(trace) = trace else {
             ui.small(language.text(Text::NoData));
-            return;
+            return None;
         };
-        if self.markers.is_empty() {
-            return;
+        if self.target != previous_target {
+            self.refresh_auto_peaks(trace);
         }
-        self.marker_actions(ui, language, trace);
-        self.marker_readout(ui, language, trace);
+        if self.markers.is_empty() {
+            return None;
+        }
+        let ready = self.target_row(trace, 0).is_some();
+        if !ready {
+            ui.small(language.text(Text::AnalysisTargetUnavailable));
+        }
+        ui.add_enabled_ui(ready, |ui| {
+            if !smith {
+                self.marker_actions(ui, language, trace);
+            }
+            if ui
+                .small_button(language.text(Text::AnalysisCenter))
+                .clicked()
+            {
+                self.move_selected(trace, sweep_center_hz);
+            }
+        });
+        let center = self.marker_readout(ui, language, trace, ready);
         let position = egui::pos2(ui.ctx().content_rect().left() + 316.0, 56.0);
-        egui::Window::new(language.text(Text::AnalysisMarkers))
-            .id(ui.id().with(("marker_table_window", self.trace_id)))
-            .default_pos(position)
-            .default_width(290.0)
-            .resizable(false)
-            .show(ui.ctx(), |ui| self.marker_table(ui, language, trace));
+        egui::Window::new(format!(
+            "T{} {}",
+            self.trace_id,
+            language.text(Text::AnalysisMarkers)
+        ))
+        .id(ui.id().with(("marker_table_window", self.trace_id)))
+        .default_pos(position)
+        .default_width(290.0)
+        .resizable(false)
+        .show(ui.ctx(), |ui| self.marker_table(ui, language, trace));
+        center
+    }
+
+    fn target_control(&mut self, ui: &mut egui::Ui, language: Language) {
+        ui.horizontal(|ui| {
+            ui.label(language.text(Text::AnalysisTarget));
+            egui::ComboBox::from_id_salt("marker_target")
+                .width(ui.available_width())
+                .selected_text(self.target.label(language))
+                .show_ui(ui, |ui| {
+                    for target in [
+                        MarkerTarget::Current,
+                        MarkerTarget::Hold,
+                        MarkerTarget::Maximum,
+                        MarkerTarget::Minimum,
+                    ] {
+                        if self.smith
+                            && matches!(target, MarkerTarget::Maximum | MarkerTarget::Minimum)
+                        {
+                            continue;
+                        }
+                        ui.selectable_value(&mut self.target, target, target.label(language));
+                    }
+                });
+        });
     }
 
     fn reset_holds(&mut self) {
@@ -252,29 +509,36 @@ impl AnalysisTools {
         self.minima = None;
     }
 
-    fn add_marker(&mut self, trace: &SweepData) {
+    fn add_marker(&mut self, trace: &SweepData, center_hz: f64) {
         if self.markers.len() >= MAX_MARKERS {
             return;
         }
-        let Some(point) = trace.points.get(trace.points.len() / 2) else {
+        let Some(index) = nearest(trace, center_hz) else {
             return;
         };
-        if !point.freq_hz.is_finite() {
+        let Some(id) = self.next_id.checked_add(1) else {
             return;
-        }
+        };
         for marker in &mut self.markers {
             marker.selected = false;
         }
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.next_id = id;
         self.markers.push(Marker {
-            id: self.next_id,
-            frequency_hz: point.freq_hz,
+            id,
+            frequency_hz: trace.points[index].freq_hz,
             selected: true,
             reference: false,
+            auto_peak: false,
         });
     }
 
-    fn marker_buttons(&mut self, ui: &mut egui::Ui, language: Language, trace: Option<&SweepData>) {
+    fn marker_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: Language,
+        trace: Option<&SweepData>,
+        center_hz: f64,
+    ) {
         ui.horizontal(|ui| {
             let width = (ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0;
             let button = |ui: &mut egui::Ui, key, enabled| {
@@ -287,32 +551,25 @@ impl AnalysisTools {
             if button(
                 ui,
                 Text::AnalysisAdd,
-                trace.is_some() && self.markers.len() < MAX_MARKERS,
+                trace.is_some() && self.markers.len() < MAX_MARKERS && self.next_id < u32::MAX,
             ) && let Some(trace) = trace
             {
-                self.add_marker(trace);
+                self.add_marker(trace, center_hz);
             }
-            if button(
-                ui,
-                Text::AnalysisRemove,
-                trace.is_some() && !self.markers.is_empty(),
-            ) {
+            if button(ui, Text::AnalysisRemove, !self.markers.is_empty()) {
                 self.markers.retain(|marker| !marker.selected);
                 if let Some(marker) = self.markers.last_mut() {
                     marker.selected = true;
                 }
             }
-            if button(
-                ui,
-                Text::AnalysisClear,
-                trace.is_some() && !self.markers.is_empty(),
-            ) {
+            if button(ui, Text::AnalysisClear, !self.markers.is_empty()) {
                 self.markers.clear();
             }
         });
     }
 
     fn marker_actions(&mut self, ui: &mut egui::Ui, language: Language, trace: &SweepData) {
+        let previous_column = self.column;
         let count = trace
             .points
             .iter()
@@ -327,6 +584,7 @@ impl AnalysisTools {
             ui.horizontal(|ui| {
                 ui.label(language.text(Text::AnalysisColumn));
                 egui::ComboBox::from_id_salt("marker_column")
+                    .width(ui.available_width())
                     .selected_text(column_label(&trace.format, self.column, language))
                     .show_ui(ui, |ui| {
                         for column in 0..count {
@@ -352,13 +610,28 @@ impl AnalysisTools {
                     }
                 }
             });
+            let changed = self
+                .markers
+                .iter_mut()
+                .find(|marker| marker.selected)
+                .is_some_and(|marker| {
+                    ui.checkbox(&mut marker.auto_peak, language.text(Text::AnalysisAutoPeak))
+                        .changed()
+                });
+            if changed || self.column != previous_column {
+                self.refresh_auto_peaks(trace);
+            }
         });
     }
 
-    fn marker_readout(&mut self, ui: &mut egui::Ui, language: Language, trace: &SweepData) {
-        let Some(index) = self.markers.iter().position(|marker| marker.selected) else {
-            return;
-        };
+    fn marker_readout(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: Language,
+        trace: &SweepData,
+        ready: bool,
+    ) -> Option<f64> {
+        let index = self.markers.iter().position(|marker| marker.selected)?;
         let mut frequency = self.markers[index].frequency_hz / 1e6;
         ui.horizontal(|ui| {
             ui.label(language.text(Text::AnalysisFrequency));
@@ -370,64 +643,113 @@ impl AnalysisTools {
                         .max_decimals(6),
                 )
                 .changed()
-                && let Some(point) = nearest(trace, frequency * 1e6)
             {
-                self.markers[index].frequency_hz = trace.points[point].freq_hz;
+                self.move_selected(trace, frequency * 1e6);
             }
         });
-        let mut reference = self.markers[index].reference;
-        if ui
-            .checkbox(&mut reference, language.text(Text::AnalysisDelta))
-            .changed()
-        {
-            for (i, marker) in self.markers.iter_mut().enumerate() {
-                marker.reference = i == index && reference;
+        let mut center = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    ready,
+                    egui::Button::new(language.text(Text::AnalysisCenterAtMarker)),
+                )
+                .on_hover_text(language.text(Text::AnalysisCenterAtMarkerHelp))
+                .clicked()
+            {
+                center = Some(self.markers[index].frequency_hz);
             }
-        }
+            if !self.smith {
+                let mut reference = self.markers[index].reference;
+                if ui
+                    .checkbox(&mut reference, language.text(Text::AnalysisDeltaReference))
+                    .changed()
+                {
+                    for (i, marker) in self.markers.iter_mut().enumerate() {
+                        marker.reference = i == index && reference;
+                    }
+                }
+            }
+        });
+        center
     }
 
     fn marker_table(&mut self, ui: &mut egui::Ui, language: Language, trace: &SweepData) {
-        let reference = self
-            .markers
-            .iter()
-            .find(|m| m.reference)
-            .and_then(|marker| sample(trace, marker.frequency_hz, self.column));
+        ui.label(format!(
+            "{}: {}",
+            language.text(Text::AnalysisTarget),
+            self.target.label(language)
+        ));
+        if !self.smith {
+            ui.label(format!(
+                "{}: {}",
+                language.text(Text::AnalysisColumn),
+                column_label(&trace.format, self.column, language)
+            ));
+        }
+        let reference = (!self.smith)
+            .then(|| self.markers.iter().find(|marker| marker.reference))
+            .flatten();
+        let reference_value = reference
+            .and_then(|marker| self.target_sample(trace, marker.frequency_hz, self.column));
         let mut selected = None;
         egui::Grid::new("analysis_marker_table")
-            .num_columns(3)
+            .num_columns(4)
             .striped(true)
             .show(ui, |ui| {
                 ui.label("M");
                 ui.label("MHz");
-                let label = language.text(Text::AnalysisValue);
-                let unit = column_unit(trace, self.column);
-                ui.label(if unit.is_empty() {
-                    label.to_owned()
+                ui.label(if self.smith {
+                    "R (ohm)"
                 } else {
-                    format!("{label} ({unit})")
+                    language.text(Text::AnalysisValue)
                 });
+                ui.label(if self.smith { "X (ohm)" } else { "" });
                 ui.end_row();
                 for marker in self.markers() {
-                    let label =
-                        format!("M{}{}", marker.id, if marker.reference { " R" } else { "" });
+                    let is_reference = reference.is_some_and(|reference| reference.id == marker.id);
+                    let delta = reference.is_some() && !is_reference;
+                    let suffix = if is_reference {
+                        language.text(Text::AnalysisReference)
+                    } else if delta {
+                        language.text(Text::AnalysisDelta)
+                    } else {
+                        ""
+                    };
+                    let label = format!("M{} {suffix}", marker.id).trim_end().to_owned();
                     if ui.selectable_label(marker.selected, label).clicked() {
                         selected = Some(marker.id);
                     }
-                    if let Some((frequency, value)) =
-                        sample(trace, marker.frequency_hz, self.column)
-                    {
-                        let (df, dv) = if marker.reference {
-                            (frequency, value)
-                        } else if let Some((rf, rv)) = reference {
-                            (frequency - rf, value - rv)
+                    if self.smith {
+                        if let Some((frequency, resistance, reactance)) =
+                            self.smith_sample(trace, marker.frequency_hz)
+                        {
+                            ui.monospace(format!("{:.6}", frequency / 1e6));
+                            ui.monospace(format_value(resistance));
+                            ui.monospace(format_value(reactance));
                         } else {
-                            (frequency, value)
-                        };
-                        ui.monospace(format!("{:.6}", df / 1e6));
-                        ui.monospace(format_value(dv));
+                            for _ in 0..3 {
+                                ui.label("-");
+                            }
+                        }
                     } else {
-                        ui.label("-");
-                        ui.label("-");
+                        let value = self.target_sample(trace, marker.frequency_hz, self.column);
+                        let value = if delta {
+                            value.zip(reference_value).and_then(|((f, v), (rf, rv))| {
+                                let pair = (f - rf, v - rv);
+                                (pair.0.is_finite() && pair.1.is_finite()).then_some(pair)
+                            })
+                        } else {
+                            value
+                        };
+                        if let Some((frequency, value)) = value {
+                            ui.monospace(format!("{:.6}", frequency / 1e6));
+                            ui.monospace(format_value(value));
+                        } else {
+                            ui.label("-");
+                            ui.label("-");
+                        }
+                        ui.label(difference_unit(trace, self.column, delta));
                     }
                     ui.end_row();
                 }
@@ -440,18 +762,39 @@ impl AnalysisTools {
     }
 
     fn search(&mut self, trace: &SweepData, action: Search) {
-        let Some(marker) = self.markers.iter_mut().find(|m| m.selected) else {
+        let Some(marker) = self.markers.iter().find(|marker| marker.selected) else {
             return;
         };
+        let frequency = self.extremum(trace, action, marker.frequency_hz);
+        if let Some(marker) = self.markers.iter_mut().find(|marker| marker.selected) {
+            marker.auto_peak = false;
+            if let Some(frequency) = frequency {
+                marker.frequency_hz = frequency;
+            }
+        }
+    }
+
+    fn move_selected(&mut self, trace: &SweepData, frequency: f64) {
+        let Some(marker) = self.markers.iter_mut().find(|marker| marker.selected) else {
+            return;
+        };
+        marker.auto_peak = false;
+        if let Some(index) = nearest(trace, frequency) {
+            marker.frequency_hz = trace.points[index].freq_hz;
+        }
+    }
+
+    fn extremum(&self, trace: &SweepData, action: Search, frequency: f64) -> Option<f64> {
+        let rows = self.target_rows(trace)?;
         let mut best: Option<(f64, f64)> = None;
-        for point in &trace.points {
-            let Some(&value) = point.values.get(self.column) else {
+        for (index, point) in trace.points.iter().enumerate() {
+            let Some(&value) = rows.get(index).and_then(|row| row.get(self.column)) else {
                 continue;
             };
             if !point.freq_hz.is_finite()
                 || !value.is_finite()
-                || matches!(action, Search::Left) && point.freq_hz >= marker.frequency_hz
-                || matches!(action, Search::Right) && point.freq_hz <= marker.frequency_hz
+                || matches!(action, Search::Left) && point.freq_hz >= frequency
+                || matches!(action, Search::Right) && point.freq_hz <= frequency
             {
                 continue;
             }
@@ -465,9 +808,68 @@ impl AnalysisTools {
                 best = Some((point.freq_hz, value));
             }
         }
-        if let Some((frequency, _)) = best {
-            marker.frequency_hz = frequency;
+        best.map(|(frequency, _)| frequency)
+    }
+
+    fn target_rows<'a>(&'a self, trace: &'a SweepData) -> Option<TargetRows<'a>> {
+        if self.target == MarkerTarget::Current {
+            return Some(TargetRows::Current(trace));
         }
+        if !self
+            .latest
+            .as_ref()
+            .is_some_and(|snapshot| same_grid(&snapshot.data, trace))
+        {
+            return None;
+        }
+        let rows = match self.target {
+            MarkerTarget::Hold if self.hold => self.held.as_ref(),
+            MarkerTarget::Maximum if self.max_hold && !self.smith => self.maxima.as_ref(),
+            MarkerTarget::Minimum if self.min_hold && !self.smith => self.minima.as_ref(),
+            _ => None,
+        }?;
+        Some(TargetRows::Stored(rows.as_slice()))
+    }
+
+    fn target_row<'a>(&'a self, trace: &'a SweepData, index: usize) -> Option<&'a [f64]> {
+        match self.target_rows(trace)? {
+            TargetRows::Current(trace) => Some(&trace.points.get(index)?.values),
+            TargetRows::Stored(rows) => Some(rows.get(index)?.as_slice()),
+        }
+    }
+
+    fn target_sample(
+        &self,
+        trace: &SweepData,
+        frequency: f64,
+        column: usize,
+    ) -> Option<(f64, f64)> {
+        let index = nearest(trace, frequency)?;
+        let value = *self.target_row(trace, index)?.get(column)?;
+        value
+            .is_finite()
+            .then_some((trace.points[index].freq_hz, value))
+    }
+
+    fn smith_sample(&self, trace: &SweepData, frequency: f64) -> Option<(f64, f64, f64)> {
+        let index = nearest(trace, frequency)?;
+        let row = self.target_row(trace, index)?;
+        let (resistance, reactance) = match (trace.format.as_str(), row) {
+            ("z", [_, resistance, reactance]) => (*resistance, *reactance),
+            ("ri", [real, imag]) => {
+                let denominator = (1.0 - real).powi(2) + imag.powi(2);
+                (
+                    50.0 * (1.0 - real.powi(2) - imag.powi(2)) / denominator,
+                    100.0 * imag / denominator,
+                )
+            }
+            _ => return None,
+        };
+        (resistance.is_finite() && reactance.is_finite()).then_some((
+            trace.points[index].freq_hz,
+            resistance,
+            reactance,
+        ))
     }
 }
 
@@ -531,12 +933,6 @@ fn nearest(trace: &SweepData, frequency: f64) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn sample(trace: &SweepData, frequency: f64, column: usize) -> Option<(f64, f64)> {
-    let point = &trace.points[nearest(trace, frequency)?];
-    let value = *point.values.get(column)?;
-    value.is_finite().then_some((point.freq_hz, value))
-}
-
 fn column_label(format: &str, column: usize, language: Language) -> &'static str {
     match (format, column) {
         ("ma", 0) => language.text(Text::AnalysisMagnitude),
@@ -561,6 +957,13 @@ fn column_unit(trace: &SweepData, column: usize) -> &'static str {
         ("delay", _) => "s",
         ("", _) if trace.mode == kcsdi_core::protocol::StreamMode::Spec => "dBm",
         _ => "",
+    }
+}
+
+fn difference_unit(trace: &SweepData, column: usize, difference: bool) -> &'static str {
+    match (column_unit(trace, column), difference) {
+        ("dBm", true) => "dB",
+        (unit, _) => unit,
     }
 }
 
@@ -692,7 +1095,7 @@ mod tests {
         let mut overlays = tools.overlay_series(&[0, 1, 2]);
         overlays[1].visible = false;
         tools.apply_overlay_visibility(&overlays);
-        tools.language = Language::SimplifiedChinese;
+        tools.set_language(Language::SimplifiedChinese);
         tools.observe(&snapshot(&data));
         let reordered = tools.overlay_series(&[2, 1]);
         assert!(reordered[0].visible);
@@ -702,13 +1105,45 @@ mod tests {
     }
 
     #[test]
+    fn overlay_labels_follow_language_without_opening_trace_controls() {
+        let complete = snapshot(&trace(&[3.0, 4.0, 5.0]));
+        let mut tools = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            ..Default::default()
+        };
+        tools.observe(&complete);
+        let config = tools.config();
+        for language in [Language::SimplifiedChinese, Language::English] {
+            tools.set_language(language);
+            let overlays = tools.overlay_series(&[0]);
+            assert_eq!(
+                overlays
+                    .iter()
+                    .map(|series| series.name)
+                    .collect::<Vec<_>>(),
+                [
+                    Text::AnalysisHold,
+                    Text::AnalysisMaxHold,
+                    Text::AnalysisMinHold
+                ]
+                .map(|key| language.text(key))
+            );
+            assert!(overlays.iter().all(|series| series.points[0] == (1e6, 3.0)));
+            assert_eq!(tools.config(), config);
+        }
+        assert_eq!(tools.latest.as_ref().unwrap().data, complete.data);
+    }
+
+    #[test]
     fn marker_table_is_outside_the_parameter_panel_clip_and_clear_of_the_legend() {
         let ctx = egui::Context::default();
         let data = trace(&[3.0, 4.0, 5.0]);
         let mut tools = AnalysisTools::default();
         let completed = snapshot(&data);
         tools.observe(&completed);
-        tools.add_marker(&data);
+        tools.add_marker(&data, 2e6);
         let mut visible = false;
         for frame in 0..3 {
             let output = ctx.run_ui(
@@ -732,6 +1167,7 @@ mod tests {
                                 Language::English,
                                 Some(&completed),
                                 false,
+                                2e6,
                             )
                         });
                 },
@@ -760,10 +1196,10 @@ mod tests {
         data.mode = StreamMode::S21;
         data.format = "delay".into();
         let mut tools = AnalysisTools::default();
-        tools.add_marker(&data);
+        tools.add_marker(&data, 2e6);
         tools.markers[0].frequency_hz = 1e6;
         tools.markers[0].reference = true;
-        tools.add_marker(&data);
+        tools.add_marker(&data, 2e6);
         for language in [Language::English, Language::SimplifiedChinese] {
             let ctx = egui::Context::default();
             let output = ctx.run_ui(Default::default(), |ui| {
@@ -777,8 +1213,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let header = format!("{} (s)", language.text(Text::AnalysisValue));
-            assert!(text.contains(&header.as_str()));
+            assert!(text.contains(&language.text(Text::AnalysisValue)));
+            assert!(text.contains(&"s"));
             assert!(text.contains(&"-5.147e-9"));
             assert!(text.contains(&"5.522e-9"));
             assert!(!text.contains(&"0.0000") && !text.contains(&"-0.0000"));
@@ -865,7 +1301,7 @@ mod tests {
         let mut tools = AnalysisTools::default();
         tools.observe(&snapshot(&data));
         assert_eq!(tools.column, 1);
-        tools.add_marker(&data);
+        tools.add_marker(&data, 2e6);
         tools.search(&data, Search::Maximum);
         assert_eq!(tools.markers[0].frequency_hz, 2e6);
         tools.search(&data, Search::Minimum);
@@ -899,7 +1335,7 @@ mod tests {
     fn marker_search_uses_measured_extrema_and_keeps_ids() {
         let data = trace(&[9.0, 4.0, 3.0, 8.0, 5.0]);
         let mut tools = AnalysisTools::default();
-        tools.add_marker(&data);
+        tools.add_marker(&data, 3e6);
         tools.search(&data, Search::Left);
         assert_eq!(tools.markers[0].frequency_hz, 1e6);
         tools.search(&data, Search::Right);
@@ -907,11 +1343,11 @@ mod tests {
         tools.search(&data, Search::Minimum);
         assert_eq!(tools.markers[0].frequency_hz, 3e6);
         for _ in 0..20 {
-            tools.add_marker(&data);
+            tools.add_marker(&data, 3e6);
         }
         assert_eq!(tools.markers.len(), MAX_MARKERS);
         assert_eq!(tools.markers.iter().filter(|m| m.selected).count(), 1);
-        assert_eq!(sample(&data, 2.4e6, 0), Some((2e6, 4.0)));
+        assert_eq!(tools.target_sample(&data, 2.4e6, 0), Some((2e6, 4.0)));
     }
 
     #[test]
@@ -1024,5 +1460,643 @@ mod tests {
         frozen.observe(&next);
         assert_eq!(frozen.held_trace(), Some(next.data));
         assert_eq!(first.data.points[0].values, vec![1.0]);
+    }
+
+    #[test]
+    fn targets_search_and_read_the_same_rows_without_falling_back() {
+        let first = trace(&[8.0, 1.0, 3.0]);
+        let second = trace(&[2.0, 9.0, 0.0]);
+        let mut tools = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            ..Default::default()
+        };
+        tools.observe(&snapshot(&first));
+        tools.observe(&snapshot(&second));
+        tools.add_marker(&second, 2e6);
+        for (target, frequency, value) in [
+            (MarkerTarget::Current, 2e6, 9.0),
+            (MarkerTarget::Hold, 1e6, 8.0),
+            (MarkerTarget::Maximum, 2e6, 9.0),
+            (MarkerTarget::Minimum, 1e6, 2.0),
+        ] {
+            tools.target = target;
+            tools.search(&second, Search::Maximum);
+            assert_eq!(tools.markers[0].frequency_hz, frequency);
+            assert_eq!(
+                tools.target_sample(&second, frequency, 0),
+                Some((frequency, value))
+            );
+        }
+        tools.target = MarkerTarget::Hold;
+        assert_eq!(tools.marker_trace(), Some(first.clone()));
+        tools.hold = false;
+        assert!(tools.target_sample(&second, 2e6, 0).is_none());
+        assert!(tools.marker_trace().is_none());
+        tools.search(&second, Search::Maximum);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        tools.hold = true;
+        let mut changed_grid = second;
+        changed_grid.points[1].freq_hz += 1.0;
+        assert!(tools.target_sample(&changed_grid, 2e6, 0).is_none());
+        for target in [MarkerTarget::Maximum, MarkerTarget::Minimum] {
+            tools.target = target;
+            assert!(tools.marker_trace().is_none());
+        }
+        tools.restore_config(&tools.config());
+        assert!(tools.target_sample(&first, 2e6, 0).is_none());
+        assert!(tools.marker_trace().is_none());
+    }
+
+    #[test]
+    fn auto_peak_uses_complete_targets_and_manual_moves_disable_only_that_marker() {
+        let first = trace(&[8.0, 1.0, 3.0]);
+        let second = trace(&[2.0, 9.0, 0.0]);
+        let mut tools = AnalysisTools {
+            hold: true,
+            ..Default::default()
+        };
+        tools.observe(&snapshot(&first));
+        tools.add_marker(&first, 2e6);
+        tools.markers[0].auto_peak = true;
+        tools.add_marker(&first, 3e6);
+        tools.observe(&snapshot(&second));
+        assert_eq!(tools.markers[0].frequency_hz, 2e6);
+        assert_eq!(tools.markers[1].frequency_hz, 3e6);
+        assert!(!tools.markers[1].auto_peak);
+        tools.target = MarkerTarget::Hold;
+        tools.refresh_auto_peaks(&second);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        tools.markers[0].selected = true;
+        tools.markers[1].selected = false;
+        tools.move_selected(&second, 2.6e6);
+        assert_eq!(tools.markers[0].frequency_hz, 3e6);
+        assert!(!tools.markers[0].auto_peak);
+        tools.markers[0].auto_peak = true;
+        tools.search(&second, Search::Left);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        assert!(!tools.markers[0].auto_peak);
+        tools.markers[0].auto_peak = true;
+        tools.search(&second, Search::Left);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        assert!(!tools.markers[0].auto_peak);
+    }
+
+    #[test]
+    fn hold_toggles_do_not_create_an_acquisition_or_retarget_an_auto_marker() {
+        let data = trace(&[9.0, 2.0, 3.0]);
+        let complete = snapshot(&data);
+        let mut tools = AnalysisTools::default();
+        tools.observe(&complete);
+        tools.add_marker(&data, 2e6);
+        tools.markers[0].auto_peak = true;
+        tools.hold = true;
+        tools.max_hold = true;
+        tools.refresh_holds(&data);
+        assert_eq!(tools.markers[0].frequency_hz, 2e6);
+        assert_eq!(
+            tools.latest.as_ref().unwrap().completed_at,
+            complete.completed_at
+        );
+        assert_eq!(tools.latest.as_ref().unwrap().data, data);
+        assert_eq!(tools.held_trace(), Some(data));
+    }
+
+    #[test]
+    fn selected_component_survives_receiver_grid_and_session_changes() {
+        use crate::acquisition::AcquisitionSettings;
+        use kcsdi_core::model::Rbw;
+        let mut data = trace(&[50.0, 60.0, 70.0]);
+        data.mode = StreamMode::S11;
+        data.format = "z".into();
+        for point in &mut data.points {
+            point.values = vec![50.0, 30.0, -40.0];
+        }
+        let mut complete = snapshot(&data);
+        let mut tools = AnalysisTools::default();
+        tools.observe(&complete);
+        tools.column = 1;
+        let AcquisitionSettings::S11(params) = &mut complete.settings else {
+            unreachable!()
+        };
+        params.rbw = Some(Rbw::R1k);
+        tools.observe(&complete);
+        assert_eq!(tools.column, 1);
+        complete.data.points[1].freq_hz += 1.0;
+        tools.observe(&complete);
+        assert_eq!(tools.column, 1);
+        complete.session_id += 1;
+        tools.observe(&complete);
+        assert_eq!(tools.column, 1);
+        tools.restore_config(&tools.config());
+        tools.observe(&complete);
+        assert_eq!(tools.column, 1);
+        tools.observe(&snapshot(&trace(&[1.0, 2.0, 3.0])));
+        assert_eq!(tools.column, 0);
+    }
+
+    #[test]
+    fn centers_and_side_searches_use_measured_frequency_and_finite_first_ties() {
+        let mut data = trace(&[9.0, 4.0, f64::NAN, 9.0, f64::INFINITY]);
+        data.points[1].freq_hz = data.points[0].freq_hz;
+        let mut tools = AnalysisTools::default();
+        tools.add_marker(&data, 3e6);
+        assert_eq!(tools.markers[0].frequency_hz, 3e6);
+        tools.search(&data, Search::Maximum);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        tools.search(&data, Search::Right);
+        assert_eq!(tools.markers[0].frequency_hz, 4e6);
+        tools.search(&data, Search::Right);
+        assert_eq!(tools.markers[0].frequency_hz, 4e6);
+        tools.markers[0].auto_peak = true;
+        tools.move_selected(&data, 2.1e6);
+        assert_eq!(tools.markers[0].frequency_hz, 3e6);
+        assert!(!tools.markers[0].auto_peak);
+        tools.move_selected(&data, f64::NAN);
+        assert_eq!(tools.markers[0].frequency_hz, 3e6);
+    }
+
+    #[test]
+    fn marker_config_sanitizes_definitions_and_does_not_wrap_exhausted_ids() {
+        let marker = |id, frequency_hz| Marker {
+            id,
+            frequency_hz,
+            selected: true,
+            reference: true,
+            auto_peak: true,
+        };
+        let mut config = AnalysisConfig {
+            markers: vec![
+                marker(0, 1e6),
+                marker(1, f64::NAN),
+                marker(2, -1.0),
+                marker(3, 0.0),
+                marker(3, 2e6),
+            ],
+            next_id: 15,
+            hold: true,
+            column: usize::MAX,
+            target: MarkerTarget::Hold,
+            overlay_visibility: vec![
+                OverlayVisibilityConfig {
+                    format: "z".into(),
+                    kind: 0,
+                    column: 1,
+                    visible: false,
+                },
+                OverlayVisibilityConfig {
+                    format: "unknown".into(),
+                    kind: 0,
+                    column: 0,
+                    visible: true,
+                },
+                OverlayVisibilityConfig {
+                    format: "z".into(),
+                    kind: 3,
+                    column: 0,
+                    visible: true,
+                },
+            ],
+            ..Default::default()
+        };
+        config
+            .markers
+            .extend((4..20).map(|id| marker(id, f64::from(id) * 1e6)));
+        let mut tools = AnalysisTools::default();
+        tools.restore_config(&config);
+        assert_eq!(tools.markers.len(), MAX_MARKERS);
+        assert_eq!(tools.markers[0].frequency_hz, 0.0);
+        assert_eq!(
+            tools
+                .markers
+                .iter()
+                .filter(|marker| marker.selected)
+                .count(),
+            1
+        );
+        assert_eq!(
+            tools
+                .markers
+                .iter()
+                .filter(|marker| marker.reference)
+                .count(),
+            1
+        );
+        assert_eq!(tools.column, 2);
+        assert_eq!(tools.overlay_visibility.len(), 1);
+        assert!(tools.latest.is_none() && tools.held.is_none());
+        let restored = tools.config();
+        let serialized = toml::to_string(&restored).unwrap();
+        assert_eq!(
+            toml::from_str::<AnalysisConfig>(&serialized).unwrap(),
+            restored
+        );
+        tools.markers.clear();
+        tools.add_marker(&trace(&[1.0, 2.0, 3.0]), 2e6);
+        assert_eq!(tools.markers[0].id, 16);
+        config.markers = vec![marker(u32::MAX, 1e6)];
+        config.next_id = 0;
+        tools.restore_config(&config);
+        tools.markers.clear();
+        tools.add_marker(&trace(&[1.0, 2.0, 3.0]), 2e6);
+        assert!(tools.markers.is_empty());
+        assert_eq!(tools.next_id, u32::MAX);
+    }
+
+    #[test]
+    fn smith_uses_whole_current_or_held_impedance_and_clears_scalar_actions() {
+        let mut data = trace(&[0.0, 0.5, 1.0]);
+        data.mode = StreamMode::S11;
+        data.format = "ri".into();
+        for point in &mut data.points {
+            point.values.push(0.0);
+        }
+        let mut tools = AnalysisTools {
+            hold: true,
+            ..Default::default()
+        };
+        tools.observe(&snapshot(&data));
+        tools.add_marker(&data, 2e6);
+        tools.markers[0].reference = true;
+        tools.markers[0].auto_peak = true;
+        tools.target = MarkerTarget::Maximum;
+        tools.set_smith(true);
+        assert_eq!(tools.target, MarkerTarget::Current);
+        assert!(!tools.markers[0].reference && !tools.markers[0].auto_peak);
+        assert_eq!(tools.smith_sample(&data, 1e6), Some((1e6, 50.0, 0.0)));
+        assert_eq!(tools.smith_sample(&data, 2e6), Some((2e6, 150.0, 0.0)));
+        assert!(tools.smith_sample(&data, 3e6).is_none());
+        let first = data.clone();
+        data.points[1].values = vec![0.0, -0.5];
+        tools.observe(&snapshot(&data));
+        assert_eq!(tools.smith_sample(&data, 2e6), Some((2e6, 30.0, -40.0)));
+        tools.target = MarkerTarget::Hold;
+        assert_eq!(tools.marker_trace(), Some(first));
+        assert_eq!(tools.smith_sample(&data, 2e6), Some((2e6, 150.0, 0.0)));
+        let mut config = tools.config();
+        config.markers[0].reference = true;
+        config.markers[0].auto_peak = true;
+        config.target = MarkerTarget::Minimum;
+        tools.restore_config(&config);
+        assert_eq!(tools.target, MarkerTarget::Current);
+        assert!(!tools.markers[0].reference && !tools.markers[0].auto_peak);
+    }
+
+    #[test]
+    fn spectrum_delta_readout_identifies_reference_target_and_difference_units() {
+        let data = trace(&[-30.0, -10.0, -20.0]);
+        let mut tools = AnalysisTools::default();
+        tools.add_marker(&data, 1e6);
+        tools.markers[0].reference = true;
+        tools.add_marker(&data, 2e6);
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(Default::default(), |ui| {
+                tools.marker_table(ui, language, &data)
+            });
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                text.contains(&format!("M1 {}", language.text(Text::AnalysisReference)).as_str())
+            );
+            assert!(text.contains(&format!("M2 {}", language.text(Text::AnalysisDelta)).as_str()));
+            assert!(
+                text.contains(
+                    &format!(
+                        "{}: {}",
+                        language.text(Text::AnalysisTarget),
+                        language.text(Text::AnalysisCurrent)
+                    )
+                    .as_str()
+                )
+            );
+            assert!(text.contains(&"dBm") && text.contains(&"dB"));
+            assert!(text.contains(&"20") && text.contains(&"-30"));
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(difference_unit(&data, 0, true), "dB");
+        assert_eq!(difference_unit(&data, 0, false), "dBm");
+    }
+
+    fn controls_frame(
+        ctx: &egui::Context,
+        tools: &mut AnalysisTools,
+        complete: &CompletedSweep,
+        language: Language,
+        frame: usize,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 1000.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::right("analysis_panel")
+                    .exact_size(256.0)
+                    .frame(egui::Frame::new().inner_margin(8))
+                    .show(ui, |ui| {
+                        let edge = ui.max_rect().right();
+                        tools.controls_for_display(ui, language, Some(complete), tools.smith, 2e6);
+                        assert!(
+                            ui.min_rect().right() <= edge + 0.1,
+                            "analysis controls overflow a 240 px panel"
+                        );
+                    });
+            },
+        )
+    }
+
+    fn text_rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn bilingual_controls_fit_a_narrow_panel_and_tables_identify_trace_and_component() {
+        for language in Language::ALL {
+            for (format, magnitudes, smith) in [
+                ("z", [1e200, -1e200, 2e200], false),
+                ("delay", [-5e-12, 3e-12, 1e-12], false),
+                ("ri", [0.0, 0.25, 0.5], true),
+            ] {
+                let mut data = trace(&magnitudes);
+                data.mode = if format == "delay" {
+                    StreamMode::S21
+                } else {
+                    StreamMode::S11
+                };
+                data.format = format.into();
+                for (index, point) in data.points.iter_mut().enumerate() {
+                    point.freq_hz = 6_000_000_000.0 + index as f64 * 1e6;
+                    if format == "z" {
+                        point.values = vec![point.values[0].abs(), point.values[0], 1e200];
+                    }
+                    if format == "ri" {
+                        point.values.push(-0.25);
+                    }
+                }
+                let complete = snapshot(&data);
+                let mut tools = AnalysisTools {
+                    hold: true,
+                    trace_id: 42,
+                    ..Default::default()
+                };
+                tools.set_smith(smith);
+                tools.observe(&complete);
+                tools.target = MarkerTarget::Hold;
+                tools.add_marker(&data, data.points[0].freq_hz);
+                tools.markers[0].reference = !smith;
+                tools.add_marker(&data, data.points[1].freq_hz);
+                if format == "z" {
+                    tools.column = 1;
+                }
+                let ctx = egui::Context::default();
+                for frame in 0..3 {
+                    let output =
+                        controls_frame(&ctx, &mut tools, &complete, language, frame, vec![]);
+                    if frame == 2 {
+                        assert!(
+                            text_rect(
+                                &output,
+                                &format!("T42 {}", language.text(Text::AnalysisMarkers))
+                            )
+                            .is_some()
+                        );
+                        assert!(
+                            text_rect(
+                                &output,
+                                &format!(
+                                    "{}: {}",
+                                    language.text(Text::AnalysisTarget),
+                                    language.text(Text::AnalysisHold)
+                                )
+                            )
+                            .is_some()
+                        );
+                        assert!(text_rect(&output, language.text(Text::AnalysisCenter)).is_some());
+                        if smith {
+                            assert!(text_rect(&output, "R (ohm)").is_some());
+                            assert!(text_rect(&output, "X (ohm)").is_some());
+                            for key in [
+                                Text::AnalysisAutoPeak,
+                                Text::AnalysisMaximum,
+                                Text::AnalysisDeltaReference,
+                            ] {
+                                assert!(text_rect(&output, language.text(key)).is_none());
+                            }
+                        } else {
+                            assert!(
+                                text_rect(
+                                    &output,
+                                    &format!(
+                                        "{}: {}",
+                                        language.text(Text::AnalysisColumn),
+                                        column_label(format, tools.column, language)
+                                    )
+                                )
+                                .is_some()
+                            );
+                            assert!(
+                                text_rect(
+                                    &output,
+                                    &format!("M2 {}", language.text(Text::AnalysisDelta))
+                                )
+                                .is_some()
+                            );
+                        }
+                    }
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stopped_hold_reset_recaptures_and_retargets_auto_peak_without_a_new_sweep() {
+        let first = trace(&[9.0, 2.0, 3.0]);
+        let second = trace(&[1.0, 2.0, 8.0]);
+        let complete = snapshot(&second);
+        let mut tools = AnalysisTools {
+            hold: true,
+            target: MarkerTarget::Hold,
+            ..Default::default()
+        };
+        tools.observe(&snapshot(&first));
+        tools.add_marker(&first, 2e6);
+        tools.markers[0].auto_peak = true;
+        tools.observe(&complete);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
+        let ctx = egui::Context::default();
+        let mut button = None;
+        for frame in 0..3 {
+            let output = controls_frame(
+                &ctx,
+                &mut tools,
+                &complete,
+                Language::English,
+                frame,
+                vec![],
+            );
+            button = text_rect(&output, Language::English.text(Text::AnalysisReset));
+            output.drop_without_applying_deltas();
+        }
+        let position = button.unwrap().center();
+        for (frame, pressed) in [(3, true), (4, false)] {
+            controls_frame(
+                &ctx,
+                &mut tools,
+                &complete,
+                Language::English,
+                frame,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(tools.held_trace(), Some(second));
+        assert_eq!(tools.markers[0].frequency_hz, 3e6);
+        assert!(tools.markers[0].auto_peak);
+        assert_eq!(
+            tools.latest.as_ref().unwrap().completed_at,
+            complete.completed_at
+        );
+    }
+
+    #[test]
+    fn disabling_holds_without_display_data_discards_buffers_before_reenabling() {
+        let first = snapshot(&trace(&[-1.0, 8.0, 3.0]));
+        let current = snapshot(&trace(&[2.0, 3.0, 9.0]));
+        for (kind, caption) in [
+            Text::AnalysisHold,
+            Text::AnalysisMaxHold,
+            Text::AnalysisMinHold,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut tools = AnalysisTools {
+                hold: true,
+                max_hold: true,
+                min_hold: true,
+                ..Default::default()
+            };
+            tools.observe(&first);
+            tools.observe(&current);
+            let buffer = |tools: &AnalysisTools| match kind {
+                0 => tools.held.clone(),
+                1 => tools.maxima.clone(),
+                _ => tools.minima.clone(),
+            };
+            assert!(buffer(&tools).is_some());
+            let ctx = egui::Context::default();
+            let mut frame = 0;
+            let mut render =
+                |tools: &mut AnalysisTools, complete: Option<&CompletedSweep>, events| {
+                    frame += 1;
+                    ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1280.0, 1000.0),
+                            )),
+                            time: Some(frame as f64 / 60.0),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::Panel::right("analysis_no_data")
+                                .exact_size(256.0)
+                                .show(ui, |ui| {
+                                    tools.controls_for_display(
+                                        ui,
+                                        Language::English,
+                                        complete,
+                                        false,
+                                        2e6,
+                                    );
+                                });
+                        },
+                    )
+                };
+            let mut click = |tools: &mut AnalysisTools, complete: Option<&CompletedSweep>| {
+                let mut button = None;
+                for _ in 0..3 {
+                    let output = render(tools, complete, vec![]);
+                    // HOLD appears in both the section heading and the button.
+                    button = output
+                        .shapes
+                        .iter()
+                        .rev()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text)
+                                if text.galley.text() == Language::English.text(caption) =>
+                            {
+                                Some(text.galley.rect.translate(text.pos.to_vec2()))
+                            }
+                            _ => None,
+                        });
+                    output.drop_without_applying_deltas();
+                }
+                let position = button.unwrap().center();
+                for pressed in [true, false] {
+                    render(
+                        tools,
+                        complete,
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    )
+                    .drop_without_applying_deltas();
+                }
+            };
+            click(&mut tools, None);
+            assert!(
+                buffer(&tools).is_none(),
+                "disabled buffer {kind} survived absent display data"
+            );
+            click(&mut tools, None);
+            assert!(
+                buffer(&tools).is_none(),
+                "enabling buffer {kind} captured absent display data"
+            );
+            click(&mut tools, None);
+            click(&mut tools, Some(&current));
+            assert_eq!(buffer(&tools), Some(values(&current.data)));
+            assert_eq!(tools.latest.as_ref().unwrap().data, current.data);
+            assert_eq!(
+                tools.latest.as_ref().unwrap().completed_at,
+                current.completed_at
+            );
+        }
     }
 }
