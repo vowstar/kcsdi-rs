@@ -1405,8 +1405,9 @@ mod tests {
                     };
                     assert_eq!(pass_id, pass);
                     assert!(path.is_file());
-                    assert_ne!(path.parent().unwrap(), directory.path());
-                    assert!(path.starts_with(directory.path()));
+                    let root = directory.path().canonicalize().unwrap();
+                    assert_ne!(path.parent().unwrap(), root);
+                    assert!(path.starts_with(root));
                     paths.push(path);
                     commands
                         .send(CommandEnvelope {

@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_root_or_child_refuses_publication() {
+    fn directory_replacement_is_rejected_or_blocks_publication() {
         for replace_root in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("root");
@@ -848,7 +848,23 @@ mod tests {
                 first.parent().unwrap().to_owned()
             };
             let moved = target.with_extension("moved");
-            fs::rename(&target, &moved).unwrap();
+            if let Err(error) = fs::rename(&target, &moved) {
+                // Windows can reject moving a directory with open descendants.
+                // In that case the attempted replacement never happened.
+                assert!(
+                    cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied,
+                    "unexpected directory rename failure: {error}"
+                );
+                assert!(target.is_dir() && !moved.exists());
+                assert!(first.is_file());
+                let run = store.run.as_ref().unwrap();
+                run.root.check().unwrap();
+                run.child.check().unwrap();
+                let second = save(&mut store, &settings, 2);
+                assert!(second.is_file());
+                assert!(!first.exists());
+                continue;
+            }
             fs::create_dir(&target).unwrap();
             assert!(
                 store
