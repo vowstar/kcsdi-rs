@@ -34,7 +34,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Work
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 
 fn legacy_config_version() -> u32 {
     1
@@ -77,6 +77,8 @@ pub struct WorkspaceConfig {
     pub start_hz: f64,
     pub stop_hz: f64,
     pub points: u32,
+    pub list_mode: bool,
+    pub frequencies_hz: Vec<u64>,
     pub log_x: bool,
     pub selected: Option<TraceId>,
     pub next_id: u64,
@@ -163,6 +165,25 @@ impl YViewConfig {
 }
 
 impl XViewConfig {
+    fn for_workspace(workspace: &Workspace) -> Self {
+        let (start, stop) = workspace.frequency_bounds();
+        let mut view = Self::for_range(
+            &SweepRange::new(start, stop, workspace.range.points),
+            workspace.log_x,
+        );
+        if workspace.log_x
+            && workspace.list_mode
+            && start <= 0.0
+            && let Some(&positive) = workspace
+                .frequencies_hz
+                .iter()
+                .find(|&&hz| hz > 0 && (hz as f64) < stop)
+        {
+            view.min = positive as f64;
+        }
+        view
+    }
+
     fn valid(self, log_x: bool) -> bool {
         valid_span(self.min, self.max)
             && (!log_x || (self.min > 0.0 && self.max.log10() > self.min.log10()))
@@ -349,7 +370,7 @@ impl WorkspaceConfig {
         let x_view = if x_view.valid(workspace.log_x) {
             x_view
         } else {
-            XViewConfig::for_range(&workspace.range, workspace.log_x)
+            XViewConfig::for_workspace(workspace)
         };
         let smith = SmithViewConfig {
             zoom: workspace.smith.zoom,
@@ -361,6 +382,8 @@ impl WorkspaceConfig {
             start_hz: workspace.range.start_hz,
             stop_hz: workspace.range.stop_hz,
             points: workspace.range.points,
+            list_mode: workspace.list_mode,
+            frequencies_hz: workspace.frequencies_hz.clone(),
             log_x: workspace.log_x,
             selected: workspace.selected,
             next_id: workspace.next_id,
@@ -382,10 +405,12 @@ impl WorkspaceConfig {
         let mut workspace =
             Workspace::empty(SweepRange::new(self.start_hz, self.stop_hz, self.points));
         workspace.log_x = self.log_x;
+        workspace.list_mode = self.list_mode;
+        workspace.frequencies_hz = self.frequencies_hz.clone();
         let x_view = self
             .x_view
             .filter(|view| view.valid(self.log_x))
-            .unwrap_or_else(|| XViewConfig::for_range(&workspace.range, self.log_x));
+            .unwrap_or_else(|| XViewConfig::for_workspace(&workspace));
         workspace.x_view = PlotView::new(x_view.min, x_view.max, 0.0, 1.0);
         workspace.smith = self.smith_view.unwrap_or_default().restore();
         for trace in &self.traces {
@@ -758,7 +783,7 @@ visible = false
         assert!(state.legacy_sweeps.is_none());
         assert!(state.desktop.settings.profiles.is_empty());
         let saved = AppConfig::from_state(&state);
-        assert_eq!(saved.version, 4);
+        assert_eq!(saved.version, CONFIG_VERSION);
         assert!(saved.workspace.x_view.is_some());
         assert!(saved.workspace.traces[0].analysis.is_some());
     }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{S11Params, S21Params, SpecParams};
+use kcsdi_core::device::{PointParams, PointSettings, S11Params, S21Params, SpecParams};
 use kcsdi_core::protocol::StreamMode;
 use kcsdi_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,10 @@ pub enum AcquisitionSettings {
     S11(S11Params),
     S21(S21Params),
     Spec(SpecParams),
+    List {
+        settings: PointSettings,
+        frequencies_hz: Vec<u64>,
+    },
 }
 
 impl AcquisitionSettings {
@@ -43,6 +47,30 @@ impl AcquisitionSettings {
                 params.validate(&caps)?;
                 Some(params.rbw)
             }
+            Self::List {
+                settings,
+                frequencies_hz,
+            } => {
+                if !(crate::frequency_list::MIN_POINTS..=crate::frequency_list::MAX_POINTS)
+                    .contains(&frequencies_hz.len())
+                    || frequencies_hz.windows(2).any(|pair| pair[0] > pair[1])
+                {
+                    return Err(Error::InvalidParameter(
+                        "frequency lists require 3 to 1001 ascending entries".into(),
+                    ));
+                }
+                for &frequency_hz in frequencies_hz {
+                    PointParams {
+                        settings: settings.clone(),
+                        frequency_hz,
+                    }
+                    .validate(&caps)?;
+                }
+                match settings {
+                    PointSettings::S11 { rbw, .. } | PointSettings::S21 { rbw, .. } => *rbw,
+                    PointSettings::Spec { rbw, .. } => Some(*rbw),
+                }
+            }
         };
         if rbw.is_none() {
             return Err(Error::InvalidParameter(
@@ -57,6 +85,7 @@ impl AcquisitionSettings {
             Self::S11(_) => StreamMode::S11,
             Self::S21(_) => StreamMode::S21,
             Self::Spec(_) => StreamMode::Spec,
+            Self::List { settings, .. } => settings.mode(),
         }
     }
 
@@ -65,6 +94,7 @@ impl AcquisitionSettings {
             Self::S11(params) => params.format.as_str(),
             Self::S21(params) => params.format.as_str(),
             Self::Spec(_) => "",
+            Self::List { settings, .. } => settings.format(),
         }
     }
 
@@ -73,6 +103,7 @@ impl AcquisitionSettings {
             Self::S11(params) => params.points,
             Self::S21(params) => params.points,
             Self::Spec(params) => params.points,
+            Self::List { frequencies_hz, .. } => frequencies_hz.len() as u32,
         }
     }
 

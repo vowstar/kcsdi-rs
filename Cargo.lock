@@ -1811,12 +1811,14 @@ dependencies = [
  "env_logger",
  "kcsdi-core",
  "log",
+ "quick-xml",
  "rfd",
  "rust_xlsxwriter",
  "serde",
  "sys-locale",
  "tempfile",
  "toml",
+ "zip",
 ]
 
 [[package]]

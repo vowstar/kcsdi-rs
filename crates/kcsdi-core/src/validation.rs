@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 
-//! Shared CLI, GUI and session preflight checks for finite, ascending sweeps.
+//! Shared CLI, GUI and session preflight checks for sweeps and single points.
 //! KC901V S11 and SPEC limits were exercised on firmware V1.6.1 (section 12).
 //! S21 validation follows the source-based table in section 7.3.
 
 use std::fmt::Display;
 
-use crate::device::{S11Params, S21Params, SpecParams};
+use crate::device::{PointParams, PointSettings, S11Params, S21Params, SpecParams};
 use crate::error::{Error, Result};
 use crate::model::{Capabilities, FreqRange, Rbw};
 
@@ -73,11 +73,56 @@ impl SpecParams {
         caps.wire_points(self.points)?;
         choice("SPEC calibration", self.cal, caps.spec_calibrations())?;
         validate_rbw(caps, self.rbw)?;
-        if !(caps.spec.ref_min_dbm..=caps.spec.ref_max_dbm).contains(&self.ref_level_dbm) {
+        validate_spec_reference(caps, self.ref_level_dbm)
+    }
+}
+
+impl PointParams {
+    /// Check source-based mode bounds and receiver settings without applying
+    /// finite sweep span or sample-count limits (sections 3.4, 3.5 and 3.8).
+    pub fn validate(&self, caps: &Capabilities) -> Result<()> {
+        let mode = self.settings.mode().name().to_ascii_uppercase();
+        let (enabled, range) = match self.settings {
+            PointSettings::S11 { .. } => (caps.s11.enabled, caps.s11.range),
+            PointSettings::S21 { .. } => (caps.s21.enabled, caps.s21.range),
+            PointSettings::Spec { .. } => (caps.spec.enabled, caps.spec.range),
+        };
+        if !enabled {
+            return Err(invalid(format!("{} does not support {mode}", caps.model)));
+        }
+        if !(range.min_hz..=range.max_hz).contains(&self.frequency_hz) {
             return Err(invalid(format!(
-                "SPEC reference {} dBm, expected {}..={} dBm for {}",
-                self.ref_level_dbm, caps.spec.ref_min_dbm, caps.spec.ref_max_dbm, caps.model
+                "{mode} point frequency {} Hz, expected {}..={} Hz for {}",
+                self.frequency_hz, range.min_hz, range.max_hz, caps.model
             )));
+        }
+        match self.settings {
+            PointSettings::S11 { cal, format, rbw } => {
+                choice("S11 calibration", cal, caps.s11_calibrations())?;
+                choice("S11 format", format, caps.s11_formats())?;
+                if let Some(rbw) = rbw {
+                    validate_rbw(caps, rbw)?;
+                }
+            }
+            PointSettings::S21 {
+                cal, format, rbw, ..
+            } => {
+                choice("S21 calibration", cal, caps.s21_calibrations())?;
+                choice("S21 format", format, caps.s21_formats())?;
+                if let Some(rbw) = rbw {
+                    validate_rbw(caps, rbw)?;
+                }
+            }
+            PointSettings::Spec {
+                cal,
+                rbw,
+                ref_level_dbm,
+                ..
+            } => {
+                choice("SPEC calibration", cal, caps.spec_calibrations())?;
+                validate_rbw(caps, rbw)?;
+                validate_spec_reference(caps, ref_level_dbm)?;
+            }
         }
         Ok(())
     }
@@ -128,6 +173,16 @@ fn validate_range(
 
 fn validate_rbw(caps: &Capabilities, rbw: Rbw) -> Result<()> {
     choice(&format!("{} RBW", caps.model), rbw, caps.rbw_list)
+}
+
+fn validate_spec_reference(caps: &Capabilities, reference: i32) -> Result<()> {
+    if !(caps.spec.ref_min_dbm..=caps.spec.ref_max_dbm).contains(&reference) {
+        return Err(invalid(format!(
+            "SPEC reference {reference} dBm, expected {}..={} dBm for {}",
+            caps.spec.ref_min_dbm, caps.spec.ref_max_dbm, caps.model
+        )));
+    }
+    Ok(())
 }
 
 fn choice<T: Display + PartialEq>(field: &str, value: T, allowed: &[T]) -> Result<()> {
@@ -183,6 +238,202 @@ mod tests {
             start_hz: 0,
             stop_hz: 7_000_000_000,
             rbw: Some(Rbw::R1k),
+        }
+    }
+
+    #[test]
+    fn point_limits_do_not_apply_finite_span_or_count_rules() {
+        let mut caps = Model::Kc901V.capabilities();
+        // Point mode sends literal count one, independent of these finite
+        // sample-count limits and the legacy endpoint adjustment.
+        caps.points_min = 100;
+        caps.points_max = 100;
+        for (settings, minimum) in [
+            (
+                PointSettings::S11 {
+                    cal: Cal::CalOff,
+                    format: Format::Z,
+                    rbw: None,
+                },
+                5_000,
+            ),
+            (
+                PointSettings::S21 {
+                    cal: Cal::CalOff,
+                    format: Format::Delay,
+                    lo: Lo::HighLo,
+                    rbw: None,
+                },
+                0,
+            ),
+            (
+                PointSettings::Spec {
+                    cal: Cal::CalOff,
+                    lo: Lo::LowLo,
+                    rbw: Rbw::R10k,
+                    ref_level_dbm: -10,
+                },
+                0,
+            ),
+        ] {
+            for frequency_hz in [minimum, minimum + 1, 6_999_999_999, 7_000_000_000] {
+                assert!(
+                    PointParams {
+                        settings: settings.clone(),
+                        frequency_hz
+                    }
+                    .validate(&caps)
+                    .is_ok()
+                );
+            }
+            for frequency_hz in [7_000_000_001, u64::MAX] {
+                assert!(
+                    PointParams {
+                        settings: settings.clone(),
+                        frequency_hz
+                    }
+                    .validate(&caps)
+                    .is_err()
+                );
+            }
+            if minimum > 0 {
+                assert!(
+                    PointParams {
+                        settings,
+                        frequency_hz: minimum - 1
+                    }
+                    .validate(&caps)
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn point_receiver_choices_match_finite_sweep_choices() {
+        let formats = [
+            Format::Ri,
+            Format::Ma,
+            Format::Z,
+            Format::Loss,
+            Format::Vswr,
+            Format::Delay,
+        ];
+        for model in [Model::Kc901V, Model::Kc901K, Model::Kc901R, Model::Kc901J] {
+            let caps = model.capabilities();
+            for cal in [Cal::CalOff, Cal::CalOn, Cal::CalSys, Cal::CalUser] {
+                for format in formats {
+                    for rbw in Rbw::ALL {
+                        let s11 = S11Params {
+                            cal,
+                            format,
+                            rbw: Some(rbw),
+                            start_hz: 1_000_000,
+                            stop_hz: 2_000_000,
+                            points: 3,
+                        };
+                        let point = PointParams {
+                            settings: PointSettings::S11 {
+                                cal,
+                                format,
+                                rbw: Some(rbw),
+                            },
+                            frequency_hz: 1_000_000,
+                        };
+                        assert_eq!(
+                            point.validate(&caps).is_ok(),
+                            s11.validate(&caps).is_ok(),
+                            "{model} {point:?}"
+                        );
+                        let s21 = S21Params {
+                            cal,
+                            format,
+                            rbw: Some(rbw),
+                            lo: Lo::HighLo,
+                            start_hz: 1_000_000,
+                            stop_hz: 2_000_000,
+                            points: 3,
+                        };
+                        let point = PointParams {
+                            settings: PointSettings::S21 {
+                                cal,
+                                format,
+                                lo: Lo::HighLo,
+                                rbw: Some(rbw),
+                            },
+                            frequency_hz: 1_000_000,
+                        };
+                        assert_eq!(
+                            point.validate(&caps).is_ok(),
+                            s21.validate(&caps).is_ok(),
+                            "{model} {point:?}"
+                        );
+                    }
+                }
+                for rbw in Rbw::ALL {
+                    for ref_level_dbm in [-51, -50, -10, 10, 11] {
+                        let spec = SpecParams {
+                            cal,
+                            lo: Lo::LowLo,
+                            rbw,
+                            ref_level_dbm,
+                            start_hz: 1_000_000,
+                            stop_hz: 2_000_000,
+                            points: 3,
+                        };
+                        let point = PointParams {
+                            settings: PointSettings::Spec {
+                                cal,
+                                lo: Lo::LowLo,
+                                rbw,
+                                ref_level_dbm,
+                            },
+                            frequency_hz: 1_000_000,
+                        };
+                        assert_eq!(
+                            point.validate(&caps).is_ok(),
+                            spec.validate(&caps).is_ok(),
+                            "{model} {point:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_disabled_modes_fail_preflight() {
+        let mut caps = Model::Kc901V.capabilities();
+        caps.s11.enabled = false;
+        caps.s21.enabled = false;
+        caps.spec.enabled = false;
+        for settings in [
+            PointSettings::S11 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                rbw: None,
+            },
+            PointSettings::S21 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                lo: Lo::HighLo,
+                rbw: None,
+            },
+            PointSettings::Spec {
+                cal: Cal::CalOff,
+                lo: Lo::HighLo,
+                rbw: Rbw::R10k,
+                ref_level_dbm: -10,
+            },
+        ] {
+            assert!(
+                PointParams {
+                    settings,
+                    frequency_hz: 1_000_000
+                }
+                .validate(&caps)
+                .is_err()
+            );
         }
     }
 

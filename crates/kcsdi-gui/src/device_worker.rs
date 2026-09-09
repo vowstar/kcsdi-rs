@@ -168,6 +168,10 @@ pub fn device_worker(
                 AcquisitionSettings::S21(params) => {
                     dev.sweep_s21_controlled(params, &current.cancel, progress)
                 }
+                AcquisitionSettings::List {
+                    settings,
+                    frequencies_hz,
+                } => measure_list(dev, settings, frequencies_hz, &current.cancel, progress),
             };
             match result {
                 Ok(data) => {
@@ -199,6 +203,49 @@ pub fn device_worker(
     if let Some(mut dev) = device.take() {
         dev.close();
     }
+}
+
+fn measure_list<T: kcsdi_core::transport::Transport>(
+    device: &mut Device<T>,
+    settings: &kcsdi_core::device::PointSettings,
+    frequencies_hz: &[u64],
+    cancel: &CancellationToken,
+    mut progress: impl FnMut(kcsdi_core::device::SweepProgress<'_>),
+) -> kcsdi_core::Result<SweepData> {
+    let mut data = SweepData {
+        mode: settings.mode(),
+        format: settings.format().to_owned(),
+        points: Vec::with_capacity(frequencies_hz.len()),
+    };
+    progress(kcsdi_core::device::SweepProgress {
+        mode: data.mode,
+        format: &data.format,
+        points: &data.points,
+        expected_points: frequencies_hz.len() as u32,
+    });
+    for &frequency_hz in frequencies_hz {
+        if cancel.is_cancelled() {
+            return Err(kcsdi_core::Error::Cancelled);
+        }
+        let point = device.measure_point_controlled(
+            &kcsdi_core::device::PointParams {
+                settings: settings.clone(),
+                frequency_hz,
+            },
+            cancel,
+        )?;
+        data.points.extend(point.points);
+        progress(kcsdi_core::device::SweepProgress {
+            mode: data.mode,
+            format: &data.format,
+            points: &data.points,
+            expected_points: frequencies_hz.len() as u32,
+        });
+    }
+    if cancel.is_cancelled() {
+        return Err(kcsdi_core::Error::Cancelled);
+    }
+    Ok(data)
 }
 
 fn handle_or_defer(
@@ -472,6 +519,226 @@ mod tests {
             cancel: CancellationToken::default(),
             plan: plan(settings),
             next_group: 0,
+        }
+    }
+
+    struct ListTransport {
+        lines: std::collections::VecDeque<String>,
+        sent: Arc<std::sync::Mutex<Vec<u8>>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_on_read: Option<(usize, CancellationToken)>,
+    }
+
+    impl ListTransport {
+        fn new() -> Self {
+            Self {
+                lines: std::collections::VecDeque::new(),
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cancel_on_read: None,
+            }
+        }
+
+        fn queue_point(
+            &mut self,
+            settings: &kcsdi_core::device::PointSettings,
+            frequency: f64,
+            value: &str,
+        ) {
+            let header = if settings.format().is_empty() {
+                format!("$start,{}", settings.mode().name())
+            } else {
+                format!("$start,{},{}", settings.mode().name(), settings.format())
+            };
+            self.lines
+                .extend([header, format!("${frequency},{value}"), "$end".into()]);
+            self.lines.extend(
+                [
+                    "$start,device",
+                    "$Synthetic peer",
+                    "$<-User @ :replay>",
+                    "$<-Software ver:test>",
+                    "$<-Hardware ver:test>",
+                    "$<-Serial num:000000000001>",
+                    "$<-Copyright:Test fixture>",
+                    "$end",
+                ]
+                .map(str::to_owned),
+            );
+        }
+    }
+
+    impl kcsdi_core::transport::Transport for ListTransport {
+        fn send_with_timeout(&mut self, data: &[u8], _: Duration) -> kcsdi_core::Result<()> {
+            self.sent.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn recv_line(&mut self, _: Duration) -> kcsdi_core::Result<String> {
+            let count = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if let Some((read, token)) = &self.cancel_on_read
+                && *read == count
+            {
+                token.cancel();
+            }
+            self.lines.pop_front().ok_or(Error::NotConnected)
+        }
+    }
+
+    fn list_settings() -> [kcsdi_core::device::PointSettings; 3] {
+        use kcsdi_core::commands::{Cal, Format, Lo};
+        use kcsdi_core::device::PointSettings;
+        use kcsdi_core::model::Rbw;
+        [
+            PointSettings::S11 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                rbw: None,
+            },
+            PointSettings::S21 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                lo: Lo::HighLo,
+                rbw: None,
+            },
+            PointSettings::Spec {
+                cal: Cal::CalOff,
+                lo: Lo::HighLo,
+                rbw: Rbw::R10k,
+                ref_level_dbm: -10,
+            },
+        ]
+    }
+
+    #[test]
+    fn list_acquisition_keeps_actual_hz_and_repeated_targets_after_each_fence() {
+        for settings in list_settings() {
+            let requested = [1_000_000, 1_000_000, 4_000_000];
+            // Independent replies at a repeated target need not round to the
+            // same value or arrive in increasing reported-frequency order.
+            let actual = [1_000_000.25, 999_999.0, 4_000_000.2];
+            let mut transport = ListTransport::new();
+            for (frequency, value) in actual.into_iter().zip(["1", "2", "3"]) {
+                transport.queue_point(&settings, frequency, value);
+            }
+            let sent = transport.sent.clone();
+            let reads = transport.reads.clone();
+            let mut device = Device::new(transport);
+            let mut prefixes = Vec::new();
+            let data = measure_list(
+                &mut device,
+                &settings,
+                &requested,
+                &CancellationToken::default(),
+                |prefix| {
+                    assert_eq!(prefix.mode, settings.mode());
+                    assert_eq!(prefix.format, settings.format());
+                    assert_eq!(prefix.expected_points, 3);
+                    assert_eq!(
+                        reads.load(std::sync::atomic::Ordering::SeqCst),
+                        prefix.points.len() * 11
+                    );
+                    prefixes.push(
+                        prefix
+                            .points
+                            .iter()
+                            .map(|point| point.freq_hz)
+                            .collect::<Vec<_>>(),
+                    );
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                prefixes,
+                [
+                    vec![],
+                    actual[..1].to_vec(),
+                    actual[..2].to_vec(),
+                    actual.to_vec()
+                ]
+            );
+            assert_eq!(
+                data.points
+                    .iter()
+                    .map(|point| point.freq_hz)
+                    .collect::<Vec<_>>(),
+                actual
+            );
+            assert_eq!(
+                data.points
+                    .iter()
+                    .map(|point| point.values[0])
+                    .collect::<Vec<_>>(),
+                [1.0, 2.0, 3.0]
+            );
+            assert!(!device.requires_reconnect());
+            let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
+            assert_eq!(sent.matches(",1,ss,1000000\n").count(), 2);
+            assert_eq!(sent.matches(",1,ss,4000000\n").count(), 1);
+            assert_eq!(sent.matches("\x03$device\n").count(), 3);
+        }
+    }
+
+    #[test]
+    fn list_partial_failure_keeps_only_fenced_previews_and_never_starts_the_next_point() {
+        for settings in list_settings() {
+            let mut transport = ListTransport::new();
+            transport.queue_point(&settings, 999_999.0, "1");
+            transport.queue_point(&settings, 2_000_000.0, "2,3");
+            let sent = transport.sent.clone();
+            let mut device = Device::new(transport);
+            let mut prefixes = Vec::new();
+            let result = measure_list(
+                &mut device,
+                &settings,
+                &[1_000_000, 2_000_000, 3_000_000],
+                &CancellationToken::default(),
+                |prefix| prefixes.push(prefix.points.len()),
+            );
+            assert!(matches!(result, Err(Error::Protocol(_))), "{result:?}");
+            assert_eq!(prefixes, [0, 1]);
+            assert!(device.requires_reconnect());
+            let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
+            assert_eq!(sent.matches(",run,").count(), 2);
+            assert!(!sent.contains(",ss,3000000\n"));
+            assert_eq!(sent.matches("\x03$device\n").count(), 2);
+        }
+    }
+
+    #[test]
+    fn list_cancellation_after_a_fenced_preview_starts_no_further_point() {
+        let settings = list_settings()[0].clone();
+        for cancel_during_second_point in [false, true] {
+            let cancel = CancellationToken::default();
+            let mut transport = ListTransport::new();
+            transport.queue_point(&settings, 999_999.0, "1");
+            transport.queue_point(&settings, 2_000_000.0, "2");
+            if cancel_during_second_point {
+                transport.cancel_on_read = Some((13, cancel.clone()));
+            }
+            let sent = transport.sent.clone();
+            let mut device = Device::new(transport);
+            let mut prefixes = Vec::new();
+            let result = measure_list(
+                &mut device,
+                &settings,
+                &[1_000_000, 2_000_000, 3_000_000],
+                &cancel,
+                |prefix| {
+                    prefixes.push(prefix.points.len());
+                    if prefix.points.len() == 1 && !cancel_during_second_point {
+                        cancel.cancel();
+                    }
+                },
+            );
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(prefixes, [0, 1]);
+            assert!(!device.requires_reconnect());
+            let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
+            let expected_runs = if cancel_during_second_point { 2 } else { 1 };
+            assert_eq!(sent.matches(",run,").count(), expected_runs);
+            assert_eq!(sent.matches("\x03$device\n").count(), expected_runs);
+            assert!(!sent.contains(",ss,3000000\n"));
         }
     }
 

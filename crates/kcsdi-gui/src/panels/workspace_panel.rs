@@ -13,6 +13,43 @@ pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_enabled_ui(
         state.sweep != SweepState::Stopping && state.connection != ConnectionState::Disconnecting,
         |ui| {
+            ui.horizontal(|ui| {
+                let previous = state.workspace.list_mode;
+                ui.selectable_value(
+                    &mut state.workspace.list_mode,
+                    false,
+                    state.language.text(Text::FrequencyRange),
+                );
+                ui.selectable_value(
+                    &mut state.workspace.list_mode,
+                    true,
+                    state.language.text(Text::FrequencyListTab),
+                );
+                if previous != state.workspace.list_mode {
+                    state.workspace.reset_frequency_view();
+                }
+            });
+            if state.workspace.list_mode {
+                let list = &state.workspace.frequencies_hz;
+                ui.label(format!(
+                    "{}: {}",
+                    state.language.text(Text::Points),
+                    list.len()
+                ));
+                if let (Some(first), Some(last)) = (list.first(), list.last()) {
+                    ui.small(format!(
+                        "{first} {} {last} Hz",
+                        state.language.text(Text::RangeTo)
+                    ));
+                }
+                if ui
+                    .button(state.language.text(Text::EditFrequencyList))
+                    .clicked()
+                {
+                    state.workspace.frequency_editor.open(list);
+                }
+                return;
+            }
             let allowed = state.workspace.visible_range();
             let range = &mut state.workspace.range;
             let edit = SweepFields {
@@ -36,7 +73,10 @@ pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
             );
         },
     );
-    if state.any_running() && sweep_controls::invalid_step(ui.ctx(), "workspace") {
+    if state.any_running()
+        && !state.workspace.list_mode
+        && sweep_controls::invalid_step(ui.ctx(), "workspace")
+    {
         state.send(WorkerCommand::StopSweep);
     }
 }
@@ -57,7 +97,9 @@ pub fn run_button(ui: &mut egui::Ui, state: &mut AppState) {
                 state.send(WorkerCommand::StopSweep);
             }
         } else {
-            let plan = if sweep_controls::invalid_step(ui.ctx(), "workspace") {
+            let plan = if !state.workspace.list_mode
+                && sweep_controls::invalid_step(ui.ctx(), "workspace")
+            {
                 Err(kcsdi_core::Error::InvalidParameter(
                     state.language.text(Text::InvalidStep).into(),
                 ))

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::Color32;
 use kcsdi_core::commands::{Cal, Lo};
-use kcsdi_core::device::{S11Params, S21Params, SpecParams};
+use kcsdi_core::device::{PointSettings, S11Params, S21Params, SpecParams};
 use kcsdi_core::model::{FreqRange, Rbw};
 use kcsdi_core::validation::frequency_hz;
 
@@ -121,6 +121,41 @@ impl Default for TraceSettings {
 }
 
 impl TraceSettings {
+    pub fn acquisition_for(
+        &self,
+        range: &SweepRange,
+        list: Option<&[u64]>,
+    ) -> kcsdi_core::Result<AcquisitionSettings> {
+        if let Some(frequencies_hz) = list {
+            let settings = match self.display {
+                TraceDisplay::Spec => PointSettings::Spec {
+                    cal: self.cal,
+                    lo: self.lo,
+                    rbw: self.rbw,
+                    ref_level_dbm: self.ref_level_dbm,
+                },
+                TraceDisplay::S11(display) => PointSettings::S11 {
+                    cal: self.cal,
+                    format: display.wire_format(),
+                    rbw: Some(self.rbw),
+                },
+                TraceDisplay::S21(display) => PointSettings::S21 {
+                    cal: self.cal,
+                    format: display.wire_format(),
+                    lo: self.lo,
+                    rbw: Some(self.rbw),
+                },
+            };
+            let settings = AcquisitionSettings::List {
+                settings,
+                frequencies_hz: frequencies_hz.to_vec(),
+            };
+            settings.validate()?;
+            return Ok(settings);
+        }
+        self.acquisition(range)
+    }
+
     pub fn acquisition(&self, range: &SweepRange) -> kcsdi_core::Result<AcquisitionSettings> {
         let start_hz = frequency_hz(range.start_hz, "start")?;
         let stop_hz = frequency_hz(range.stop_hz, "stop")?;
@@ -279,6 +314,9 @@ pub struct TraceEditor {
 
 pub struct Workspace {
     pub range: SweepRange,
+    pub list_mode: bool,
+    pub frequencies_hz: Vec<u64>,
+    pub frequency_editor: crate::frequency_editor::FrequencyEditor,
     pub traces: Vec<TraceState>,
     pub selected: Option<TraceId>,
     pub x_view: PlotView,
@@ -324,6 +362,9 @@ impl Workspace {
     pub fn empty(range: SweepRange) -> Self {
         Self {
             range,
+            list_mode: false,
+            frequencies_hz: Vec::new(),
+            frequency_editor: Default::default(),
             traces: Vec::new(),
             selected: None,
             x_view: PlotView::new(range.start_hz, range.stop_hz, 0.0, 1.0),
@@ -383,11 +424,34 @@ impl Workspace {
             .map(|trace| {
                 trace
                     .settings
-                    .acquisition(&self.range)
+                    .acquisition_for(&self.range, self.requested_list())
                     .map(|settings| (trace.id, settings))
             })
             .collect();
         SweepPlan::from_requests(requests?)
+    }
+
+    pub fn requested_list(&self) -> Option<&[u64]> {
+        self.list_mode.then_some(&self.frequencies_hz)
+    }
+
+    pub fn frequency_bounds(&self) -> (f64, f64) {
+        if self.list_mode
+            && let (Some(&first), Some(&last)) =
+                (self.frequencies_hz.first(), self.frequencies_hz.last())
+        {
+            if first == last {
+                let pad = (first as f64 * 0.01).max(1.0);
+                return ((first as f64 - pad).max(0.0), last as f64 + pad);
+            }
+            return (first as f64, last as f64);
+        }
+        (self.range.start_hz, self.range.stop_hz)
+    }
+
+    pub fn reset_frequency_view(&mut self) {
+        (self.x_view.x_min, self.x_view.x_max) = self.frequency_bounds();
+        self.ensure_log_x_view();
     }
 
     pub fn visible_range(&self) -> FreqRange {
@@ -412,6 +476,11 @@ impl Workspace {
     /// Explicit C=M acquisition edit. Keep the span unless a mode boundary
     /// requires a smaller symmetric sweep around the marker (section 8.3).
     pub fn center_on_marker(&mut self, frequency: f64) -> kcsdi_core::Result<()> {
+        if self.list_mode {
+            return Err(kcsdi_core::Error::InvalidParameter(
+                "marker centering requires a frequency range".into(),
+            ));
+        }
         let invalid = || {
             kcsdi_core::Error::InvalidParameter(
                 "marker center cannot form a valid sweep for the visible traces".into(),
@@ -459,10 +528,11 @@ impl Workspace {
         {
             return;
         }
+        let (start, planned_stop) = self.frequency_bounds();
         let stop = if self.x_view.x_max.is_finite() && self.x_view.x_max > 0.0 {
             self.x_view.x_max
-        } else if self.range.stop_hz.is_finite() && self.range.stop_hz > 0.0 {
-            self.range.stop_hz
+        } else if planned_stop.is_finite() && planned_stop > 0.0 {
+            planned_stop
         } else {
             10.0
         };
@@ -475,20 +545,27 @@ impl Workspace {
             .map(|point| point.freq_hz)
             .filter(|frequency| frequency.is_finite() && *frequency > 0.0 && *frequency < stop)
             .min_by(f64::total_cmp);
-        let step = (self.range.stop_hz - self.range.start_hz)
-            / f64::from(self.range.points.saturating_sub(1).max(1));
-        let grid_start = if self.range.start_hz > 0.0 {
-            self.range.start_hz
+        let step = (planned_stop - start) / f64::from(self.range.points.saturating_sub(1).max(1));
+        let grid_start = if self.list_mode {
+            self.frequencies_hz
+                .iter()
+                .map(|&hz| hz as f64)
+                .find(|&hz| hz > 0.0 && hz < stop)
+                .unwrap_or(stop / 10.0)
+        } else if start > 0.0 {
+            start
         } else {
             step
         };
-        self.x_view.x_min = measured_start.unwrap_or_else(|| {
-            if grid_start.is_finite() && grid_start > 0.0 && grid_start < stop {
-                grid_start
-            } else {
-                stop / 10.0
-            }
-        });
+        self.x_view.x_min = measured_start
+            .filter(|_| !self.list_mode)
+            .unwrap_or_else(|| {
+                if grid_start.is_finite() && grid_start > 0.0 && grid_start < stop {
+                    grid_start
+                } else {
+                    stop / 10.0
+                }
+            });
         self.x_view.x_max = stop;
     }
 }

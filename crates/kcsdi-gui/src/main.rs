@@ -13,6 +13,8 @@ mod config;
 mod desktop;
 mod device_worker;
 mod export;
+mod frequency_editor;
+mod frequency_list;
 mod health;
 mod i18n;
 mod panels;
@@ -22,6 +24,9 @@ mod state;
 mod theme;
 mod widgets;
 mod workspace;
+
+#[cfg(test)]
+mod list_tests;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

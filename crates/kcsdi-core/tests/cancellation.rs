@@ -12,7 +12,9 @@ use std::time::Duration;
 use kcsdi_core::commands::{Cal, Format, Lo};
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{Device, S11Params, S21Params, SpecParams, SweepProgress};
+use kcsdi_core::device::{
+    Device, PointParams, PointSettings, S11Params, S21Params, SpecParams, SweepProgress,
+};
 use kcsdi_core::model::Rbw;
 use kcsdi_core::protocol::StreamMode;
 use kcsdi_core::transport::TcpTransport;
@@ -245,4 +247,153 @@ fn interrupted_fragmented_query_retires_the_socket_without_another_query() {
         drop(device);
         server.join().unwrap();
     });
+}
+
+fn point_params(mode: StreamMode) -> PointParams {
+    PointParams {
+        settings: match mode {
+            StreamMode::S11 => PointSettings::S11 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                rbw: Some(Rbw::R10k),
+            },
+            StreamMode::S21 => PointSettings::S21 {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                lo: Lo::HighLo,
+                rbw: Some(Rbw::R10k),
+            },
+            StreamMode::Spec => PointSettings::Spec {
+                cal: Cal::CalOff,
+                lo: Lo::HighLo,
+                rbw: Rbw::R10k,
+                ref_level_dbm: -10,
+            },
+            _ => unreachable!(),
+        },
+        frequency_hz: 1_000_000,
+    }
+}
+
+fn expect_point_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
+    for command in ["$s11,stop\n", "$s21,stop\n", "$spec,stop\n"] {
+        assert_eq!(read_line(peer), command);
+    }
+    assert_eq!(read_line(peer), format!("${},init\n", mode.name()));
+    assert_eq!(read_line(peer), "$bw,10k\n");
+    let run = match mode {
+        StreamMode::S11 => "$s11,run,caloff,loss,1,ss,1000000\n",
+        StreamMode::S21 => "$s21,run,caloff,loss,highlo,1,ss,1000000\n",
+        StreamMode::Spec => {
+            assert_eq!(read_line(peer), "$specref,-10\n");
+            "$spec,run,caloff,highlo,1,ss,1000000\n"
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(read_line(peer), run);
+}
+
+fn point_header(mode: StreamMode) -> String {
+    if mode == StreamMode::Spec {
+        "$start,spec\n".into()
+    } else {
+        format!("$start,{},loss\n", mode.name())
+    }
+}
+
+fn expect_interrupt_query(peer: &mut BufReader<TcpStream>) {
+    let mut interrupt = [0];
+    peer.read_exact(&mut interrupt).unwrap();
+    assert_eq!(interrupt, [3]);
+    assert_eq!(read_line(peer), "$device\n");
+}
+
+fn replay_point_then_finite_sweep(mode: StreamMode, cancel_fragment: bool) {
+    let (mut device, mut peer) = connected_pair();
+    let cancel = CancellationToken::default();
+    let peer_cancel = cancel.clone();
+    let (returned, wait_for_return) = mpsc::channel();
+    thread::scope(|scope| {
+        let server = scope.spawn(move || {
+            handshake(&mut peer);
+            expect_point_run(&mut peer, mode);
+            let header = point_header(mode);
+            peer.get_mut().write_all(header.as_bytes()).unwrap();
+            // The repeated header shape also occurs in recorded point replies.
+            peer.get_mut().write_all(header.as_bytes()).unwrap();
+            if cancel_fragment {
+                peer.get_mut().write_all(b"$999999.").unwrap();
+                thread::sleep(FRAGMENT_WAIT);
+                peer_cancel.cancel();
+                expect_interrupt_query(&mut peer);
+                peer.get_mut().write_all(b"25,-12.5\n$end\n").unwrap();
+            } else {
+                peer.get_mut()
+                    .write_all(b"$999999.25,-12.5\n$end\n")
+                    .unwrap();
+                expect_interrupt_query(&mut peer);
+            }
+            // Another continuous frame is residual data, not the next result.
+            peer.get_mut().write_all(header.as_bytes()).unwrap();
+            peer.get_mut().write_all(b"$999999.25,999\n$end\n").unwrap();
+            assert!(matches!(
+                wait_for_return.recv_timeout(FRAGMENT_WAIT),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            peer.get_mut().write_all(IDENTITY).unwrap();
+            wait_for_return.recv_timeout(PEER_TIMEOUT).unwrap();
+
+            // A point fence resets mode state. The next finite sweep still
+            // sends its original count and retains all three returned rows.
+            expect_run(&mut peer, mode);
+            peer.get_mut().write_all(header.as_bytes()).unwrap();
+            peer.get_mut()
+                .write_all(b"$1000000,10\n$1500000,20\n$2000000,30\n$end\n")
+                .unwrap();
+            assert_eq!(read_line(&mut peer), format!("${},stop\n", mode.name()));
+            assert_eq!(read_line(&mut peer), "$local\n");
+            let mut extra = [0];
+            assert_eq!(peer.read(&mut extra).unwrap(), 0);
+        });
+        device.handshake().unwrap();
+        let point = device.measure_point_controlled(&point_params(mode), &cancel);
+        returned.send(()).unwrap();
+        if cancel_fragment {
+            assert!(matches!(point, Err(Error::Cancelled)), "{point:?}");
+        } else {
+            let point = point.unwrap();
+            assert_eq!(point.mode, mode);
+            assert_eq!(point.points.len(), 1);
+            assert_eq!(point.points[0].freq_hz, 999_999.25);
+            assert_eq!(point.points[0].values, [-12.5]);
+        }
+        assert!(!device.requires_reconnect());
+        let sweep = sweep(&mut device, mode, &CancellationToken::default(), |_| {}).unwrap();
+        assert_eq!(sweep.points.len(), 3);
+        assert_eq!(
+            sweep
+                .points
+                .iter()
+                .map(|point| point.values[0])
+                .collect::<Vec<_>>(),
+            [10.0, 20.0, 30.0]
+        );
+        device.close();
+        drop(device);
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn point_results_wait_for_the_identity_fence_before_finite_sweep_reuse() {
+    for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
+        replay_point_then_finite_sweep(mode, false);
+    }
+}
+
+#[test]
+fn point_cancellation_drains_fragmented_and_complete_residual_frames() {
+    for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
+        replay_point_then_finite_sweep(mode, true);
+    }
 }

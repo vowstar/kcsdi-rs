@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use kcsdi_core::device::PointSettings;
 use kcsdi_core::table::{self, Column};
 use rust_xlsxwriter::{Workbook, Worksheet, XlsxError};
 
@@ -20,7 +21,7 @@ const VALUE_HEADERS: [&str; 6] = [
     "value",
     "unit",
 ];
-const METADATA_HEADERS: [&str; 12] = [
+const METADATA_HEADERS: [&str; 13] = [
     "source",
     "mode",
     "format",
@@ -33,7 +34,9 @@ const METADATA_HEADERS: [&str; 12] = [
     "requested_points",
     "completed_at_unix_s",
     "session_id",
+    "frequency_plan",
 ];
+const REQUESTED_FREQUENCY_HEADER: &str = "requested_freq_hz";
 
 /// A bounded selection frozen before a file dialog or background serialization.
 #[derive(Debug, Clone)]
@@ -75,12 +78,19 @@ impl FrozenSnapshots {
             .terminator(csv::Terminator::CRLF)
             .from_writer(Vec::new());
         writer
-            .write_record(VALUE_HEADERS.into_iter().chain(METADATA_HEADERS))
+            .write_record(
+                VALUE_HEADERS
+                    .into_iter()
+                    .chain(METADATA_HEADERS)
+                    .chain([REQUESTED_FREQUENCY_HEADER]),
+            )
             .map_err(|error| error.to_string())?;
         for (id, snapshot) in &self.traces {
             let metadata = metadata(snapshot);
             let columns = schema(snapshot)?;
             for (index, point) in snapshot.data.points.iter().enumerate() {
+                let requested = requested_frequencies(&snapshot.settings)
+                    .map_or_else(String::new, |frequencies| frequencies[index].to_string());
                 for (column, &value) in columns.iter().zip(&point.values) {
                     let mut record = vec![
                         id.0.to_string(),
@@ -91,6 +101,7 @@ impl FrozenSnapshots {
                         column.unit.to_owned(),
                     ];
                     record.extend(metadata.iter().cloned());
+                    record.push(requested.clone());
                     writer
                         .write_record(&record)
                         .map_err(|error| error.to_string())?;
@@ -120,13 +131,25 @@ impl FrozenSnapshots {
             for (index, column) in columns.iter().enumerate() {
                 worksheet.write_string(0, index as u16 + 1, column.name)?;
             }
-            worksheet.set_column_range_width(0, columns.len() as u16, 24)?;
+            let requested = requested_frequencies(&snapshot.settings);
+            let requested_column = columns.len() as u16 + 1;
+            if requested.is_some() {
+                worksheet.write_string(0, requested_column, REQUESTED_FREQUENCY_HEADER)?;
+            }
+            worksheet.set_column_range_width(
+                0,
+                columns.len() as u16 + u16::from(requested.is_some()),
+                24,
+            )?;
             worksheet.set_freeze_panes(1, 1)?;
             for (index, point) in snapshot.data.points.iter().enumerate() {
                 let row = index as u32 + 1;
                 worksheet.write_number(row, 0, point.freq_hz)?;
                 for (index, &value) in point.values.iter().enumerate() {
                     write_value(worksheet, row, index as u16 + 1, value)?;
+                }
+                if let Some(frequencies) = requested {
+                    worksheet.write_number(row, requested_column, frequencies[index] as f64)?;
                 }
             }
         }
@@ -166,11 +189,12 @@ fn validate(snapshot: &CompletedSweep) -> Result<(), String> {
         );
     }
     let columns = schema(snapshot)?;
+    let finite_range = requested_frequencies(&snapshot.settings).is_none();
     let mut previous = None;
     for (index, point) in snapshot.data.points.iter().enumerate() {
         if !point.freq_hz.is_finite()
             || point.freq_hz < 0.0
-            || previous.is_some_and(|frequency| point.freq_hz < frequency)
+            || (finite_range && previous.is_some_and(|frequency| point.freq_hz < frequency))
         {
             return Err(format!("sample {index} has an invalid measured frequency"));
         }
@@ -180,6 +204,13 @@ fn validate(snapshot: &CompletedSweep) -> Result<(), String> {
         previous = Some(point.freq_hz);
     }
     Ok(())
+}
+
+fn requested_frequencies(settings: &AcquisitionSettings) -> Option<&[u64]> {
+    match settings {
+        AcquisitionSettings::List { frequencies_hz, .. } => Some(frequencies_hz),
+        _ => None,
+    }
 }
 
 fn schema(snapshot: &CompletedSweep) -> Result<&'static [Column], String> {
@@ -216,6 +247,32 @@ fn metadata(snapshot: &CompletedSweep) -> [String; METADATA_HEADERS.len()] {
             params.stop_hz,
             params.points,
         ),
+        AcquisitionSettings::List {
+            settings,
+            frequencies_hz,
+        } => {
+            let (cal, rbw, lo, reference) = match settings {
+                PointSettings::S11 { cal, rbw, .. } => (*cal, *rbw, None, None),
+                PointSettings::S21 { cal, rbw, lo, .. } => (*cal, *rbw, Some(*lo), None),
+                PointSettings::Spec {
+                    cal,
+                    rbw,
+                    lo,
+                    ref_level_dbm,
+                } => (*cal, Some(*rbw), Some(*lo), Some(*ref_level_dbm)),
+            };
+            (
+                cal,
+                rbw,
+                lo,
+                reference,
+                frequencies_hz[0],
+                *frequencies_hz
+                    .last()
+                    .expect("validated nonempty frequency list"),
+                frequencies_hz.len() as u32,
+            )
+        }
     };
     [
         "measured".into(),
@@ -230,6 +287,12 @@ fn metadata(snapshot: &CompletedSweep) -> [String; METADATA_HEADERS.len()] {
         points.to_string(),
         unix_timestamp(snapshot.completed_at),
         snapshot.session_id.to_string(),
+        if requested_frequencies(&snapshot.settings).is_some() {
+            "list"
+        } else {
+            "range"
+        }
+        .into(),
     ]
 }
 
@@ -349,6 +412,35 @@ mod tests {
         open_workbook_from_rs(Cursor::new(bytes)).unwrap()
     }
 
+    fn list_snapshot(mode: StreamMode, format: &str, frequencies_hz: Vec<u64>) -> CompletedSweep {
+        let mut snapshot = snapshot(mode, format, frequencies_hz.len() as u32);
+        let settings = match snapshot.settings {
+            AcquisitionSettings::S11(params) => PointSettings::S11 {
+                cal: params.cal,
+                format: params.format,
+                rbw: params.rbw,
+            },
+            AcquisitionSettings::S21(params) => PointSettings::S21 {
+                cal: params.cal,
+                format: params.format,
+                lo: params.lo,
+                rbw: params.rbw,
+            },
+            AcquisitionSettings::Spec(params) => PointSettings::Spec {
+                cal: params.cal,
+                lo: params.lo,
+                rbw: params.rbw,
+                ref_level_dbm: params.ref_level_dbm,
+            },
+            AcquisitionSettings::List { .. } => unreachable!(),
+        };
+        snapshot.settings = AcquisitionSettings::List {
+            settings,
+            frequencies_hz,
+        };
+        snapshot
+    }
+
     fn assert_no_formulas(workbook: &mut Xlsx<Cursor<Vec<u8>>>) {
         for name in workbook.sheet_names().to_vec() {
             assert!(
@@ -420,6 +512,7 @@ mod tests {
             VALUE_HEADERS
                 .into_iter()
                 .chain(METADATA_HEADERS)
+                .chain([REQUESTED_FREQUENCY_HEADER])
                 .collect::<Vec<_>>()
         );
         let mut records = reader.records();
@@ -450,7 +543,7 @@ mod tests {
                     columns.iter().zip(&point.values).enumerate()
                 {
                     let record = records.next().unwrap().unwrap();
-                    assert_eq!(record.len(), 18);
+                    assert_eq!(record.len(), 20);
                     assert_eq!(&record[0], id.0.to_string());
                     assert_eq!(&record[1], point_index.to_string());
                     assert_eq!(record[2].parse::<f64>().unwrap(), point.freq_hz);
@@ -469,6 +562,8 @@ mod tests {
                         format!("1789021234.{:09}", 987_654_300 + trace_index * 100)
                     );
                     assert_eq!(&record[17], (u64::MAX - 9).to_string());
+                    assert_eq!(&record[18], "range");
+                    assert_eq!(&record[19], "");
                     match snapshot.data.mode {
                         StreamMode::S11 => {
                             assert_eq!((&record[9], &record[11], &record[12]), ("caluser", "", ""))
@@ -513,6 +608,10 @@ mod tests {
                 metadata.get_value((row, 12)),
                 Some(&Data::String((u64::MAX - 9).to_string()))
             );
+            assert_eq!(
+                metadata.get_value((row, 13)),
+                Some(&Data::String("range".into()))
+            );
         }
         assert!(records.next().is_none());
         assert_no_formulas(&mut xlsx);
@@ -548,6 +647,182 @@ mod tests {
             );
         }
         assert_no_formulas(&mut xlsx);
+    }
+
+    #[test]
+    fn list_exports_keep_requested_indices_and_actual_jitter_in_every_mode() {
+        let requested = [1_000_000, 1_000_000, 1_300_007];
+        let actual = [1_000_000.25, 999_999.875, 1_300_007.5];
+        let cases = [
+            (StreamMode::S11, "ri"),
+            (StreamMode::S11, "ma"),
+            (StreamMode::S11, "vswr"),
+            (StreamMode::S11, "z"),
+            (StreamMode::S11, "loss"),
+            (StreamMode::S21, "ri"),
+            (StreamMode::S21, "ma"),
+            (StreamMode::S21, "loss"),
+            (StreamMode::S21, "delay"),
+            (StreamMode::Spec, ""),
+        ];
+        for (mode, format) in cases {
+            let mut snapshot = list_snapshot(mode, format, requested.to_vec());
+            for (point, frequency) in snapshot.data.points.iter_mut().zip(actual) {
+                point.freq_hz = frequency;
+            }
+            let expected = snapshot.clone();
+            let frozen = FrozenSnapshots::new(vec![(TraceId(4), Arc::new(snapshot))]).unwrap();
+            let csv = frozen.csv_bytes().unwrap();
+            let mut reader = csv::Reader::from_reader(csv.as_slice());
+            assert_eq!(
+                reader.headers().unwrap().get(19),
+                Some(REQUESTED_FREQUENCY_HEADER)
+            );
+            let columns = table::columns(mode, format).unwrap();
+            let records: Vec<_> = reader.records().map(Result::unwrap).collect();
+            assert_eq!(records.len(), requested.len() * columns.len());
+            let mut xlsx = workbook(frozen.xlsx_bytes().unwrap());
+            let data = xlsx.worksheet_range("T4").unwrap();
+            let metadata = xlsx.worksheet_range("Metadata").unwrap();
+            assert_eq!(data.get_size(), (4, columns.len() + 2));
+            let requested_column = columns.len() as u32 + 1;
+            assert_eq!(
+                data.get_value((0, requested_column)),
+                Some(&Data::String(REQUESTED_FREQUENCY_HEADER.into()))
+            );
+            for index in 0..requested.len() {
+                assert_eq!(
+                    data.get_value((index as u32 + 1, 0)),
+                    Some(&Data::Float(actual[index]))
+                );
+                assert_eq!(
+                    data.get_value((index as u32 + 1, requested_column)),
+                    Some(&Data::Float(requested[index] as f64))
+                );
+                for (column, value) in expected.data.points[index].values.iter().enumerate() {
+                    let record = &records[index * columns.len() + column];
+                    assert_eq!(&record[1], index.to_string());
+                    assert_eq!(record[2].parse::<f64>().unwrap(), actual[index]);
+                    assert_eq!(&record[13], requested[0].to_string());
+                    assert_eq!(&record[14], requested[2].to_string());
+                    assert_eq!(&record[15], "3");
+                    assert_eq!(&record[18], "list");
+                    assert_eq!(record[19].parse::<u64>().unwrap(), requested[index]);
+                    assert_eq!(record[4].parse::<f64>().unwrap(), *value);
+                    assert_eq!(
+                        data.get_value((index as u32 + 1, column as u32 + 1)),
+                        Some(&Data::Float(*value))
+                    );
+                }
+            }
+            assert_eq!(
+                metadata.get_value((1, 8)),
+                Some(&Data::String(requested[0].to_string()))
+            );
+            assert_eq!(
+                metadata.get_value((1, 9)),
+                Some(&Data::String(requested[2].to_string()))
+            );
+            assert_eq!(
+                metadata.get_value((1, 13)),
+                Some(&Data::String("list".into()))
+            );
+            assert_no_formulas(&mut xlsx);
+        }
+    }
+
+    #[test]
+    fn zero_span_lists_and_nonfinite_values_remain_exportable_without_relabeling() {
+        let mut snapshot = list_snapshot(StreamMode::S11, "z", vec![1_000_000; 3]);
+        let actual = [1_000_000.25, 1_000_000.25, 999_999.875];
+        for (point, frequency) in snapshot.data.points.iter_mut().zip(actual) {
+            point.freq_hz = frequency;
+        }
+        snapshot.data.points[0].values = vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        let frozen = FrozenSnapshots::new(vec![(TraceId(1), Arc::new(snapshot))]).unwrap();
+        let csv = frozen.csv_bytes().unwrap();
+        let records: Vec<_> = csv::Reader::from_reader(csv.as_slice())
+            .records()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            [&records[0][4], &records[1][4], &records[2][4]],
+            ["NaN", "+Inf", "-Inf"]
+        );
+        let mut xlsx = workbook(frozen.xlsx_bytes().unwrap());
+        let data = xlsx.worksheet_range("T1").unwrap();
+        for (index, frequency) in actual.into_iter().enumerate() {
+            assert_eq!(
+                data.get_value((index as u32 + 1, 0)),
+                Some(&Data::Float(frequency))
+            );
+            assert_eq!(
+                data.get_value((index as u32 + 1, 4)),
+                Some(&Data::Float(1_000_000.0))
+            );
+        }
+        for (index, value) in ["NaN", "+Inf", "-Inf"].into_iter().enumerate() {
+            assert_eq!(
+                data.get_value((1, index as u32 + 1)),
+                Some(&Data::String(value.into()))
+            );
+        }
+        assert_no_formulas(&mut xlsx);
+    }
+
+    #[test]
+    fn list_exports_reject_mismatched_or_invalid_captured_definitions() {
+        let valid = list_snapshot(
+            StreamMode::S21,
+            "delay",
+            vec![1_000_000, 1_000_000, 1_300_007],
+        );
+        for change in [
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.points.pop();
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.mode = StreamMode::S11;
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.format = "loss".into();
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.points[0].values.push(1.0);
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.points[0].freq_hz = f64::NAN;
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.points[0].freq_hz = f64::INFINITY;
+            },
+            |snapshot: &mut CompletedSweep| {
+                snapshot.data.points[0].freq_hz = -1.0;
+            },
+            |snapshot: &mut CompletedSweep| {
+                if let AcquisitionSettings::List { frequencies_hz, .. } = &mut snapshot.settings {
+                    frequencies_hz.swap(0, 2);
+                }
+            },
+            |snapshot: &mut CompletedSweep| {
+                if let AcquisitionSettings::List { frequencies_hz, .. } = &mut snapshot.settings {
+                    frequencies_hz[0] = u64::MAX;
+                }
+            },
+            |snapshot: &mut CompletedSweep| {
+                if let AcquisitionSettings::List {
+                    settings: PointSettings::S21 { rbw, .. },
+                    ..
+                } = &mut snapshot.settings
+                {
+                    *rbw = None;
+                }
+            },
+        ] {
+            let mut invalid = valid.clone();
+            change(&mut invalid);
+            assert!(FrozenSnapshots::new(vec![(TraceId(1), Arc::new(invalid))]).is_err());
+        }
     }
 
     #[test]

@@ -113,10 +113,16 @@ impl KcsdiApp {
             return;
         }
         let range = self.state.workspace.range;
+        let list = self.state.workspace.requested_list().map(<[u64]>::to_vec);
         for trace in &mut self.state.workspace.traces {
             if !trace.settings.visible
                 || !group.members.contains(&trace.id)
-                || trace.settings.acquisition(&range).ok().as_ref() != Some(&group.settings)
+                || trace
+                    .settings
+                    .acquisition_for(&range, list.as_deref())
+                    .ok()
+                    .as_ref()
+                    != Some(&group.settings)
                 || !trace.settings.display.accepts(&delivery.snapshot.data)
                 || trace.last_completed_cycle.is_some_and(|last| cycle <= last)
             {
@@ -148,11 +154,17 @@ impl KcsdiApp {
             return;
         }
         let range = self.state.workspace.range;
+        let list = self.state.workspace.requested_list().map(<[u64]>::to_vec);
         let preview = Arc::new(preview);
         for trace in &mut self.state.workspace.traces {
             if !trace.settings.visible
                 || !preview.group.members.contains(&trace.id)
-                || trace.settings.acquisition(&range).ok().as_ref() != Some(&preview.group.settings)
+                || trace
+                    .settings
+                    .acquisition_for(&range, list.as_deref())
+                    .ok()
+                    .as_ref()
+                    != Some(&preview.group.settings)
                 || !trace.settings.display.accepts(&preview.data)
                 || trace
                     .last_completed_cycle
@@ -232,6 +244,7 @@ impl KcsdiApp {
         if ctx.input(|input| input.viewport().close_requested()) && !self.closing {
             self.closing = true;
             self.state.export.cancel();
+            self.state.workspace.frequency_editor.cancel();
             self.state.send(crate::state::WorkerCommand::Shutdown);
         }
         if !self.closing {
@@ -252,7 +265,7 @@ impl KcsdiApp {
             warn!("device worker panicked during shutdown");
         }
         self.state.cmd_tx = None;
-        if self.state.export.is_pending() {
+        if self.state.export.is_pending() || self.state.workspace.frequency_editor.is_pending() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -341,6 +354,7 @@ impl eframe::App for KcsdiApp {
         i18n::set_language(&ctx, self.state.language);
         theme::apply(&ctx, self.state.desktop.settings.theme);
         self.state.export.poll();
+        self.state.workspace.frequency_editor.poll();
         self.poll_close(&ctx);
 
         // Drain all pending events from the device worker.
@@ -369,11 +383,15 @@ impl eframe::App for KcsdiApp {
                 .resizable(false)
                 .show(&ctx, |ui| {
                     ui.spinner();
-                    ui.label(self.state.language.text(if self.state.export.is_pending() {
-                        Text::ExportCancelHelp
-                    } else {
-                        Text::Disconnecting
-                    }));
+                    ui.label(self.state.language.text(
+                        if self.state.workspace.frequency_editor.is_pending() {
+                            Text::FrequencyFilePending
+                        } else if self.state.export.is_pending() {
+                            Text::ExportCancelHelp
+                        } else {
+                            Text::Disconnecting
+                        },
+                    ));
                 });
         }
 
@@ -394,6 +412,18 @@ impl eframe::App for KcsdiApp {
             .show(&ctx, |ui| panels::top_bar::show(ui, &mut self.state));
 
         trace_editor(&ctx, &mut self.state);
+        let allowed = self.state.workspace.visible_range();
+        if let Some(list) =
+            self.state
+                .workspace
+                .frequency_editor
+                .show(&ctx, self.state.language, allowed)
+            && !self.closing
+        {
+            self.state.workspace.frequencies_hz = list;
+            self.state.workspace.list_mode = true;
+            self.state.workspace.reset_frequency_view();
+        }
         self.state.reconcile_plan();
         ctx.request_repaint_after(Duration::from_millis(500));
         self.persist_config_debounced();
@@ -622,6 +652,7 @@ impl KcsdiApp {
         let options: Vec<_> = layers.iter().map(|layer| layer.options.clone()).collect();
         drop(layers);
         let mut reset_x = None;
+        let bounds = workspace.frequency_bounds();
         for ((trace, (base_count, _, _, completed_options)), options) in workspace
             .traces
             .iter_mut()
@@ -635,12 +666,7 @@ impl KcsdiApp {
                     widgets::plot::ViewLock::Unlocked => {
                         trace.view_locked = false;
                         let (low, high) = trace.settings.display.default_y();
-                        trace.view.reset(
-                            workspace.range.start_hz,
-                            workspace.range.stop_hz,
-                            low,
-                            high,
-                        );
+                        trace.view.reset(bounds.0, bounds.1, low, high);
                         if let Some(options) = &completed_options {
                             widgets::plot::fit_view(&mut trace.view, options);
                         }
@@ -814,7 +840,9 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .show(ui, |ui| {
                     let editable = state.sweep != SweepState::Stopping
                         && state.connection != ConnectionState::Disconnecting;
-                    let sweep_center = state.workspace.range.center_hz;
+                    let list_mode = state.workspace.list_mode;
+                    let (start, stop) = state.workspace.frequency_bounds();
+                    let sweep_center = (start + stop) / 2.0;
                     let mut marker_center = None;
                     if let Some(trace) = state.workspace.selected_mut() {
                         ui.push_id(trace.id.0, |ui| {
@@ -848,6 +876,7 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                     complete.as_deref(),
                                     trace.settings.display.is_smith(),
                                     sweep_center,
+                                    !list_mode,
                                 );
                             });
                             if trace.completed.is_some() && complete.is_none() {
@@ -1129,6 +1158,56 @@ mod tests {
             .selected()
             .and_then(|trace| trace.completed.as_ref())
             .map(|snapshot| snapshot.data.clone())
+    }
+
+    #[test]
+    fn changing_same_count_list_rejects_old_completions_and_previews() {
+        let mut app = active_impedance_app();
+        let original = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .clone()
+            .unwrap();
+        app.state.workspace.list_mode = true;
+        app.state.workspace.frequencies_hz = vec![1_000_000, 1_500_000, 2_000_000];
+        app.state.reconcile_plan();
+        let stale = completion(&app, 0, 1);
+        let old_preview = prefix(&app, 0, 1, 2);
+        app.state.workspace.frequencies_hz[1] = 1_750_000;
+        // The UI may edit definitions before the end-of-frame replan.
+        app.apply_worker_event(stale);
+        app.apply_preview(old_preview);
+        assert!(Arc::ptr_eq(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap(),
+            &original
+        ));
+        assert!(app.state.workspace.selected().unwrap().preview.is_none());
+        app.state.reconcile_plan();
+        app.apply_worker_event(completion(&app, 0, 2));
+        let complete = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            complete.settings,
+            app.state.active_plan.as_ref().unwrap().groups[0].settings
+        );
+        assert!(
+            matches!(&complete.settings, crate::acquisition::AcquisitionSettings::List { frequencies_hz, .. } if frequencies_hz[1] == 1_750_000)
+        );
     }
 
     fn prefix(
@@ -1641,6 +1720,7 @@ mod tests {
                             trace.completed.as_deref(),
                             display.is_smith(),
                             300e6,
+                            true,
                         );
                     },
                 )

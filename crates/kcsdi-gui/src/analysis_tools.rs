@@ -367,6 +367,7 @@ impl AnalysisTools {
         trace: Option<&CompletedSweep>,
         smith: bool,
         sweep_center_hz: f64,
+        allow_sweep_center: bool,
     ) -> Option<f64> {
         self.set_language(language);
         self.set_smith(smith);
@@ -464,7 +465,7 @@ impl AnalysisTools {
                 self.move_selected(trace, sweep_center_hz);
             }
         });
-        let center = self.marker_readout(ui, language, trace, ready);
+        let center = self.marker_readout(ui, language, trace, ready, allow_sweep_center);
         let position = egui::pos2(ui.ctx().content_rect().left() + 316.0, 56.0);
         egui::Window::new(format!(
             "T{} {}",
@@ -630,6 +631,7 @@ impl AnalysisTools {
         language: Language,
         trace: &SweepData,
         ready: bool,
+        allow_sweep_center: bool,
     ) -> Option<f64> {
         let index = self.markers.iter().position(|marker| marker.selected)?;
         let mut frequency = self.markers[index].frequency_hz / 1e6;
@@ -651,7 +653,7 @@ impl AnalysisTools {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    ready,
+                    ready && allow_sweep_center,
                     egui::Button::new(language.text(Text::AnalysisCenterAtMarker)),
                 )
                 .on_hover_text(language.text(Text::AnalysisCenterAtMarkerHelp))
@@ -1043,6 +1045,7 @@ mod tests {
                 params.start_hz = start_hz;
                 params.stop_hz = stop_hz;
             }
+            AcquisitionSettings::List { .. } => unreachable!("finite snapshot fixture"),
         }
         assert!(settings.accepts(data));
         CompletedSweep {
@@ -1168,6 +1171,7 @@ mod tests {
                                 Some(&completed),
                                 false,
                                 2e6,
+                                true,
                             )
                         });
                 },
@@ -1809,7 +1813,14 @@ mod tests {
                     .frame(egui::Frame::new().inner_margin(8))
                     .show(ui, |ui| {
                         let edge = ui.max_rect().right();
-                        tools.controls_for_display(ui, language, Some(complete), tools.smith, 2e6);
+                        tools.controls_for_display(
+                            ui,
+                            language,
+                            Some(complete),
+                            tools.smith,
+                            2e6,
+                            true,
+                        );
                         assert!(
                             ui.min_rect().right() <= edge + 0.1,
                             "analysis controls overflow a 240 px panel"
@@ -2037,6 +2048,7 @@ mod tests {
                                         complete,
                                         false,
                                         2e6,
+                                        true,
                                     );
                                 });
                         },

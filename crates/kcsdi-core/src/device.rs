@@ -88,6 +88,57 @@ pub struct SpecParams {
     pub ref_level_dbm: i32,
 }
 
+/// Receiver settings for a single-frequency acquisition (sections 3.4, 3.5
+/// and 3.8). The host interrupts the continuous stream after one full frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointSettings {
+    S11 {
+        cal: Cal,
+        format: Format,
+        rbw: Option<Rbw>,
+    },
+    S21 {
+        cal: Cal,
+        format: Format,
+        lo: Lo,
+        rbw: Option<Rbw>,
+    },
+    Spec {
+        cal: Cal,
+        lo: Lo,
+        rbw: Rbw,
+        ref_level_dbm: i32,
+    },
+}
+
+impl PointSettings {
+    pub fn mode(&self) -> StreamMode {
+        match self {
+            Self::S11 { .. } => StreamMode::S11,
+            Self::S21 { .. } => StreamMode::S21,
+            Self::Spec { .. } => StreamMode::Spec,
+        }
+    }
+
+    pub fn format(&self) -> &'static str {
+        self.measurement_format().map_or("", Format::as_str)
+    }
+
+    fn measurement_format(&self) -> Option<Format> {
+        match self {
+            Self::S11 { format, .. } | Self::S21 { format, .. } => Some(*format),
+            Self::Spec { .. } => None,
+        }
+    }
+}
+
+/// One requested frequency, independent of finite sweep span and point count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointParams {
+    pub settings: PointSettings,
+    pub frequency_hz: u64,
+}
+
 /// A remote-control session with a KC901 instrument.
 pub struct Device<T: Transport> {
     transport: T,
@@ -405,6 +456,86 @@ impl<T: Transport> Device<T> {
             )
         })();
         self.finish_sweep(result)
+    }
+
+    /// Acquire one complete point and interrupt the continuous output before
+    /// returning it. Reported frequency and raw values remain unchanged.
+    /// Point limits follow the source-based mode tables, not a finite sweep.
+    pub fn measure_point(&mut self, params: &PointParams) -> Result<SweepData> {
+        self.measure_point_controlled(params, &CancellationToken::default())
+    }
+
+    /// No point is published until an interrupt and fresh identity reply
+    /// establish the receive boundary. Failed synchronization retires the
+    /// session. Cancellation also discards a point captured before cleanup.
+    pub fn measure_point_controlled(
+        &mut self,
+        params: &PointParams,
+        cancel: &CancellationToken,
+    ) -> Result<SweepData> {
+        cancel.check()?;
+        params.validate(&self.caps)?;
+        if self.requires_reconnect() {
+            return Err(Error::NotConnected);
+        }
+        let result = (|| {
+            self.prepare_mode(params.settings.mode(), cancel)?;
+            let frequency = params.frequency_hz;
+            let run = match params.settings {
+                PointSettings::S11 { cal, format, rbw } => {
+                    if let Some(rbw) = rbw {
+                        self.set_rbw(rbw, cancel)?;
+                    }
+                    commands::s11_run(cal, format, 1, ScanMode::StartStop, frequency, None)
+                }
+                PointSettings::S21 {
+                    cal,
+                    format,
+                    lo,
+                    rbw,
+                } => {
+                    if let Some(rbw) = rbw {
+                        self.set_rbw(rbw, cancel)?;
+                    }
+                    commands::s21_run(cal, format, lo, 1, ScanMode::StartStop, frequency, None)
+                }
+                PointSettings::Spec {
+                    cal,
+                    lo,
+                    rbw,
+                    ref_level_dbm,
+                } => {
+                    self.set_rbw(rbw, cancel)?;
+                    self.send_controlled(commands::set_spec_ref(ref_level_dbm).as_bytes(), cancel)?;
+                    commands::spec_run(cal, lo, 1, ScanMode::StartStop, frequency, None, None)
+                }
+            };
+            self.send_controlled(run.as_bytes(), cancel)?;
+            self.collect_controlled(
+                params.settings.mode(),
+                params.settings.measurement_format(),
+                1,
+                self.sweep_timeout(1),
+                cancel,
+                |_| {},
+            )
+        })();
+        // Framing and transport failures remain terminal even if the cleanup
+        // reply arrives. A full point alone never ends continuous acquisition.
+        let result = self.record_result(result);
+        let cleanup = self.cancel_sweep(CLEANUP_TIMEOUT);
+        match result {
+            Err(Error::Cancelled) => {
+                cleanup?;
+                Err(Error::Cancelled)
+            }
+            Err(error) => Err(error),
+            Ok(data) => {
+                cleanup?;
+                cancel.check()?;
+                Ok(data)
+            }
+        }
     }
 
     fn send_controlled(&mut self, data: &[u8], cancel: &CancellationToken) -> Result<()> {
@@ -881,6 +1012,263 @@ mod tests {
         }
     }
 
+    fn point_params(mode: StreamMode) -> PointParams {
+        PointParams {
+            settings: match mode {
+                StreamMode::S11 => PointSettings::S11 {
+                    cal: Cal::CalOff,
+                    format: Format::Loss,
+                    rbw: Some(Rbw::R10k),
+                },
+                StreamMode::S21 => PointSettings::S21 {
+                    cal: Cal::CalOff,
+                    format: Format::Loss,
+                    lo: Lo::HighLo,
+                    rbw: Some(Rbw::R10k),
+                },
+                StreamMode::Spec => PointSettings::Spec {
+                    cal: Cal::CalOff,
+                    lo: Lo::HighLo,
+                    rbw: Rbw::R10k,
+                    ref_level_dbm: -10,
+                },
+                _ => unreachable!(),
+            },
+            frequency_hz: 1_000_000,
+        }
+    }
+
+    fn queue_point(mock: &mut MockTransport, settings: &PointSettings, value: &str) {
+        let header = if settings.format().is_empty() {
+            format!("$start,{}", settings.mode().name())
+        } else {
+            format!("$start,{},{}", settings.mode().name(), settings.format())
+        };
+        mock.incoming
+            .extend([header, format!("$999999,{value}"), "$end".into()]);
+    }
+
+    #[test]
+    fn point_runs_use_continuous_count_one_then_fence_and_reinitialize() {
+        for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
+            let params = point_params(mode);
+            let mut mock = MockTransport::with_lines(&[]);
+            queue_point(&mut mock, &params.settings, "-12.5");
+            queue_point(&mut mock, &params.settings, "999");
+            mock.queue_identity();
+            queue_point(&mut mock, &params.settings, "-20");
+            mock.queue_identity();
+            let mut dev = Device::new(mock);
+            for expected in [-12.5, -20.0] {
+                let point = dev.measure_point(&params).unwrap();
+                assert_eq!(point.mode, mode);
+                assert_eq!(point.format, params.settings.format());
+                assert_eq!(point.points.len(), 1);
+                assert_eq!(point.points[0].freq_hz, 999_999.0);
+                assert_eq!(point.points[0].values, [expected]);
+                assert!(!dev.requires_reconnect());
+                assert_eq!(dev.active_mode, None);
+                assert_eq!(dev.last_rbw, None);
+            }
+            let (receiver, run) = match mode {
+                StreamMode::S11 => ("$bw,10k\n", "$s11,run,caloff,loss,1,ss,1000000\n"),
+                StreamMode::S21 => ("$bw,10k\n", "$s21,run,caloff,loss,highlo,1,ss,1000000\n"),
+                StreamMode::Spec => (
+                    "$bw,10k\n$specref,-10\n",
+                    "$spec,run,caloff,highlo,1,ss,1000000\n",
+                ),
+                _ => unreachable!(),
+            };
+            let commands = format!(
+                "$s11,stop\n$s21,stop\n$spec,stop\n${},init\n{receiver}{run}\x03$device\n",
+                mode.name()
+            );
+            assert_eq!(dev.transport.sent_text(), commands.repeat(2));
+            assert!(dev.transport.incoming.is_empty());
+        }
+    }
+
+    #[test]
+    fn point_repeated_headers_replace_incomplete_rows_without_relabeling() {
+        let params = point_params(StreamMode::S11);
+        let mut mock = MockTransport::with_lines(&[
+            "$start,s11,loss",
+            "$1000000,999",
+            "$start,s11,loss",
+            "$start,s11,loss",
+            "$1000000.25,NaN",
+            "$end",
+        ]);
+        mock.queue_identity();
+        let mut dev = Device::new(mock);
+        let point = dev.measure_point(&params).unwrap();
+        assert_eq!(point.points.len(), 1);
+        assert_eq!(point.points[0].freq_hz, 1_000_000.25);
+        assert!(point.points[0].values[0].is_nan());
+    }
+
+    #[test]
+    fn point_invalid_parameters_and_retired_sessions_perform_no_io() {
+        let mut dev = Device::new(MockTransport::with_lines(&[]));
+        let mut params = point_params(StreamMode::S11);
+        params.frequency_hz = 0;
+        assert!(matches!(
+            dev.measure_point(&params),
+            Err(Error::InvalidParameter(_))
+        ));
+        params.frequency_hz = 1_000_000;
+        params.settings = PointSettings::S11 {
+            cal: Cal::CalOn,
+            format: Format::Delay,
+            rbw: Some(Rbw::R100Hz),
+        };
+        assert!(matches!(
+            dev.measure_point(&params),
+            Err(Error::InvalidParameter(_))
+        ));
+        dev.session_failed = true;
+        assert!(matches!(
+            dev.measure_point(&point_params(StreamMode::S11)),
+            Err(Error::NotConnected)
+        ));
+        assert!(dev.transport.sent.is_empty());
+        assert!(dev.transport.read_timeouts.is_empty());
+    }
+
+    #[test]
+    fn malformed_point_frames_are_never_published_or_reused_after_cleanup() {
+        for lines in [
+            vec!["$start,s11,loss", "$end"],
+            vec!["$start,s11,loss", "$1000000,1", "$1000000,2", "$end"],
+            vec!["$start,s11,loss", "$1000000,1,2", "$end"],
+            vec!["$start,s11,loss", "$NaN,1", "$end"],
+            vec!["$start,s11,loss", "$-1,1", "$end"],
+            vec!["$start,s21,loss", "$1000000,1", "$end"],
+            vec!["$start,s11,z", "$1000000,1,2,3", "$end"],
+        ] {
+            let mut mock = MockTransport::with_lines(&lines);
+            mock.queue_identity();
+            let mut dev = Device::new(mock);
+            let params = point_params(StreamMode::S11);
+            assert!(
+                matches!(dev.measure_point(&params), Err(Error::Protocol(_))),
+                "{lines:?}"
+            );
+            assert!(dev.requires_reconnect());
+            assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(
+                dev.measure_point(&params),
+                Err(Error::NotConnected)
+            ));
+            assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent, sent);
+        }
+    }
+
+    #[test]
+    fn point_failure_fence_retires_complete_but_unaccepted_data() {
+        for failure in ["identity", "device", "abort", "query"] {
+            let params = point_params(StreamMode::S11);
+            let mut mock = MockTransport::with_lines(&[]);
+            queue_point(&mut mock, &params.settings, "1");
+            match failure {
+                "identity" => mock
+                    .incoming
+                    .extend(["$start,device", "$bad", "$end"].map(str::to_owned)),
+                "device" => mock
+                    .incoming
+                    .extend(["$start,err_cmd", "$bad", "$end"].map(str::to_owned)),
+                "abort" => mock.fail_send = Some(7),
+                "query" => mock.fail_send = Some(8),
+                _ => unreachable!(),
+            }
+            let mut dev = Device::new(mock);
+            assert!(dev.measure_point(&params).is_err(), "{failure}");
+            assert!(dev.requires_reconnect(), "{failure}");
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(
+                dev.measure_point(&params),
+                Err(Error::NotConnected)
+            ));
+            assert_eq!(dev.transport.sent, sent);
+        }
+    }
+
+    #[test]
+    fn point_cancellation_discards_data_even_during_the_final_identity_fence() {
+        for cancel_read in [1, 2, 3, 4, 11] {
+            let params = point_params(StreamMode::S11);
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            queue_point(&mut mock, &params.settings, "1");
+            mock.queue_identity();
+            mock.cancel_on_read = Some((cancel_read, cancel.clone()));
+            let mut dev = Device::new(mock);
+            assert!(
+                matches!(
+                    dev.measure_point_controlled(&params, &cancel),
+                    Err(Error::Cancelled)
+                ),
+                "read {cancel_read}"
+            );
+            assert!(!dev.requires_reconnect());
+            assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+            assert!(dev.transport.incoming.is_empty());
+        }
+    }
+
+    #[test]
+    fn point_setup_cancellation_never_sends_run_and_still_synchronizes() {
+        for send in 1..=5 {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.cancel_on_send = Some((send, cancel.clone()));
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.measure_point_controlled(&point_params(StreamMode::S11), &cancel),
+                Err(Error::Cancelled)
+            ));
+            assert!(!dev.transport.sent_text().contains(",run,"));
+            assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+            assert!(!dev.requires_reconnect());
+        }
+    }
+
+    #[test]
+    fn framed_point_device_error_is_recoverable_only_after_a_successful_fence() {
+        let params = point_params(StreamMode::S11);
+        let mut mock = MockTransport::with_lines(&["$start,err_par5", "$error", "$end"]);
+        mock.queue_identity();
+        queue_point(&mut mock, &params.settings, "2");
+        mock.queue_identity();
+        let mut dev = Device::new(mock);
+        assert!(
+            matches!(dev.measure_point(&params), Err(Error::Device(name)) if name == "err_par5")
+        );
+        assert!(!dev.requires_reconnect());
+        assert_eq!(dev.measure_point(&params).unwrap().points[0].values, [2.0]);
+    }
+
+    #[test]
+    fn point_device_error_preserves_its_diagnostic_when_cleanup_also_fails() {
+        let params = point_params(StreamMode::S11);
+        let mut mock = MockTransport::with_lines(&["$start,err_par5", "$error", "$end"]);
+        mock.fail_send = Some(7);
+        let mut dev = Device::new(mock);
+        assert!(
+            matches!(dev.measure_point(&params), Err(Error::Device(name)) if name == "err_par5")
+        );
+        assert!(dev.requires_reconnect());
+        let sent = dev.transport.sent.clone();
+        assert!(matches!(
+            dev.measure_point(&params),
+            Err(Error::NotConnected)
+        ));
+        assert_eq!(dev.transport.sent, sent);
+    }
+
     impl Transport for MockTransport {
         fn send_with_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
             self.send_calls += 1;
@@ -953,6 +1341,10 @@ mod tests {
         ));
         assert!(matches!(
             dev.sweep_s21_controlled(&s21_params(3), &cancel, |_| panic!("no preview expected")),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.measure_point_controlled(&point_params(StreamMode::S11), &cancel),
             Err(Error::Cancelled)
         ));
         assert!(dev.transport.sent.is_empty());
