@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use kcsdi_core::data::SweepData;
 
+use crate::acquisition::AcquisitionGroup;
+
 /// An incomplete sweep, even when all expected rows have arrived before its end.
 #[derive(Debug)]
 pub struct PreviewEnvelope {
@@ -18,7 +20,7 @@ pub struct PreviewEnvelope {
     pub request_id: u64,
     pub cycle_id: u64,
     pub data: SweepData,
-    pub expected_points: u32,
+    pub group: AcquisitionGroup,
 }
 
 /// Shared latest-preview slot. Lock contention never delays the producer.
@@ -83,7 +85,12 @@ mod tests {
                     })
                     .collect(),
             },
-            expected_points: 3,
+            group: AcquisitionGroup {
+                settings: crate::acquisition::AcquisitionSettings::S11(
+                    crate::acquisition::tests::s11(),
+                ),
+                members: vec![crate::acquisition::TraceId(1)],
+            },
         }
     }
 
@@ -97,7 +104,7 @@ mod tests {
             (received.session_id, received.request_id, received.cycle_id),
             (1, 2, 1)
         );
-        assert_eq!(received.expected_points, 3);
+        assert_eq!(received.group.settings.points(), 3);
         assert_eq!(received.data.points.len(), 2);
         assert!(mailbox.take().is_none());
     }

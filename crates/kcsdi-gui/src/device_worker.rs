@@ -8,33 +8,27 @@
 //! two mpsc channels. After every event the worker calls
 //! `ctx.request_repaint()` so the UI picks it up immediately.
 
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 
 use kcsdi_core::Device;
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{S11Params, SpecParams};
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
+use crate::acquisition::{AcquisitionSettings, CompletedSweep, SweepDelivery, SweepPlan};
 use crate::preview::{PreviewEnvelope, PreviewMailbox};
 use crate::state::{CommandEnvelope, DEVICE_MODEL, EventEnvelope, WorkerCommand, WorkerEvent};
 
 pub const EVENT_CAPACITY: usize = 16;
 
-/// A repeating sweep job requested by the UI.
-#[derive(Debug, Clone)]
-enum SweepJob {
-    Spec(SpecParams),
-    S11(S11Params),
-}
-
 #[derive(Debug, Clone)]
 struct SweepRequest {
     request_id: u64,
     cancel: CancellationToken,
-    job: SweepJob,
+    plan: SweepPlan,
+    next_group: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -82,6 +76,7 @@ pub fn device_worker(
                 job = None;
                 continue;
             }
+            let group = &current.plan.groups[current.next_group];
             cycle_id = cycle_id.checked_add(1).expect("sweep cycle ID exhausted");
             let source = WorkerIdentity {
                 session_id: identity.session_id,
@@ -106,24 +101,35 @@ pub fn device_worker(
                         format: progress.format.to_owned(),
                         points: progress.points.to_vec(),
                     },
-                    expected_points: progress.expected_points,
+                    group: group.clone(),
                 });
                 ctx.request_repaint();
             };
             let dev = device.as_mut().expect("checked above");
-            let result = match &current.job {
-                SweepJob::Spec(params) => {
+            let result = match &group.settings {
+                AcquisitionSettings::Spec(params) => {
                     dev.sweep_spec_controlled(params, &current.cancel, progress)
                 }
-                SweepJob::S11(params) => {
+                AcquisitionSettings::S11(params) => {
                     dev.sweep_s11_controlled(params, &current.cancel, progress)
                 }
             };
             match result {
                 Ok(data) => {
-                    let mut event = source.event(WorkerEvent::SweepTrace(data));
+                    let mut event = source.event(WorkerEvent::SweepTrace(SweepDelivery {
+                        members: group.members.clone(),
+                        snapshot: Arc::new(CompletedSweep {
+                            data,
+                            settings: group.settings.clone(),
+                            session_id: source.session_id,
+                            completed_at: SystemTime::now(),
+                        }),
+                    }));
                     event.cycle_id = Some(cycle_id);
                     send_event(&evt_tx, event, &shutdown, Some(&current.cancel), &ctx);
+                    if let Some(job) = job.as_mut() {
+                        job.next_group = (current.next_group + 1) % current.plan.groups.len();
+                    }
                 }
                 Err(e) => {
                     if !matches!(e, kcsdi_core::Error::Cancelled) {
@@ -266,25 +272,8 @@ fn handle(
             }
             emit(WorkerEvent::Disconnected);
         }
-        WorkerCommand::RunSpec(params) => {
-            start_sweep(
-                SweepJob::Spec(params),
-                request_id,
-                cancel,
-                device,
-                job,
-                &emit,
-            );
-        }
-        WorkerCommand::RunS11(params) => {
-            start_sweep(
-                SweepJob::S11(params),
-                request_id,
-                cancel,
-                device,
-                job,
-                &emit,
-            );
+        WorkerCommand::RunWorkspace(plan) => {
+            start_sweep(plan, request_id, cancel, device, job, &emit);
         }
         WorkerCommand::StopSweep => {
             *job = None;
@@ -316,7 +305,7 @@ fn handle(
 }
 
 fn start_sweep(
-    next: SweepJob,
+    next: SweepPlan,
     request_id: u64,
     cancel: CancellationToken,
     device: &mut Option<Device<TcpTransport>>,
@@ -325,6 +314,8 @@ fn start_sweep(
 ) {
     if cancel.is_cancelled() {
         *job = None;
+    } else if let Err(error) = next.validate() {
+        fail(error, "Run failed", device, job, emit);
     } else if device.is_none() {
         fail(
             kcsdi_core::Error::NotConnected,
@@ -337,7 +328,8 @@ fn start_sweep(
         *job = Some(SweepRequest {
             request_id,
             cancel,
-            job: next,
+            plan: next,
+            next_group: 0,
         });
     }
 }
@@ -374,15 +366,291 @@ fn connection_failed(error: &kcsdi_core::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acquisition::tests::{s11, spec};
+    use crate::acquisition::{AcquisitionGroup, TraceId};
     use kcsdi_core::Error;
     use std::cell::RefCell;
 
-    fn request(job: SweepJob) -> SweepRequest {
+    fn plan(settings: AcquisitionSettings) -> SweepPlan {
+        SweepPlan::from_requests([(TraceId(1), settings)]).unwrap()
+    }
+
+    fn request(settings: AcquisitionSettings) -> SweepRequest {
         SweepRequest {
             request_id: 0,
             cancel: CancellationToken::default(),
-            job,
+            plan: plan(settings),
+            next_group: 0,
         }
+    }
+
+    #[test]
+    fn invalid_workspace_plans_send_nothing_on_an_existing_connection() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let valid = plan(AcquisitionSettings::S11(s11()));
+        let mut invalid_params = spec();
+        invalid_params.points = 0;
+        let invalid_plans = [
+            SweepPlan { groups: Vec::new() },
+            SweepPlan {
+                groups: vec![
+                    valid.groups[0].clone(),
+                    AcquisitionGroup {
+                        settings: AcquisitionSettings::Spec(invalid_params),
+                        members: vec![TraceId(2)],
+                    },
+                ],
+            },
+            SweepPlan {
+                groups: vec![valid.groups[0].clone(), valid.groups[0].clone()],
+            },
+        ];
+        for invalid in invalid_plans {
+            assert!(invalid.validate().is_err());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let transport =
+                TcpTransport::connect("127.0.0.1", listener.local_addr().unwrap().port()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let mut device = Some(Device::new(transport));
+            let mut job = Some(request(AcquisitionSettings::S11(s11())));
+            let events = RefCell::new(Vec::new());
+            start_sweep(
+                invalid,
+                2,
+                CancellationToken::default(),
+                &mut device,
+                &mut job,
+                &|event| events.borrow_mut().push(event),
+            );
+            assert!(job.is_none());
+            assert!(!device.as_ref().unwrap().requires_reconnect());
+            let events = events.borrow();
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], WorkerEvent::Error(_)));
+            let error = peer.read(&mut [0]).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_replays_group_fanout_round_robin_order_and_partial_cancellation() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const IDENTITY: &[u8] = b"$start,device\n\
+            $Synthetic peer\n\
+            $<-User @ :replay>\n\
+            $<-Software ver:test>\n\
+            $<-Hardware ver:test>\n\
+            $<-Serial num:000000000001>\n\
+            $<-Copyright:Test fixture>\n\
+            $end\n";
+
+        fn expect_line(peer: &mut BufReader<TcpStream>, expected: &str) {
+            let mut line = String::new();
+            assert_ne!(peer.read_line(&mut line).unwrap(), 0);
+            assert_eq!(line, expected);
+        }
+
+        struct ShutdownOnDrop {
+            sender: mpsc::Sender<CommandEnvelope>,
+            shutdown: CancellationToken,
+            request: CancellationToken,
+        }
+
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.request.cancel();
+                self.shutdown.cancel();
+                let _ = self.sender.send(CommandEnvelope {
+                    session_id: 2,
+                    request_id: 4,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::Shutdown,
+                });
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let (partial_sent, partial_ready) = mpsc::channel();
+        let shutdown = CancellationToken::default();
+        let worker_shutdown = shutdown.clone();
+        let cancel = CancellationToken::default();
+        let settings = AcquisitionSettings::S11(s11());
+        let spectrum = AcquisitionSettings::Spec(spec());
+        let plan = SweepPlan::from_requests([
+            (TraceId(1), settings.clone()),
+            (TraceId(2), spectrum.clone()),
+            (TraceId(3), settings.clone()),
+        ])
+        .unwrap();
+        std::thread::scope(|scope| {
+            let cleanup = ShutdownOnDrop {
+                sender: commands.clone(),
+                shutdown,
+                request: cancel.clone(),
+            };
+            let server = scope.spawn(move || {
+                let began = Instant::now();
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(began.elapsed() < WAIT, "worker did not connect");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("peer accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(WAIT)).unwrap();
+                socket.set_write_timeout(Some(WAIT)).unwrap();
+                socket.set_nodelay(true).unwrap();
+                let mut peer = BufReader::new(socket);
+                let mut handshake = [0];
+                peer.read_exact(&mut handshake).unwrap();
+                assert_eq!(&handshake, b"C");
+                peer.get_mut()
+                    .write_all(b"$start,id\n$000000000001\n$end\n")
+                    .unwrap();
+                expect_line(&mut peer, "$device\n");
+                peer.get_mut().write_all(IDENTITY).unwrap();
+
+                for command in [
+                    "$s11,stop\n",
+                    "$spec,stop\n",
+                    "$s11,init\n",
+                    "$bw,10k\n",
+                    "$s11,run,caloff,z,2,ss,1000000,2000000\n",
+                ] {
+                    expect_line(&mut peer, command);
+                }
+                peer.get_mut().write_all(
+                    b"$start,s11,z\n$1000000,50,50,0\n$1500000,55,55,0\n$2000000,60,60,0\n$end\n"
+                ).unwrap();
+                for command in [
+                    "$s11,stop\n",
+                    "$spec,init\n",
+                    "$bw,10k\n",
+                    "$specref,-10\n",
+                    "$spec,run,caloff,highlo,2,ss,1000000,2000000\n",
+                ] {
+                    expect_line(&mut peer, command);
+                }
+                peer.get_mut()
+                    .write_all(b"$start,spec\n$1000000,-10\n$1500000,-20\n$2000000,-30\n$end\n")
+                    .unwrap();
+                // The next pass returns to the first group, rather than
+                // measuring its second display member as a separate sweep.
+                for command in [
+                    "$spec,stop\n",
+                    "$s11,init\n",
+                    "$bw,10k\n",
+                    "$s11,run,caloff,z,2,ss,1000000,2000000\n",
+                ] {
+                    expect_line(&mut peer, command);
+                }
+                peer.get_mut()
+                    .write_all(b"$start,s11,z\n$1000000,70,70,0\n$1500000,")
+                    .unwrap();
+                partial_sent.send(()).unwrap();
+                let mut interrupt = [0];
+                peer.read_exact(&mut interrupt).unwrap();
+                assert_eq!(interrupt, [3]);
+                expect_line(&mut peer, "$device\n");
+                // Ordered local replay, not an assertion about untested
+                // firmware behavior after an interrupted command.
+                peer.get_mut().write_all(b"75,75,0\n$end\n").unwrap();
+                peer.get_mut().write_all(IDENTITY).unwrap();
+                expect_line(&mut peer, "$local\n");
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            });
+            let worker = scope.spawn(move || {
+                device_worker(
+                    command_rx,
+                    events,
+                    egui::Context::default(),
+                    worker_shutdown,
+                    PreviewMailbox::default(),
+                );
+            });
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 1,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::Connect {
+                        host: "127.0.0.1".into(),
+                        port,
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::Connected(_)
+            ));
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 2,
+                    cancel: cancel.clone(),
+                    command: WorkerCommand::RunWorkspace(plan),
+                })
+                .unwrap();
+            let mut completed = Vec::new();
+            for (cycle, members, expected_settings) in [
+                (1, vec![TraceId(1), TraceId(3)], settings),
+                (2, vec![TraceId(2)], spectrum),
+            ] {
+                let event = event_rx.recv_timeout(WAIT).unwrap();
+                assert_eq!(
+                    (event.session_id, event.request_id, event.cycle_id),
+                    (1, 2, Some(cycle))
+                );
+                let WorkerEvent::SweepTrace(delivery) = event.event else {
+                    panic!("unexpected event: {:?}", event.event);
+                };
+                assert_eq!(delivery.members, members);
+                assert_eq!(delivery.snapshot.settings, expected_settings);
+                assert_eq!(delivery.snapshot.session_id, 1);
+                assert!(expected_settings.accepts(&delivery.snapshot.data));
+                completed.push(delivery.snapshot);
+            }
+            partial_ready.recv_timeout(WAIT).unwrap();
+            cancel.cancel();
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 3,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::StopSweep,
+                })
+                .unwrap();
+            let stopped = event_rx.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                (stopped.session_id, stopped.request_id, stopped.cycle_id),
+                (1, 3, None)
+            );
+            assert!(matches!(stopped.event, WorkerEvent::SweepStopped));
+            assert!(event_rx.try_recv().is_err());
+            assert_eq!(completed[0].data.points[0].values, [50.0, 50.0, 0.0]);
+            assert_eq!(completed[1].data.points[0].values, [-10.0]);
+            drop(cleanup);
+            worker.join().unwrap();
+            server.join().unwrap();
+        });
     }
 
     #[test]
@@ -500,9 +768,7 @@ mod tests {
                 session_id: 1,
                 request_id: 2,
                 cancel: token,
-                command: WorkerCommand::RunS11(
-                    crate::state::S11State::default().s11_params().unwrap(),
-                ),
+                command: WorkerCommand::RunWorkspace(plan(AcquisitionSettings::S11(s11()))),
             },
             &mut identity,
             &mut device,
@@ -573,12 +839,12 @@ mod tests {
             (
                 4,
                 8,
-                WorkerCommand::RunS11(crate::state::S11State::default().s11_params().unwrap()),
+                WorkerCommand::RunWorkspace(plan(AcquisitionSettings::S11(s11()))),
             ),
             (
                 3,
                 10,
-                WorkerCommand::RunSpec(crate::state::SpecState::default().spec_params().unwrap()),
+                WorkerCommand::RunWorkspace(plan(AcquisitionSettings::Spec(spec()))),
             ),
             (3, 10, WorkerCommand::RefreshStatus),
             (
@@ -629,8 +895,8 @@ mod tests {
     #[test]
     fn run_without_a_connection_cannot_create_a_dormant_job() {
         for command in [
-            WorkerCommand::RunS11(crate::state::S11State::default().s11_params().unwrap()),
-            WorkerCommand::RunSpec(crate::state::SpecState::default().spec_params().unwrap()),
+            WorkerCommand::RunWorkspace(plan(AcquisitionSettings::S11(s11()))),
+            WorkerCommand::RunWorkspace(plan(AcquisitionSettings::Spec(spec()))),
         ] {
             let mut identity = WorkerIdentity {
                 session_id: 1,
@@ -693,7 +959,12 @@ mod tests {
         let mut job = Some(SweepRequest {
             request_id: 7,
             cancel: CancellationToken::default(),
-            job: SweepJob::S11(crate::state::S11State::default().s11_params().unwrap()),
+            plan: SweepPlan::from_requests([
+                (TraceId(1), AcquisitionSettings::S11(s11())),
+                (TraceId(2), AcquisitionSettings::Spec(spec())),
+            ])
+            .unwrap(),
+            next_group: 1,
         });
         let events = RefCell::new(Vec::new());
         handle(
@@ -710,7 +981,10 @@ mod tests {
         );
         server.join().unwrap();
         assert_eq!((identity.session_id, identity.request_id), (2, 7));
-        assert_eq!(job.unwrap().request_id, 7);
+        let job = job.unwrap();
+        assert_eq!(job.request_id, 7);
+        assert_eq!(job.next_group, 1);
+        assert_eq!(job.plan.groups.len(), 2);
         assert!(device.is_some());
         let events = events.borrow();
         assert_eq!((events[0].session_id, events[0].request_id), (2, 7));
@@ -732,9 +1006,7 @@ mod tests {
             Error::Io(std::io::ErrorKind::ConnectionReset.into()),
         ] {
             let mut device: Option<Device<TcpTransport>> = None;
-            let mut job = Some(request(SweepJob::S11(
-                crate::state::S11State::default().s11_params().unwrap(),
-            )));
+            let mut job = Some(request(AcquisitionSettings::S11(s11())));
             let events = RefCell::new(Vec::new());
             fail(error, "Sweep failed", &mut device, &mut job, &|event| {
                 events.borrow_mut().push(event);
@@ -774,9 +1046,7 @@ mod tests {
         let mut device = Some(Device::new(
             TcpTransport::connect("127.0.0.1", port).unwrap(),
         ));
-        let mut job = Some(request(SweepJob::S11(
-            crate::state::S11State::default().s11_params().unwrap(),
-        )));
+        let mut job = Some(request(AcquisitionSettings::S11(s11())));
         let events = RefCell::new(Vec::new());
         handle(
             CommandEnvelope {
@@ -810,7 +1080,7 @@ mod tests {
         impl kcsdi_core::transport::Transport for CleanupFailure {
             fn send_with_timeout(&mut self, _: &[u8], _: Duration) -> kcsdi_core::Result<()> {
                 self.sends += 1;
-                if self.sends == 5 {
+                if self.sends == 6 {
                     Err(Error::NotConnected)
                 } else {
                     Ok(())
@@ -827,10 +1097,10 @@ mod tests {
             lines: ["$start,err_par5", "$invalid frequency", "$end"].into(),
             sends: 0,
         }));
-        let params = crate::state::S11State::default().s11_params().unwrap();
+        let params = s11();
         let error = device.as_mut().unwrap().sweep_s11(&params).unwrap_err();
         assert!(matches!(&error, Error::Device(name) if name == "err_par5"));
-        let mut job = Some(request(SweepJob::S11(params)));
+        let mut job = Some(request(AcquisitionSettings::S11(params)));
         let events = RefCell::new(Vec::new());
         fail(error, "Sweep failed", &mut device, &mut job, &|event| {
             events.borrow_mut().push(event);

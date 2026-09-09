@@ -8,6 +8,7 @@ use egui::Color32;
 use kcsdi_core::data::SweepData;
 use std::collections::BTreeMap;
 
+use crate::acquisition::CompletedSweep;
 use crate::i18n::{Language, Text};
 use crate::widgets::plot::{Marker, Series};
 
@@ -15,7 +16,7 @@ const MAX_MARKERS: usize = 10;
 
 #[derive(Default)]
 pub struct AnalysisTools {
-    latest: Option<SweepData>,
+    latest: Option<CompletedSweep>,
     hold: bool,
     max_hold: bool,
     min_hold: bool,
@@ -24,7 +25,9 @@ pub struct AnalysisTools {
     minima: Option<Vec<Vec<f64>>>,
     markers: Vec<Marker>,
     next_id: u32,
+    trace_id: u64,
     column: usize,
+    fixed_column: Option<usize>,
     language: Language,
     overlay_visibility: BTreeMap<(String, usize, usize), bool>,
     rendered_overlays: Vec<(String, usize, usize)>,
@@ -40,14 +43,17 @@ enum Search {
 
 impl AnalysisTools {
     /// Called once for each complete measured sweep, never for partial data.
-    pub fn observe(&mut self, trace: &SweepData) {
-        if !self
-            .latest
-            .as_ref()
-            .is_some_and(|old| same_grid(old, trace))
-        {
+    pub fn observe(&mut self, snapshot: &CompletedSweep) {
+        let trace = &snapshot.data;
+        if !self.latest.as_ref().is_some_and(|old| {
+            old.session_id == snapshot.session_id
+                && old.settings == snapshot.settings
+                && same_grid(&old.data, trace)
+        }) {
             self.reset_holds();
-            self.column = usize::from(trace.format == "ma");
+            self.column = self
+                .fixed_column
+                .unwrap_or_else(|| usize::from(trace.format == "ma"));
             for marker in &mut self.markers {
                 if let Some(index) = nearest(trace, marker.frequency_hz) {
                     marker.frequency_hz = trace.points[index].freq_hz;
@@ -59,7 +65,18 @@ impl AnalysisTools {
         }
         update_envelope(&mut self.maxima, self.max_hold, trace, true);
         update_envelope(&mut self.minima, self.min_hold, trace, false);
-        self.latest = Some(trace.clone());
+        self.latest = Some(snapshot.clone());
+    }
+
+    pub fn set_trace_id(&mut self, trace_id: u64) {
+        self.trace_id = trace_id;
+    }
+
+    pub fn set_column(&mut self, column: Option<usize>) {
+        self.fixed_column = column;
+        if let Some(column) = column {
+            self.column = column;
+        }
     }
 
     pub fn markers(&self) -> &[Marker] {
@@ -77,7 +94,7 @@ impl AnalysisTools {
             return None;
         }
         let rows = self.held.as_ref()?;
-        let mut trace = self.latest.clone()?;
+        let mut trace = self.latest.as_ref()?.data.clone();
         for (point, row) in trace.points.iter_mut().zip(rows) {
             point.values.clone_from(row);
         }
@@ -88,9 +105,10 @@ impl AnalysisTools {
     /// columns matching its current display and leaves export data untouched.
     pub fn overlay_series(&mut self, columns: &[usize]) -> Vec<Series<'static>> {
         self.rendered_overlays.clear();
-        let Some(trace) = &self.latest else {
+        let Some(snapshot) = &self.latest else {
             return Vec::new();
         };
+        let trace = &snapshot.data;
         let mut result = Vec::new();
         for (kind, enabled, data, color) in [
             (
@@ -145,15 +163,11 @@ impl AnalysisTools {
         }
     }
 
-    pub fn controls(&mut self, ui: &mut egui::Ui, language: Language, trace: Option<&SweepData>) {
-        self.controls_for_display(ui, language, trace, false);
-    }
-
     pub fn controls_for_display(
         &mut self,
         ui: &mut egui::Ui,
         language: Language,
-        trace: Option<&SweepData>,
+        trace: Option<&CompletedSweep>,
         smith: bool,
     ) {
         self.language = language;
@@ -210,7 +224,9 @@ impl AnalysisTools {
         ui.vertical_centered(|ui| {
             ui.strong(language.text(Text::AnalysisMarkers));
         });
-        let trace = trace.filter(|t| t.points.iter().any(|p| p.freq_hz.is_finite()));
+        let trace = trace
+            .map(|snapshot| &snapshot.data)
+            .filter(|t| t.points.iter().any(|p| p.freq_hz.is_finite()));
         self.marker_buttons(ui, language, trace);
         let Some(trace) = trace else {
             ui.small(language.text(Text::NoData));
@@ -223,9 +239,7 @@ impl AnalysisTools {
         self.marker_readout(ui, language, trace);
         let position = egui::pos2(ui.ctx().content_rect().left() + 316.0, 56.0);
         egui::Window::new(language.text(Text::AnalysisMarkers))
-            .id(ui
-                .id()
-                .with(("marker_table_window", format!("{:?}", trace.mode))))
+            .id(ui.id().with(("marker_table_window", self.trace_id)))
             .default_pos(position)
             .default_width(290.0)
             .resizable(false)
@@ -309,20 +323,22 @@ impl AnalysisTools {
             return;
         }
         self.column = self.column.min(count - 1);
-        ui.horizontal(|ui| {
-            ui.label(language.text(Text::AnalysisColumn));
-            egui::ComboBox::from_id_salt("marker_column")
-                .selected_text(column_label(&trace.format, self.column, language))
-                .show_ui(ui, |ui| {
-                    for column in 0..count {
-                        ui.selectable_value(
-                            &mut self.column,
-                            column,
-                            column_label(&trace.format, column, language),
-                        );
-                    }
-                });
-        });
+        if self.fixed_column.is_none() {
+            ui.horizontal(|ui| {
+                ui.label(language.text(Text::AnalysisColumn));
+                egui::ComboBox::from_id_salt("marker_column")
+                    .selected_text(column_label(&trace.format, self.column, language))
+                    .show_ui(ui, |ui| {
+                        for column in 0..count {
+                            ui.selectable_value(
+                                &mut self.column,
+                                column,
+                                column_label(&trace.format, column, language),
+                            );
+                        }
+                    });
+            });
+        }
         ui.add_enabled_ui(!self.markers.is_empty(), |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (action, text) in [
@@ -567,6 +583,41 @@ mod tests {
         }
     }
 
+    fn snapshot(data: &SweepData) -> CompletedSweep {
+        use crate::acquisition::{AcquisitionSettings, tests};
+        let mut settings = if data.mode == StreamMode::S11 {
+            let mut params = tests::s11();
+            params.format = data.format.parse().unwrap();
+            params.points = data.points.len() as u32;
+            AcquisitionSettings::S11(params)
+        } else {
+            let mut params = tests::spec();
+            params.points = data.points.len() as u32;
+            AcquisitionSettings::Spec(params)
+        };
+        let (start_hz, stop_hz) = (
+            data.points[0].freq_hz as u64,
+            data.points.last().unwrap().freq_hz as u64,
+        );
+        match &mut settings {
+            AcquisitionSettings::S11(params) => {
+                params.start_hz = start_hz;
+                params.stop_hz = stop_hz;
+            }
+            AcquisitionSettings::Spec(params) => {
+                params.start_hz = start_hz;
+                params.stop_hz = stop_hz;
+            }
+        }
+        assert!(settings.accepts(data));
+        CompletedSweep {
+            data: data.clone(),
+            settings,
+            session_id: 1,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
     #[test]
     fn holds_preserve_snapshot_and_update_envelopes_without_mutating_input() {
         let first = trace(&[-8.0, -5.0, -10.0]);
@@ -577,8 +628,8 @@ mod tests {
             min_hold: true,
             ..Default::default()
         };
-        tools.observe(&first);
-        tools.observe(&second);
+        tools.observe(&snapshot(&first));
+        tools.observe(&snapshot(&second));
         assert_eq!(tools.held, Some(vec![vec![-8.0], vec![-5.0], vec![-10.0]]));
         assert_eq!(
             tools.maxima,
@@ -605,12 +656,12 @@ mod tests {
             max_hold: true,
             ..Default::default()
         };
-        tools.observe(&data);
+        tools.observe(&snapshot(&data));
         let mut overlays = tools.overlay_series(&[0, 1, 2]);
         overlays[1].visible = false;
         tools.apply_overlay_visibility(&overlays);
         tools.language = Language::SimplifiedChinese;
-        tools.observe(&data);
+        tools.observe(&snapshot(&data));
         let reordered = tools.overlay_series(&[2, 1]);
         assert!(reordered[0].visible);
         assert!(!reordered[1].visible);
@@ -623,7 +674,8 @@ mod tests {
         let ctx = egui::Context::default();
         let data = trace(&[3.0, 4.0, 5.0]);
         let mut tools = AnalysisTools::default();
-        tools.observe(&data);
+        let completed = snapshot(&data);
+        tools.observe(&completed);
         tools.add_marker(&data);
         let mut visible = false;
         for frame in 0..3 {
@@ -642,7 +694,14 @@ mod tests {
                         .show(ui, |_| {});
                     egui::Panel::right("parameters")
                         .exact_size(256.0)
-                        .show(ui, |ui| tools.controls(ui, Language::English, Some(&data)));
+                        .show(ui, |ui| {
+                            tools.controls_for_display(
+                                ui,
+                                Language::English,
+                                Some(&completed),
+                                false,
+                            )
+                        });
                 },
             );
             visible |= output.shapes.iter().any(|shape| match &shape.shape {
@@ -671,16 +730,17 @@ mod tests {
             ..Default::default()
         };
         let mut data = trace(&[1.0, 2.0, 3.0]);
-        tools.observe(&data);
+        tools.observe(&snapshot(&data));
         data.points[0].freq_hz += 1.0;
         data.points[0].values[0] = -1.0;
-        tools.observe(&data);
+        tools.observe(&snapshot(&data));
         assert_eq!(tools.maxima.as_ref().unwrap()[0][0], -1.0);
         data.format = "ma".into();
+        data.mode = StreamMode::S11;
         for point in &mut data.points {
             point.values = vec![0.5, -30.0];
         }
-        tools.observe(&data);
+        tools.observe(&snapshot(&data));
         assert_eq!(tools.column, 1);
         assert_eq!(tools.held.as_ref().unwrap()[0], vec![0.5, -30.0]);
     }
@@ -727,9 +787,92 @@ mod tests {
             max_hold: true,
             ..Default::default()
         };
-        tools.observe(&first);
-        tools.observe(&second);
+        tools.observe(&snapshot(&first));
+        tools.observe(&snapshot(&second));
         assert_eq!(tools.held_trace(), Some(first));
         assert_eq!(tools.maxima.as_ref().unwrap()[0], vec![50.0, 50.0, 40.0]);
+    }
+
+    #[test]
+    fn acquisition_conditions_and_sessions_reset_holds_on_an_identical_grid() {
+        use crate::acquisition::AcquisitionSettings;
+        use kcsdi_core::{
+            commands::{Cal, Lo},
+            device::SpecParams,
+            model::Rbw,
+        };
+        let first = snapshot(&trace(&[1.0, 2.0, 3.0]));
+        let AcquisitionSettings::Spec(base) = first.settings.clone() else {
+            unreachable!()
+        };
+        let changed_settings = [
+            SpecParams {
+                cal: Cal::CalSys,
+                ..base.clone()
+            },
+            SpecParams {
+                lo: Lo::LowLo,
+                ..base.clone()
+            },
+            SpecParams {
+                rbw: Rbw::R1k,
+                ..base.clone()
+            },
+            SpecParams {
+                ref_level_dbm: -20,
+                ..base.clone()
+            },
+        ];
+        let mut changed: Vec<_> = changed_settings
+            .into_iter()
+            .map(|settings| CompletedSweep {
+                settings: AcquisitionSettings::Spec(settings),
+                ..snapshot(&trace(&[-1.0, -2.0, -3.0]))
+            })
+            .collect();
+        changed.push(CompletedSweep {
+            session_id: 2,
+            ..snapshot(&trace(&[-1.0, -2.0, -3.0]))
+        });
+        for next in changed {
+            let mut tools = AnalysisTools {
+                hold: true,
+                max_hold: true,
+                min_hold: true,
+                ..Default::default()
+            };
+            tools.observe(&first);
+            tools.observe(&next);
+            assert_eq!(tools.held_trace(), Some(next.data.clone()));
+            assert_eq!(tools.maxima, Some(values(&next.data)));
+            assert_eq!(tools.minima, Some(values(&next.data)));
+        }
+    }
+
+    #[test]
+    fn timestamps_do_not_reset_holds_and_shared_snapshots_keep_analysis_independent() {
+        let first = snapshot(&trace(&[1.0, 2.0, 3.0]));
+        let mut next = snapshot(&trace(&[4.0, 5.0, 6.0]));
+        next.completed_at += std::time::Duration::from_secs(1);
+        let mut frozen = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            ..Default::default()
+        };
+        let mut live = AnalysisTools::default();
+        frozen.set_trace_id(1);
+        live.set_trace_id(2);
+        for tools in [&mut frozen, &mut live] {
+            tools.observe(&first);
+            tools.observe(&next);
+        }
+        assert_eq!(frozen.held_trace(), Some(first.data.clone()));
+        assert_eq!(frozen.maxima, Some(values(&next.data)));
+        assert!(live.held_trace().is_none());
+        assert!(live.maxima.is_none());
+        frozen.reset_holds();
+        frozen.observe(&next);
+        assert_eq!(frozen.held_trace(), Some(next.data));
+        assert_eq!(first.data.points[0].values, vec![1.0]);
     }
 }

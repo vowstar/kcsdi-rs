@@ -42,6 +42,16 @@ pub struct PlotOptions<'a> {
     pub series: Vec<Series<'a>>,
 }
 
+/// One trace's curves and interaction state in a shared Cartesian region.
+pub struct CartesianLayer<'a> {
+    pub id: u64,
+    pub label: String,
+    pub view: &'a mut PlotView,
+    pub options: PlotOptions<'static>,
+    pub markers: &'a mut [Marker],
+    pub line_width: f32,
+}
+
 impl<'a> PlotOptions<'a> {
     fn visible_series(&self) -> impl Iterator<Item = &Series<'a>> {
         self.series.iter().filter(|series| series.visible)
@@ -461,10 +471,158 @@ fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
 }
 
 /// Draw the plot and report whether the user locked or reset the view.
+#[cfg(test)]
 pub fn show(ui: &mut egui::Ui, view: &mut PlotView, opts: &mut PlotOptions) -> ViewLock {
     show_with_markers(ui, view, opts, &mut [])
 }
 
+/// Draw every layer with its own Y mapping and one shared frequency axis.
+/// View gestures use the selected visible layer. Only its Y bounds change.
+pub fn show_multi(
+    ui: &mut egui::Ui,
+    layers: &mut [CartesianLayer<'_>],
+    selected: Option<u64>,
+) -> Vec<(u64, ViewLock)> {
+    let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
+    let plot_rect = Rect::from_min_max(
+        rect.left_top() + egui::vec2(MARGIN_LEFT, MARGIN_TOP),
+        rect.right_bottom() - egui::vec2(MARGIN_RIGHT, MARGIN_BOTTOM),
+    );
+    ui.painter()
+        .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+    ui.painter()
+        .rect_filled(plot_rect, 0.0, chart_color(ui.ctx(), BG_COLOR));
+    let mut locks: Vec<_> = layers
+        .iter()
+        .map(|layer| (layer.id, ViewLock::Unchanged))
+        .collect();
+    if !plot_rect.is_positive() {
+        return locks;
+    }
+    let Some(active) = active_layer(layers, selected) else {
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            language(ui.ctx()).text(Text::NoData),
+            FontId::monospace(14.0),
+            chart_color(ui.ctx(), TEXT_COLOR),
+        );
+        return locks;
+    };
+    let layer = &mut layers[active];
+    ensure_x_view(layer.view, &layer.options);
+    sync_layer_x(layers, active);
+    let legend = multi_legend_rect(ui.painter(), layers, plot_rect);
+    let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
+    let mut marker_input = false;
+    if !over_legend {
+        // Last hit target wins at overlapping marker positions.
+        for index in (0..layers.len())
+            .filter(|&index| index != active)
+            .chain(std::iter::once(active))
+        {
+            let layer = &mut layers[index];
+            marker_input |= ui
+                .push_id(("cartesian_layer", layer.id), |ui| {
+                    interact_markers(
+                        ui,
+                        &Mapping::new(layer.view, layer.options.log_x, plot_rect),
+                        &layer.options,
+                        layer.markers,
+                    )
+                })
+                .inner;
+        }
+    }
+    if !over_legend && !marker_input {
+        let layer = &mut layers[active];
+        locks[active].1 = handle_input(ui, layer.view, &layer.options, plot_rect, &response);
+    }
+    sync_layer_x(layers, active);
+    let layer = &layers[active];
+    let mapping = Mapping::new(layer.view, layer.options.log_x, plot_rect);
+    let caption = format!("{} {}", layer.label, layer.options.y_label);
+    draw_grid(
+        ui.painter(),
+        layer.view,
+        &PlotOptions {
+            y_label: caption.trim(),
+            log_x: layer.options.log_x,
+            series: Vec::new(),
+        },
+        &mapping,
+    );
+    let clipped = ui.painter().with_clip_rect(plot_rect);
+    let mut has_data = false;
+    for index in (0..layers.len())
+        .filter(|&index| index != active)
+        .chain(std::iter::once(active))
+    {
+        let layer = &layers[index];
+        let mapping = Mapping::new(layer.view, layer.options.log_x, plot_rect);
+        for series in layer.options.visible_series() {
+            has_data |= series
+                .points
+                .iter()
+                .any(|&(x, y)| usable_x(layer.options.log_x, x) && y.is_finite());
+            draw_series_width(&clipped, &mapping, series, layer.line_width);
+        }
+        if layer.options.visible_series().any(|s| !s.points.is_empty()) {
+            draw_markers_label(&clipped, &mapping, layer.markers, &layer.label);
+        }
+    }
+    if !has_data {
+        let has_series = layers.iter().any(|layer| !layer.options.series.is_empty());
+        let any_visible = layers
+            .iter()
+            .any(|layer| layer.options.visible_series().next().is_some());
+        let has_samples = layers.iter().any(|layer| {
+            layer
+                .options
+                .visible_series()
+                .any(|series| !series.points.is_empty())
+        });
+        clipped.text(
+            plot_rect.center(),
+            Align2::CENTER_CENTER,
+            language(ui.ctx()).text(if has_series && !any_visible {
+                Text::AllTracesHidden
+            } else if layers[active].options.log_x && has_samples {
+                Text::NoPositiveData
+            } else {
+                Text::NoData
+            }),
+            FontId::monospace(14.0),
+            chart_color(ui.ctx(), TEXT_COLOR),
+        );
+    }
+    if !over_legend {
+        draw_cursor(ui.painter(), &layers[active].options, &mapping, &response);
+    }
+    draw_multi_legend(ui, layers, legend);
+    locks
+}
+
+fn active_layer(layers: &[CartesianLayer<'_>], selected: Option<u64>) -> Option<usize> {
+    let visible = |layer: &CartesianLayer<'_>| layer.options.visible_series().next().is_some();
+    layers
+        .iter()
+        .position(|layer| Some(layer.id) == selected && visible(layer))
+        .or_else(|| layers.iter().position(visible))
+        .or_else(|| (!layers.is_empty()).then_some(0))
+}
+
+fn sync_layer_x(layers: &mut [CartesianLayer<'_>], active: usize) {
+    let source = &layers[active];
+    let (min, max, log_x) = (source.view.x_min, source.view.x_max, source.options.log_x);
+    for layer in layers {
+        layer.view.x_min = min;
+        layer.view.x_max = max;
+        layer.options.log_x = log_x;
+    }
+}
+
+#[cfg(test)]
 pub fn show_with_markers(
     ui: &mut egui::Ui,
     view: &mut PlotView,
@@ -600,7 +758,12 @@ fn interact_markers(
     busy
 }
 
+#[cfg(test)]
 fn draw_markers(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker]) {
+    draw_markers_label(painter, mapping, markers, "");
+}
+
+fn draw_markers_label(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker], label: &str) {
     let painter = painter.with_clip_rect(mapping.rect);
     for marker in markers {
         if !usable_x(mapping.log_x, marker.frequency_hz) {
@@ -622,7 +785,12 @@ fn draw_markers(painter: &egui::Painter, mapping: &Mapping, markers: &[Marker]) 
         painter.text(
             Pos2::new(x, mapping.rect.top() + 3.0),
             Align2::CENTER_TOP,
-            format!("M{}{}", marker.id, if marker.reference { "R" } else { "" }),
+            format!(
+                "{label}{}M{}{}",
+                if label.is_empty() { "" } else { " " },
+                marker.id,
+                if marker.reference { "R" } else { "" }
+            ),
             FontId::monospace(12.0),
             color,
         );
@@ -794,8 +962,21 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, mappi
 }
 
 /// Invalid samples break runs. Negative and zero Y values remain valid.
+#[cfg(test)]
 fn draw_series(painter: &egui::Painter, mapping: &Mapping, series: &Series) {
-    let stroke = Stroke::new(1.5, series.color);
+    draw_series_width(painter, mapping, series, 1.5);
+}
+
+pub(super) fn stroke_width(width: f32) -> f32 {
+    if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        1.5
+    }
+}
+
+fn draw_series_width(painter: &egui::Painter, mapping: &Mapping, series: &Series, width: f32) {
+    let stroke = Stroke::new(stroke_width(width), series.color);
     let mut run = Vec::new();
     for &(x, y) in &series.points {
         if usable_x(mapping.log_x, x) && y.is_finite() {
@@ -821,7 +1002,176 @@ fn series_label(name: &str, unit: &str) -> String {
     }
 }
 
+fn layer_series_label(layer: &CartesianLayer<'_>, series: &Series<'_>) -> String {
+    format!(
+        "{} {}",
+        layer.label,
+        series_label(series.name, layer.options.y_label)
+    )
+}
+
+fn multi_legend_rect(painter: &egui::Painter, layers: &[CartesianLayer<'_>], plot: Rect) -> Rect {
+    let mut count = 0;
+    let mut width = 0.0_f32;
+    for layer in layers {
+        for series in &layer.options.series {
+            count += 1;
+            width = width.max(
+                painter
+                    .layout_no_wrap(
+                        layer_series_label(layer, series),
+                        FontId::monospace(LABEL_FONT_SIZE),
+                        chart_color(painter.ctx(), TEXT_COLOR),
+                    )
+                    .size()
+                    .x,
+            );
+        }
+    }
+    if count == 0 {
+        return Rect::NOTHING;
+    }
+    Rect::from_min_max(
+        Pos2::new(
+            (plot.right() - width - 28.0).max(plot.left()),
+            plot.top() + 2.0,
+        ),
+        Pos2::new(
+            plot.right(),
+            (plot.top() + 10.0 + LEGEND_ROW_HEIGHT * count as f32).min(plot.bottom()),
+        ),
+    )
+}
+
+/// Scroll the legend independently so every component remains reachable.
+fn draw_multi_legend(ui: &egui::Ui, layers: &mut [CartesianLayer<'_>], rect: Rect) {
+    if !rect.is_positive() {
+        return;
+    }
+    let count: usize = layers.iter().map(|layer| layer.options.series.len()).sum();
+    let overflow = (8.0 + LEGEND_ROW_HEIGHT * count as f32 - rect.height()).max(0.0);
+    let scroll_id = ui.id().with("cartesian_legend_scroll");
+    let mut offset = ui
+        .ctx()
+        .data(|data| data.get_temp::<f32>(scroll_id))
+        .unwrap_or(0.0);
+    if ui
+        .ctx()
+        .pointer_hover_pos()
+        .is_some_and(|pos| rect.contains(pos))
+    {
+        offset -= ui.ctx().input(|input| input.smooth_scroll_delta.y);
+    }
+    offset = offset.clamp(0.0, overflow);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(scroll_id, offset));
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 2.0, chart_color(ui.ctx(), BG_COLOR));
+    let mut index = 0;
+    for layer in layers {
+        for (component, series) in layer.options.series.iter_mut().enumerate() {
+            let top = rect.top() + 4.0 + index as f32 * LEGEND_ROW_HEIGHT - offset;
+            index += 1;
+            let row = Rect::from_min_max(
+                Pos2::new(rect.left(), top),
+                Pos2::new(rect.right(), top + LEGEND_ROW_HEIGHT),
+            );
+            if !row.intersects(rect) {
+                continue;
+            }
+            legend_row(
+                ui,
+                &painter,
+                row,
+                ui.id().with(("cartesian_legend", layer.id, component)),
+                &format!(
+                    "{} {}",
+                    layer.label,
+                    series_label(series.name, layer.options.y_label)
+                ),
+                series.color,
+                &mut series.visible,
+            );
+        }
+    }
+    if overflow > 0.0 {
+        let available = rect.height() - 4.0;
+        let height = (available * rect.height() / (rect.height() + overflow)).max(12.0);
+        let top = rect.top() + 2.0 + (available - height) * offset / overflow;
+        painter.line_segment(
+            [
+                Pos2::new(rect.left() + 2.0, top),
+                Pos2::new(rect.left() + 2.0, top + height),
+            ],
+            Stroke::new(2.0, chart_color(ui.ctx(), TEXT_COLOR)),
+        );
+    }
+}
+
+fn legend_row(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    row: Rect,
+    id: egui::Id,
+    label: &str,
+    color: Color32,
+    visible: &mut bool,
+) {
+    let response = ui
+        .interact(
+            row.intersect(painter.clip_rect()),
+            id,
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(language(ui.ctx()).text(if *visible {
+            Text::HideTrace
+        } else {
+            Text::ShowTrace
+        }));
+    if response.clicked()
+        && response
+            .interact_pointer_pos()
+            .is_some_and(|pos| painter.clip_rect().contains(pos))
+    {
+        *visible = !*visible;
+    }
+    if response.hovered() {
+        painter.rect_filled(row, 2.0, chart_color(ui.ctx(), GRID_COLOR));
+    }
+    let color = if *visible {
+        color
+    } else {
+        Color32::from_gray(100)
+    };
+    let bounds = painter.text(
+        Pos2::new(row.right() - 18.0, row.center().y),
+        Align2::RIGHT_CENTER,
+        label,
+        FontId::monospace(LABEL_FONT_SIZE),
+        if *visible {
+            chart_color(ui.ctx(), TEXT_COLOR)
+        } else {
+            color
+        },
+    );
+    painter.line_segment(
+        [
+            Pos2::new(row.right() - 14.0, row.center().y),
+            Pos2::new(row.right() - 4.0, row.center().y),
+        ],
+        Stroke::new(2.0, color),
+    );
+    if !*visible {
+        painter.line_segment(
+            [bounds.left_center(), bounds.right_center()],
+            Stroke::new(1.0, color),
+        );
+    }
+}
+
 /// Reserve the same rectangle for painting and hit-testing.
+#[cfg(test)]
 fn legend_rect(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) -> Rect {
     if opts.series.len() < 2 {
         return Rect::NOTHING;
@@ -856,13 +1206,13 @@ fn legend_rect(painter: &egui::Painter, opts: &PlotOptions, plot_rect: Rect) -> 
 }
 
 /// Keep every legend entry reachable, including when all traces are hidden.
+#[cfg(test)]
 fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
     if opts.series.len() < 2 || !rect.is_positive() {
         return;
     }
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 2.0, chart_color(painter.ctx(), BG_COLOR));
-    let font = FontId::monospace(LABEL_FONT_SIZE);
     for (index, series) in opts.series.iter_mut().enumerate() {
         let top = rect.top() + 4.0 + index as f32 * LEGEND_ROW_HEIGHT;
         let row = Rect::from_min_max(
@@ -873,54 +1223,15 @@ fn draw_legend(ui: &egui::Ui, opts: &mut PlotOptions, rect: Rect) {
         if !row.is_positive() {
             continue;
         }
-        let response = ui
-            .interact(
-                row,
-                ui.id().with(("trace_legend", index, series.name)),
-                Sense::click_and_drag(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(if series.visible {
-                language(ui.ctx()).text(Text::HideTrace)
-            } else {
-                language(ui.ctx()).text(Text::ShowTrace)
-            });
-        if response.clicked() {
-            series.visible = !series.visible;
-        }
-        if response.hovered() {
-            painter.rect_filled(row, 2.0, chart_color(painter.ctx(), GRID_COLOR));
-        }
-        let color = if series.visible {
-            series.color
-        } else {
-            Color32::from_gray(100)
-        };
-        let text_color = if series.visible {
-            chart_color(painter.ctx(), TEXT_COLOR)
-        } else {
-            color
-        };
-        let bounds = painter.text(
-            Pos2::new(rect.right() - 18.0, row.center().y),
-            Align2::RIGHT_CENTER,
-            series_label(series.name, opts.y_label),
-            font.clone(),
-            text_color,
+        legend_row(
+            ui,
+            &painter,
+            row,
+            ui.id().with(("trace_legend", index, series.name)),
+            &series_label(series.name, opts.y_label),
+            series.color,
+            &mut series.visible,
         );
-        painter.line_segment(
-            [
-                Pos2::new(rect.right() - 14.0, row.center().y),
-                Pos2::new(rect.right() - 4.0, row.center().y),
-            ],
-            Stroke::new(2.0, color),
-        );
-        if !series.visible {
-            painter.line_segment(
-                [bounds.left_center(), bounds.right_center()],
-                Stroke::new(1.0, color),
-            );
-        }
     }
 }
 
@@ -1021,6 +1332,337 @@ fn draw_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multi_frame(
+        ctx: &egui::Context,
+        layers: &mut [CartesianLayer<'_>],
+        selected: Option<u64>,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (Vec<(u64, ViewLock)>, egui::FullOutput) {
+        let mut locks = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect()),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| locks = show_multi(ui, layers, selected),
+        );
+        (locks, output)
+    }
+
+    fn test_layer<'a>(
+        id: u64,
+        view: &'a mut PlotView,
+        points: &[(f64, f64)],
+    ) -> CartesianLayer<'a> {
+        CartesianLayer {
+            id,
+            label: format!("T{id}"),
+            view,
+            options: options(points, false),
+            markers: &mut [],
+            line_width: id as f32,
+        }
+    }
+
+    #[test]
+    fn multiple_layers_share_x_but_render_with_their_own_y_and_style() {
+        let mut first = PlotView::new(7e6, 9e6, 0.0, 100.0);
+        let mut second = PlotView::new(1e6, 3e6, -100.0, -20.0);
+        let mut layers = [
+            test_layer(2, &mut first, &[(1e6, 25.0), (3e6, 75.0)]),
+            test_layer(4, &mut second, &[(1e6, -80.0), (3e6, -40.0)]),
+        ];
+        layers[1].options.y_label = "dBm";
+        let (locks, output) =
+            multi_frame(&egui::Context::default(), &mut layers, Some(4), vec![], 0.0);
+        let paths: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Path(path) => Some((path.stroke.width, path.points.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!((paths[0].0, paths[1].0), (2.0, 4.0));
+        assert_eq!(paths[0].1, paths[1].1);
+        assert!(output.shapes.iter().any(
+            |shape| matches!(&shape.shape, Shape::Text(text) if text.galley.text() == "T4 dBm")
+        ));
+        assert_eq!(locks, [(2, ViewLock::Unchanged), (4, ViewLock::Unchanged)]);
+        assert_eq!((layers[0].view.x_min, layers[0].view.x_max), (1e6, 3e6));
+        assert_eq!((layers[0].view.y_min, layers[0].view.y_max), (0.0, 100.0));
+        assert_eq!(
+            (layers[1].view.y_min, layers[1].view.y_max),
+            (-100.0, -20.0)
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn multi_zoom_changes_only_selected_y_and_synchronizes_x() {
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::CTRL,
+        ] {
+            let ctx = egui::Context::default();
+            let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
+            let mut second = PlotView::new(1e6, 3e6, -100.0, -20.0);
+            let mut layers = [
+                test_layer(2, &mut first, &[(1e6, 25.0), (3e6, 75.0)]),
+                test_layer(4, &mut second, &[(1e6, -80.0), (3e6, -40.0)]),
+            ];
+            multi_frame(&ctx, &mut layers, Some(4), vec![], 0.0)
+                .1
+                .drop_without_applying_deltas();
+            multi_frame(
+                &ctx,
+                &mut layers,
+                Some(4),
+                vec![egui::Event::PointerMoved(Pos2::new(300.0, 200.0))],
+                0.02,
+            )
+            .1
+            .drop_without_applying_deltas();
+            let (locks, output) = multi_frame(
+                &ctx,
+                &mut layers,
+                Some(4),
+                vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, 3.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers,
+                    },
+                ],
+                0.04,
+            );
+            assert_eq!(locks, [(2, ViewLock::Unchanged), (4, ViewLock::Locked)]);
+            assert_eq!((layers[0].view.y_min, layers[0].view.y_max), (0.0, 100.0));
+            assert_eq!(
+                layers[1].view.y_min != -100.0,
+                modifiers.shift || modifiers.ctrl
+            );
+            assert_eq!(layers[0].view.x_min, layers[1].view.x_min);
+            assert_eq!(layers[0].view.x_max, layers[1].view.x_max);
+            assert_eq!(layers[0].view.x_min != 1e6, !modifiers.shift);
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    fn click_multi_text(
+        ctx: &egui::Context,
+        layers: &mut [CartesianLayer<'_>],
+        label: &str,
+        time: f64,
+    ) {
+        let (_, output) = multi_frame(ctx, layers, Some(2), vec![], time);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing layer label {label}"));
+        output.drop_without_applying_deltas();
+        for (frame, events) in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            multi_frame(
+                ctx,
+                layers,
+                Some(2),
+                events,
+                time + (frame + 1) as f64 * 0.02,
+            )
+            .1
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn duplicate_component_names_have_independent_legend_hits_and_can_be_restored() {
+        let ctx = egui::Context::default();
+        let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
+        let mut second = first;
+        let mut layers = [
+            test_layer(2, &mut first, &[(1e6, 25.0), (3e6, 75.0)]),
+            test_layer(4, &mut second, &[(1e6, 30.0), (3e6, 70.0)]),
+        ];
+        click_multi_text(&ctx, &mut layers, "T4 X ohm", 0.0);
+        assert!(layers[0].options.series[0].visible);
+        assert!(!layers[1].options.series[0].visible);
+        click_multi_text(&ctx, &mut layers, "T2 X ohm", 1.0);
+        assert!(!layers[0].options.series[0].visible);
+        click_multi_text(&ctx, &mut layers, "T4 X ohm", 2.0);
+        assert!(!layers[0].options.series[0].visible);
+        assert!(layers[1].options.series[0].visible);
+        assert_eq!((layers[0].view.y_min, layers[0].view.y_max), (0.0, 100.0));
+    }
+
+    #[test]
+    fn overlapping_marker_numbers_prefer_the_selected_trace() {
+        let ctx = egui::Context::default();
+        let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
+        let mut second = first;
+        let marker = |frequency_hz| {
+            [Marker {
+                id: 1,
+                frequency_hz,
+                selected: false,
+                reference: false,
+            }]
+        };
+        let mut first_markers = marker(1.5e6);
+        let mut second_markers = marker(1.5e6);
+        let mut layers = [
+            test_layer(2, &mut first, &[(1e6, 25.0), (3e6, 75.0)]),
+            test_layer(4, &mut second, &[(1e6, 30.0), (3e6, 70.0)]),
+        ];
+        layers[0].markers = &mut first_markers;
+        layers[1].markers = &mut second_markers;
+        click_multi_text(&ctx, &mut layers, "T2 M1", 0.0);
+        assert!(layers[0].markers[0].selected);
+        assert!(!layers[1].markers[0].selected);
+    }
+
+    #[test]
+    fn empty_multi_plot_and_invalid_widths_are_safe() {
+        let (locks, output) = multi_frame(&egui::Context::default(), &mut [], None, vec![], 0.0);
+        assert!(locks.is_empty());
+        assert!(output.shapes.iter().any(
+            |shape| matches!(&shape.shape, Shape::Text(text) if text.galley.text() == "No data")
+        ));
+        output.drop_without_applying_deltas();
+        for width in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert_eq!(stroke_width(width), 1.5);
+        }
+    }
+
+    #[test]
+    fn unmeasured_layers_show_no_data_instead_of_all_hidden() {
+        for (has_series, visible, expected) in [
+            (false, true, Text::NoData),
+            (true, true, Text::NoData),
+            (true, false, Text::AllTracesHidden),
+        ] {
+            let ctx = egui::Context::default();
+            let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
+            let mut second = first;
+            let mut layers = [
+                test_layer(2, &mut first, &[]),
+                test_layer(4, &mut second, &[]),
+            ];
+            for layer in &mut layers {
+                if has_series {
+                    layer.options.series[0].visible = visible;
+                } else {
+                    layer.options.series.clear();
+                }
+            }
+            let (_, output) = multi_frame(&ctx, &mut layers, Some(4), vec![], 0.0);
+            let messages: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .filter(|text| {
+                    [Text::NoData, Text::AllTracesHidden, Text::NoPositiveData]
+                        .iter()
+                        .any(|message| *text == language(&ctx).text(*message))
+                })
+                .collect();
+            assert_eq!(messages, [language(&ctx).text(expected)]);
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn a_clipped_legend_row_cannot_receive_clicks_outside_its_clip() {
+        let ctx = egui::Context::default();
+        let mut visible = true;
+        let mut time = 0.0;
+        for (pos, expected) in [
+            (Pos2::new(150.0, 95.0), true),
+            (Pos2::new(150.0, 105.0), false),
+        ] {
+            let mut plot_clicked = false;
+            for events in [
+                vec![],
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ] {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(rect()),
+                        events,
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let (_, background) =
+                            ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
+                        plot_clicked |= background.clicked();
+                        let painter = ui.painter().with_clip_rect(Rect::from_min_max(
+                            Pos2::new(100.0, 100.0),
+                            Pos2::new(200.0, 120.0),
+                        ));
+                        legend_row(
+                            ui,
+                            &painter,
+                            Rect::from_min_max(Pos2::new(100.0, 90.0), Pos2::new(200.0, 110.0)),
+                            ui.id().with("clipped_row"),
+                            "T1",
+                            Color32::WHITE,
+                            &mut visible,
+                        );
+                    },
+                )
+                .drop_without_applying_deltas();
+                time += 0.02;
+            }
+            assert_eq!(visible, expected);
+            assert_eq!(plot_clicked, expected);
+        }
+    }
 
     #[test]
     fn nice_step_picks_1_2_5() {

@@ -588,13 +588,31 @@ mod tests {
             format: "loss".into(),
             points: Vec::new(),
         };
-        state.s11.trace = Some(trace.clone());
+        state.workspace.selected_mut().unwrap().completed =
+            Some(std::sync::Arc::new(crate::acquisition::CompletedSweep {
+                data: trace.clone(),
+                settings: crate::acquisition::AcquisitionSettings::S11(
+                    crate::acquisition::tests::s11(),
+                ),
+                session_id: 0,
+                completed_at: std::time::SystemTime::UNIX_EPOCH,
+            }));
         open_profile(&mut state, 0);
         assert_eq!(state.host, "instrument.local");
         assert_eq!(state.port, 4321);
         assert_eq!(state.desktop.page, Page::Instrument);
         assert_eq!(state.connection, ConnectionState::Disconnected);
-        assert_eq!(state.s11.trace, Some(trace));
+        assert_eq!(
+            state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+                .data,
+            trace
+        );
         assert!(matches!(
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)

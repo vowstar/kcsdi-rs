@@ -8,8 +8,8 @@ use std::sync::mpsc;
 
 use kcsdi_core::touchstone::{self, Document, Version};
 
+use crate::acquisition::CompletedSweep;
 use crate::i18n::{Language, Text};
-use crate::state::S11State;
 
 #[derive(Default)]
 pub struct ExportState {
@@ -63,8 +63,13 @@ impl ExportState {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, export: &mut ExportState, s11: &S11State, language: Language) {
-    let validation = s11.trace.as_ref().map(touchstone::validate_s1p);
+pub fn show(
+    ui: &mut egui::Ui,
+    export: &mut ExportState,
+    completed: Option<&CompletedSweep>,
+    language: Language,
+) {
+    let validation = completed.map(|snapshot| touchstone::validate_s1p(&snapshot.data));
     let ready = matches!(validation, Some(Ok(())));
     let busy = export.pending.is_some();
     ui.horizontal(|ui| {
@@ -85,12 +90,13 @@ pub fn show(ui: &mut egui::Ui, export: &mut ExportState, s11: &S11State, languag
         )
         .on_hover_text(language.text(Text::ExportHelp));
     if button.clicked() {
-        match snapshot(s11, export.version) {
+        match snapshot(completed, export.version) {
             Ok(document) => export.start(document, language, ui.ctx().clone()),
             Err(error) => export.outcome = Some(Outcome::Failed(error)),
         }
     }
-    if let Some(trace) = &s11.trace {
+    if let Some(completed) = completed {
+        let trace = &completed.data;
         let label = ui.small(format!(
             "{}: {} ({})",
             language.text(Text::ExportSnapshot),
@@ -134,9 +140,9 @@ pub fn show(ui: &mut egui::Ui, export: &mut ExportState, s11: &S11State, languag
     }
 }
 
-fn snapshot(s11: &S11State, version: Version) -> Result<Document, String> {
-    let trace = s11.trace.as_ref().ok_or("no completed S11 sweep")?;
-    Document::s1p(trace, version).map_err(|error| error.to_string())
+fn snapshot(completed: Option<&CompletedSweep>, version: Version) -> Result<Document, String> {
+    let completed = completed.ok_or("no completed S11 sweep")?;
+    Document::s1p(&completed.data, version).map_err(|error| error.to_string())
 }
 
 fn destination(mut path: PathBuf, language: Language) -> Result<PathBuf, String> {
@@ -189,8 +195,8 @@ mod tests {
 
     #[test]
     fn snapshot_uses_actual_trace_not_display_controls_and_is_frozen() {
-        let mut s11 = S11State {
-            trace: Some(SweepData {
+        let completed = std::sync::Arc::new(CompletedSweep {
+            data: SweepData {
                 mode: StreamMode::S11,
                 format: "ri".into(),
                 points: vec![
@@ -199,28 +205,51 @@ mod tests {
                         values: vec![0.5, -0.25],
                     },
                     SweepPoint {
+                        freq_hz: 1e6,
+                        values: vec![0.25, -0.1],
+                    },
+                    SweepPoint {
                         freq_hz: 7000000200.0,
                         values: vec![0.1, 0.2],
                     },
                 ],
+            },
+            settings: crate::acquisition::AcquisitionSettings::S11(kcsdi_core::device::S11Params {
+                format: kcsdi_core::commands::Format::Ri,
+                start_hz: 5000,
+                stop_hz: 7_000_000_000,
+                ..crate::acquisition::tests::s11()
             }),
-            ..S11State::default()
-        };
-        let first = snapshot(&s11, Version::V2).unwrap();
-        s11.log_x = true;
-        s11.impedance_visible = [false; 3];
-        s11.start_hz = 1e6;
-        s11.stop_hz = 2e6;
-        s11.display = crate::state::S11Display::Vswr;
+            session_id: 1,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+        });
+        let mut workspace = crate::workspace::Workspace::default();
+        let id = workspace.selected.unwrap();
+        workspace.selected_mut().unwrap().completed = Some(completed);
+        let first = snapshot(
+            workspace.selected().unwrap().completed.as_deref(),
+            Version::V2,
+        )
+        .unwrap();
+        workspace.log_x = true;
+        workspace.range.start_hz = 1e6;
+        workspace.range.stop_hz = 2e6;
+        let trace = workspace.selected_mut().unwrap();
+        trace.settings.impedance_visible = [false; 3];
+        trace.settings.visible = false;
+        trace.settings.display =
+            crate::workspace::TraceDisplay::S11(crate::state::S11Display::Vswr);
         assert_eq!(
             first.as_str(),
-            snapshot(&s11, Version::V2).unwrap().as_str()
+            snapshot(trace.completed.as_deref(), Version::V2)
+                .unwrap()
+                .as_str()
         );
-        s11.trace.as_mut().unwrap().points.clear();
-        assert!(snapshot(&s11, Version::V2).is_err());
-        assert!(first.as_str().contains("[Number of Frequencies] 2"));
+        workspace.remove_trace(id);
+        assert!(workspace.traces.is_empty());
+        assert!(first.as_str().contains("[Number of Frequencies] 3"));
         assert!(first.as_str().contains("7.0000002000000000e9"));
-        assert!(snapshot(&S11State::default(), Version::V2).is_err());
+        assert!(snapshot(None, Version::V2).is_err());
     }
 
     #[test]
@@ -242,7 +271,7 @@ mod tests {
     #[test]
     fn export_events_do_not_change_measurement_state() {
         let mut state = crate::state::AppState::default();
-        state.sweep = crate::state::SweepState::Running(crate::state::AppMode::S11);
+        state.sweep = crate::state::SweepState::Running;
         for outcome in [
             Outcome::Cancelled,
             Outcome::Failed("disk full".into()),
@@ -256,7 +285,7 @@ mod tests {
             state.export.poll();
             assert!(state.export.pending.is_none());
             assert!(state.export.outcome.is_some());
-            assert!(state.running(crate::state::AppMode::S11));
+            assert!(state.any_running());
             assert!(state.status_message.is_none());
         }
     }
@@ -269,9 +298,10 @@ mod tests {
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
             let mut state = crate::state::AppState {
                 language,
-                mode: crate::state::AppMode::S11,
                 ..Default::default()
             };
+            state.workspace.selected_mut().unwrap().settings.display =
+                crate::workspace::TraceDisplay::S11(crate::state::S11Display::Impedance);
             // Panels settle their content-sized height over successive frames.
             for _ in 0..3 {
                 let output = ctx.run_ui(

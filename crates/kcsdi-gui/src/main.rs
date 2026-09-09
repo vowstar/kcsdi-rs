@@ -6,6 +6,7 @@
 //! Provides a graphical interface for controlling KC901 analyzers using
 //! egui/eframe, modeled after the KCSDI reference interface.
 
+mod acquisition;
 mod analysis_tools;
 mod app;
 mod config;
@@ -18,6 +19,7 @@ mod preview;
 mod state;
 mod theme;
 mod widgets;
+mod workspace;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

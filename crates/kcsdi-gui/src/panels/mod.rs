@@ -8,3 +8,4 @@ pub mod spec_panel;
 pub mod status_bar;
 mod sweep_controls;
 pub mod top_bar;
+pub mod workspace_panel;

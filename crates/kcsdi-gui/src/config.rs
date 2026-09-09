@@ -19,18 +19,20 @@ use std::path::PathBuf;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use kcsdi_core::commands::Cal;
+use kcsdi_core::commands::{Cal, Lo};
 use kcsdi_core::model::Rbw;
 
+use crate::acquisition::{MAX_TRACES, TraceId};
 use crate::desktop::{DesktopConfig, DeviceProfile};
 use crate::i18n::LanguagePreference;
 use crate::state::{AppMode, AppState, S11Display};
+use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Workspace};
 
 /// Environment variable that overrides the config file path.
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 fn legacy_config_version() -> u32 {
     1
@@ -44,12 +46,167 @@ pub struct AppConfig {
     pub version: u32,
     /// Missing or unknown language preferences follow the system locale.
     pub language: LanguagePreference,
-    /// Last-used function mode ("spec" or "s11").
+    /// Read-only migration fields from the fixed-mode workspace.
+    #[serde(skip_serializing)]
     pub mode: String,
     pub connection: Connection,
+    #[serde(skip_serializing)]
+    pub spec: Spec,
+    #[serde(skip_serializing)]
+    pub s11: S11,
+    /// Original fixed-mode settings kept for recovery, never used for acquisition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_sweeps: Option<LegacySweeps>,
+    pub workspace: WorkspaceConfig,
+    pub desktop: DesktopConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacySweeps {
+    pub mode: String,
     pub spec: Spec,
     pub s11: S11,
-    pub desktop: DesktopConfig,
+}
+
+/// Trace definitions only. Measurements are never written to user settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub start_hz: f64,
+    pub stop_hz: f64,
+    pub points: u32,
+    pub log_x: bool,
+    pub selected: Option<TraceId>,
+    pub next_id: u64,
+    pub traces: Vec<TraceConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceConfig {
+    pub id: TraceId,
+    pub display: String,
+    pub cal: String,
+    pub rbw: String,
+    pub lo: String,
+    pub ref_level_dbm: i32,
+    pub visible: bool,
+    pub color: [u8; 4],
+    pub line_width: f32,
+    pub impedance_visible: [bool; 3],
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self::from_workspace(&Workspace::default())
+    }
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self::from_settings(TraceId(1), &TraceSettings::default())
+    }
+}
+
+impl TraceConfig {
+    fn from_settings(id: TraceId, settings: &TraceSettings) -> Self {
+        Self {
+            id,
+            display: match settings.display {
+                TraceDisplay::Spec => "spec",
+                TraceDisplay::S11(display) => display_as_str(display),
+            }
+            .to_owned(),
+            cal: settings.cal.as_str().to_owned(),
+            rbw: settings.rbw.as_str().to_owned(),
+            lo: settings.lo.as_str().to_owned(),
+            ref_level_dbm: settings.ref_level_dbm,
+            visible: settings.visible,
+            color: settings.color.to_array(),
+            line_width: settings.line_width,
+            impedance_visible: settings.impedance_visible,
+        }
+    }
+
+    fn settings(&self) -> TraceSettings {
+        let display = match self.display.as_str() {
+            "phase" | "return_loss" | "vswr" | "smith" | "impedance" | "magnitude"
+            | "resistance" | "reactance" => TraceDisplay::S11(parse_display(&self.display)),
+            _ => TraceDisplay::Spec,
+        };
+        TraceSettings {
+            display,
+            cal: self.cal.parse().unwrap_or(Cal::CalOff),
+            rbw: self.rbw.parse().unwrap_or(Rbw::R10k),
+            lo: self.lo.parse().unwrap_or(Lo::HighLo),
+            ref_level_dbm: self.ref_level_dbm,
+            visible: self.visible,
+            color: egui::Color32::from_rgba_premultiplied(
+                self.color[0],
+                self.color[1],
+                self.color[2],
+                self.color[3],
+            ),
+            line_width: if self.line_width.is_finite() {
+                self.line_width.clamp(0.5, 5.0)
+            } else {
+                1.0
+            },
+            impedance_visible: self.impedance_visible,
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    fn from_workspace(workspace: &Workspace) -> Self {
+        Self {
+            start_hz: workspace.range.start_hz,
+            stop_hz: workspace.range.stop_hz,
+            points: workspace.range.points,
+            log_x: workspace.log_x,
+            selected: workspace.selected,
+            next_id: workspace.next_id,
+            traces: workspace
+                .traces
+                .iter()
+                .map(|trace| TraceConfig::from_settings(trace.id, &trace.settings))
+                .collect(),
+        }
+    }
+
+    fn restore(&self) -> Workspace {
+        let mut workspace =
+            Workspace::empty(SweepRange::new(self.start_hz, self.stop_hz, self.points));
+        workspace.log_x = self.log_x;
+        for trace in &self.traces {
+            if workspace.traces.len() == MAX_TRACES {
+                warn!("ignoring workspace definitions beyond the ten-trace limit");
+                break;
+            }
+            if trace.id.0 == 0
+                || trace.id.0 == u64::MAX
+                || workspace.traces.iter().any(|old| old.id == trace.id)
+            {
+                warn!(
+                    "ignoring invalid or repeated workspace trace ID {}",
+                    trace.id.0
+                );
+                continue;
+            }
+            workspace.next_id = workspace.next_id.max(trace.id.0 + 1);
+            workspace.traces.push(TraceState::new(
+                trace.id,
+                trace.settings(),
+                &workspace.range,
+            ));
+        }
+        workspace.next_id = workspace.next_id.max(self.next_id);
+        workspace.selected = self
+            .selected
+            .filter(|id| workspace.traces.iter().any(|trace| trace.id == *id))
+            .or_else(|| workspace.traces.last().map(|trace| trace.id));
+        workspace
+    }
 }
 
 /// Last-used connection target.
@@ -113,6 +270,9 @@ fn display_as_str(display: S11Display) -> &'static str {
         S11Display::Vswr => "vswr",
         S11Display::Smith => "smith",
         S11Display::Impedance => "impedance",
+        S11Display::Magnitude => "magnitude",
+        S11Display::Resistance => "resistance",
+        S11Display::Reactance => "reactance",
     }
 }
 
@@ -122,6 +282,9 @@ fn parse_display(s: &str) -> S11Display {
         "vswr" => S11Display::Vswr,
         "smith" => S11Display::Smith,
         "impedance" => S11Display::Impedance,
+        "magnitude" => S11Display::Magnitude,
+        "resistance" => S11Display::Resistance,
+        "reactance" => S11Display::Reactance,
         _ => S11Display::ReturnLoss,
     }
 }
@@ -135,6 +298,8 @@ impl Default for AppConfig {
             connection: Connection::default(),
             spec: Spec::default(),
             s11: S11::default(),
+            legacy_sweeps: None,
+            workspace: WorkspaceConfig::default(),
             desktop: DesktopConfig::default(),
         }
     }
@@ -182,29 +347,14 @@ impl AppConfig {
         Self {
             version: CONFIG_VERSION,
             language: state.language_preference,
-            mode: mode_as_str(state.mode).to_string(),
+            legacy_sweeps: state.legacy_sweeps.clone(),
             connection: Connection {
                 host: state.host.clone(),
                 port: state.port,
             },
-            spec: Spec {
-                start_hz: state.spec.start_hz,
-                stop_hz: state.spec.stop_hz,
-                points: state.spec.points,
-                rbw: state.spec.rbw.as_str().to_string(),
-                ref_level_dbm: state.spec.ref_level_dbm,
-                log_x: state.spec.log_x,
-            },
-            s11: S11 {
-                start_hz: state.s11.start_hz,
-                stop_hz: state.s11.stop_hz,
-                points: state.s11.points,
-                cal: state.s11.cal.as_str().to_string(),
-                display: display_as_str(state.s11.display).to_string(),
-                log_x: state.s11.log_x,
-                rbw: state.s11.rbw.map(|rbw| rbw.as_str().to_string()),
-            },
+            workspace: WorkspaceConfig::from_workspace(&state.workspace),
             desktop: state.desktop.settings.clone(),
+            ..Self::default()
         }
     }
 
@@ -214,7 +364,7 @@ impl AppConfig {
         state.desktop.settings = self.desktop.clone();
         // Import the legacy connection once. A version-2 empty profile list
         // represents the user's choice and must stay empty after deletion.
-        if self.version < CONFIG_VERSION && state.desktop.settings.profiles.is_empty() {
+        if self.version < 2 && state.desktop.settings.profiles.is_empty() {
             let host = self.connection.host.trim();
             if !host.is_empty() {
                 state.desktop.settings.profiles.push(DeviceProfile {
@@ -227,26 +377,66 @@ impl AppConfig {
         state.set_language_preference(self.language);
         state.host = self.connection.host.clone();
         state.port = self.connection.port;
-        state.mode = parse_mode(&self.mode);
-        state.spec.start_hz = self.spec.start_hz;
-        state.spec.stop_hz = self.spec.stop_hz;
-        state.spec.points = self.spec.points;
-        if let Ok(rbw) = self.spec.rbw.parse() {
-            state.spec.rbw = rbw;
-        }
-        state.spec.ref_level_dbm = self.spec.ref_level_dbm;
-        state.spec.log_x = self.spec.log_x;
-        state.spec.start_stop_changed();
-        state.s11.start_hz = self.s11.start_hz;
-        state.s11.stop_hz = self.s11.stop_hz;
-        state.s11.points = self.s11.points;
-        if let Ok(cal) = self.s11.cal.parse::<Cal>() {
-            state.s11.cal = cal;
-        }
-        state.s11.display = parse_display(&self.s11.display);
-        state.s11.log_x = self.s11.log_x;
-        state.s11.rbw = self.s11.rbw.as_deref().and_then(|s| s.parse::<Rbw>().ok());
-        state.s11.start_stop_changed();
+        state.legacy_sweeps = if self.version < 3 {
+            Some(LegacySweeps {
+                mode: self.mode.clone(),
+                spec: self.spec.clone(),
+                s11: self.s11.clone(),
+            })
+        } else {
+            self.legacy_sweeps.clone()
+        };
+        state.workspace = if self.version < 3 {
+            self.legacy_workspace()
+        } else {
+            self.workspace.restore()
+        };
+        state.sweep = crate::state::SweepState::Idle;
+        state.active_plan = None;
+    }
+
+    fn legacy_workspace(&self) -> Workspace {
+        let selected = parse_mode(&self.mode);
+        let (range, log_x) = match selected {
+            AppMode::Spec => (
+                SweepRange::new(self.spec.start_hz, self.spec.stop_hz, self.spec.points),
+                self.spec.log_x,
+            ),
+            AppMode::S11 => (
+                SweepRange::new(self.s11.start_hz, self.s11.stop_hz, self.s11.points),
+                self.s11.log_x,
+            ),
+        };
+        let mut workspace = Workspace::empty(range);
+        workspace.log_x = log_x;
+        let spec = workspace
+            .add_trace(TraceSettings {
+                rbw: self.spec.rbw.parse().unwrap_or(Rbw::R10k),
+                ref_level_dbm: self.spec.ref_level_dbm,
+                visible: selected == AppMode::Spec,
+                ..Default::default()
+            })
+            .expect("legacy SPEC definition");
+        let s11 = workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(parse_display(&self.s11.display)),
+                cal: self.s11.cal.parse().unwrap_or(Cal::CalOff),
+                rbw: self
+                    .s11
+                    .rbw
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(Rbw::R10k),
+                visible: selected == AppMode::S11,
+                color: crate::theme::TRACE_COLORS[1],
+                ..Default::default()
+            })
+            .expect("legacy S11 definition");
+        workspace.selected = Some(match selected {
+            AppMode::Spec => spec,
+            AppMode::S11 => s11,
+        });
+        workspace
     }
 }
 
@@ -337,8 +527,14 @@ mod tests {
                     port: 4321,
                 }]
             );
-            assert_eq!(state.s11.points, 401);
-            assert_eq!(state.mode, AppMode::S11);
+            assert_eq!(state.workspace.range.points, 401);
+            assert_eq!(
+                state.workspace.selected().unwrap().settings.display.mode(),
+                AppMode::S11
+            );
+            assert_eq!(state.workspace.traces.len(), 2);
+            assert!(!state.workspace.traces[0].settings.visible);
+            assert!(state.workspace.traces[1].settings.visible);
             let saved = AppConfig::from_state(&state);
             assert_eq!(saved.version, CONFIG_VERSION);
             let mut restored = AppState::default();
@@ -463,9 +659,22 @@ rbw = "30k"
         assert_eq!(cfg.s11.display, "smith");
         assert!(cfg.s11.log_x);
         assert_eq!(cfg.s11.rbw.as_deref(), Some("30k"));
-        // Serializing and parsing back preserves every field.
-        let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        assert_eq!(cfg, parsed);
+        let mut state = AppState::default();
+        cfg.apply_to(&mut state);
+        let saved = AppConfig::from_state(&state);
+        let text = toml::to_string_pretty(&saved).unwrap();
+        assert!(!text.contains("[s11]"));
+        assert!(!text.contains("[spec]"));
+        let parsed: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(saved, parsed);
+        let mut restored = AppState::default();
+        parsed.apply_to(&mut restored);
+        assert_eq!(restored.workspace.range, state.workspace.range);
+        assert_eq!(
+            restored.workspace.selected().unwrap().settings,
+            state.workspace.selected().unwrap().settings
+        );
+        assert!(restored.workspace.log_x);
     }
 
     #[test]
@@ -487,16 +696,23 @@ rbw = "30k"
         state.set_language_preference(LanguagePreference::SimplifiedChinese);
         state.host = "analyzer.example.invalid".to_string();
         state.port = 5025;
-        state.mode = AppMode::S11;
-        state.spec.log_x = true;
-        state.s11.start_hz = 10e6;
-        state.s11.stop_hz = 400e6;
-        state.s11.points = 101;
-        state.s11.cal = Cal::CalUser;
-        state.s11.display = S11Display::Vswr;
-        state.s11.log_x = true;
-        state.s11.rbw = Some(Rbw::R1k);
-        state.s11.start_stop_changed();
+        state.workspace.range = SweepRange::new(10e6, 400e6, 101);
+        state.workspace.log_x = true;
+        state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::Vswr),
+                cal: Cal::CalUser,
+                rbw: Rbw::R1k,
+                line_width: 2.5,
+                color: egui::Color32::RED,
+                impedance_visible: [false, true, false],
+                ..Default::default()
+            })
+            .unwrap();
+        state.workspace.traces[0].settings.lo = Lo::LowLo;
+        state.workspace.traces[0].settings.visible = false;
+        state.sweep = crate::state::SweepState::Running;
         let cfg = AppConfig::from_state(&state);
         let mut restored = AppState::default();
         cfg.apply_to(&mut restored);
@@ -507,17 +723,24 @@ rbw = "30k"
         );
         assert_eq!(restored.host, "analyzer.example.invalid");
         assert_eq!(restored.port, 5025);
-        assert_eq!(restored.spec.start_hz, state.spec.start_hz);
-        assert_eq!(restored.spec.center_hz, state.spec.center_hz);
-        assert!(restored.spec.log_x);
-        assert_eq!(restored.mode, AppMode::S11);
-        assert_eq!(restored.s11.start_hz, state.s11.start_hz);
-        assert_eq!(restored.s11.center_hz, state.s11.center_hz);
-        assert_eq!(restored.s11.points, 101);
-        assert_eq!(restored.s11.cal, Cal::CalUser);
-        assert_eq!(restored.s11.display, S11Display::Vswr);
-        assert!(restored.s11.log_x);
-        assert_eq!(restored.s11.rbw, Some(Rbw::R1k));
+        assert_eq!(restored.workspace.range, state.workspace.range);
+        assert!(restored.workspace.log_x);
+        assert_eq!(restored.workspace.selected, state.workspace.selected);
+        assert_eq!(restored.workspace.next_id, state.workspace.next_id);
+        assert_eq!(restored.workspace.traces.len(), 2);
+        for (original, restored) in state
+            .workspace
+            .traces
+            .iter()
+            .zip(&restored.workspace.traces)
+        {
+            assert_eq!(original.id, restored.id);
+            assert_eq!(original.settings, restored.settings);
+            assert!(restored.completed.is_none());
+            assert!(restored.preview.is_none());
+        }
+        assert_eq!(restored.sweep, crate::state::SweepState::Idle);
+        assert!(restored.active_plan.is_none());
     }
 
     #[test]
@@ -525,30 +748,154 @@ rbw = "30k"
         let cfg: AppConfig = toml::from_str("[s11]\nlog_y = true\n").unwrap();
         assert!(!cfg.spec.log_x);
         assert!(!cfg.s11.log_x);
-        let saved = toml::to_string_pretty(&cfg).unwrap();
+        let mut state = AppState::default();
+        cfg.apply_to(&mut state);
+        let upgraded = AppConfig::from_state(&state);
+        let saved = toml::to_string_pretty(&upgraded).unwrap();
         assert!(!saved.contains("log_y"));
         let parsed: AppConfig = toml::from_str(&saved).unwrap();
-        assert_eq!(cfg, parsed);
+        assert_eq!(upgraded, parsed);
     }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn invalid_strings_fall_back_to_defaults() {
         let mut cfg = AppConfig::default();
+        cfg.version = 1;
         cfg.mode = "bogus".to_string();
         cfg.s11.cal = "bogus".to_string();
         cfg.s11.display = "bogus".to_string();
         cfg.s11.rbw = Some("bogus".to_string());
         let mut state = AppState::default();
-        state.mode = AppMode::S11;
-        state.s11.cal = Cal::CalOn;
-        state.s11.display = S11Display::Smith;
-        state.s11.rbw = Some(Rbw::R1k);
         cfg.apply_to(&mut state);
-        assert_eq!(state.mode, AppMode::Spec);
-        // Unparseable cal keeps the state's current value, like spec.rbw.
-        assert_eq!(state.s11.cal, Cal::CalOn);
-        assert_eq!(state.s11.display, S11Display::ReturnLoss);
-        assert_eq!(state.s11.rbw, None);
+        assert_eq!(
+            state.workspace.selected().unwrap().settings.display,
+            TraceDisplay::Spec
+        );
+        let s11 = &state.workspace.traces[1].settings;
+        assert_eq!(s11.cal, Cal::CalOff);
+        assert_eq!(s11.display, TraceDisplay::S11(S11Display::ReturnLoss));
+        assert_eq!(s11.rbw, Rbw::R10k);
+    }
+
+    #[test]
+    fn version_two_migration_preserves_deleted_profiles_and_explicit_bandwidth() {
+        for mode in ["spec", "s11"] {
+            let text = format!(
+                "version = 2\nmode = \"{mode}\"\n[connection]\nhost = \"bench.example.invalid\"\n"
+            );
+            let config: AppConfig = toml::from_str(&text).unwrap();
+            let mut state = AppState::default();
+            config.apply_to(&mut state);
+            assert!(state.desktop.settings.profiles.is_empty());
+            assert_eq!(state.workspace.traces.len(), 2);
+            assert_eq!(
+                state
+                    .workspace
+                    .traces
+                    .iter()
+                    .filter(|trace| trace.settings.visible)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state.workspace.selected().unwrap().settings.display.mode(),
+                parse_mode(mode)
+            );
+            assert_eq!(state.workspace.traces[1].settings.rbw, Rbw::R10k);
+            assert_eq!(state.workspace.plan().unwrap().groups.len(), 1);
+        }
+    }
+
+    #[test]
+    fn empty_workspace_stays_empty_and_deleted_ids_are_not_reused_after_restart() {
+        let mut state = AppState::default();
+        let id = state.workspace.selected.unwrap();
+        state.workspace.remove_trace(id);
+        let config = AppConfig::from_state(&state);
+        let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        let mut restored = AppState::default();
+        parsed.apply_to(&mut restored);
+        assert!(restored.workspace.traces.is_empty());
+        assert!(restored.workspace.selected.is_none());
+        assert!(
+            restored
+                .workspace
+                .add_trace(TraceSettings::default())
+                .unwrap()
+                .0
+                > id.0
+        );
+    }
+
+    #[test]
+    fn malformed_trace_identities_cannot_collide_or_exceed_the_state_limit() {
+        let mut config = WorkspaceConfig {
+            traces: Vec::new(),
+            next_id: 0,
+            selected: Some(TraceId(999)),
+            ..Default::default()
+        };
+        for id in [0, 3, 3, u64::MAX, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11] {
+            config.traces.push(TraceConfig {
+                id: TraceId(id),
+                ..Default::default()
+            });
+        }
+        let workspace = config.restore();
+        assert_eq!(workspace.traces.len(), MAX_TRACES);
+        assert_eq!(workspace.selected, Some(TraceId(10)));
+        assert_eq!(workspace.next_id, 11);
+        assert!(workspace.plan().is_ok());
+    }
+
+    #[test]
+    fn all_projections_and_unknown_current_values_have_stable_mappings() {
+        for display in S11Display::ALL {
+            assert_eq!(parse_display(display_as_str(display)), display);
+        }
+        let config = TraceConfig {
+            display: "future-display".into(),
+            cal: "future-cal".into(),
+            rbw: "future-rbw".into(),
+            lo: "future-lo".into(),
+            line_width: f32::NAN,
+            ..Default::default()
+        };
+        assert_eq!(config.settings(), TraceSettings::default());
+    }
+
+    #[test]
+    fn distinct_legacy_ranges_are_archived_without_overriding_the_shared_range() {
+        let legacy: AppConfig = toml::from_str(
+            r#"
+version = 2
+mode = "s11"
+[spec]
+start_hz = 500000.0
+stop_hz = 900000000.0
+points = 101
+log_x = true
+[s11]
+start_hz = 5000.0
+stop_hz = 650000000.0
+points = 201
+log_x = false
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::default();
+        legacy.apply_to(&mut state);
+        assert_eq!(state.workspace.range, SweepRange::new(5000.0, 650e6, 201));
+        state.workspace.range = SweepRange::new(1e6, 2e6, 401);
+        let saved = AppConfig::from_state(&state);
+        let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&saved).unwrap()).unwrap();
+        let mut restored = AppState::default();
+        parsed.apply_to(&mut restored);
+        assert_eq!(restored.workspace.range, state.workspace.range);
+        let archive = restored.legacy_sweeps.unwrap();
+        assert_eq!(archive.mode, "s11");
+        assert_eq!(archive.spec, legacy.spec);
+        assert_eq!(archive.s11, legacy.s11);
     }
 }

@@ -36,12 +36,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                 if state.sweep == SweepState::Stopping {
                     ui.spinner();
                     ui.label(language.text(Text::Stopping));
-                } else if let Some(preview) = &state.preview {
+                } else if let Some(preview) = state
+                    .workspace
+                    .traces
+                    .iter()
+                    .filter_map(|trace| trace.preview.as_deref())
+                    .max_by_key(|preview| preview.cycle_id)
+                {
                     ui.label(format!(
                         "{} {}/{}",
                         language.text(Text::SweepProgress),
                         preview.data.points.len(),
-                        preview.expected_points
+                        preview.group.settings.points()
                     ));
                 }
             }

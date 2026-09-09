@@ -45,7 +45,7 @@ pub struct SweepProgress<'a> {
 }
 
 /// Parameters of an S11 sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S11Params {
     pub cal: Cal,
     pub format: Format,
@@ -60,7 +60,7 @@ pub struct S11Params {
 }
 
 /// Parameters of a spectrum sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecParams {
     pub cal: Cal,
     pub lo: Lo,

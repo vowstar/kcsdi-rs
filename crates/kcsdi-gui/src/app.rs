@@ -3,21 +3,21 @@
 
 //! Main application struct and eframe::App implementation.
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
+use crate::acquisition::{AcquisitionGroup, SweepDelivery};
 use crate::config::AppConfig;
 use crate::desktop::{self, Page};
 use crate::device_worker;
 use crate::i18n::{self, Language, StatusMessage, Text};
 use crate::panels;
-use crate::state::{
-    AppMode, AppState, ConnectionState, EventEnvelope, S11Display, SweepState, WorkerEvent,
-};
+use crate::state::{AppState, ConnectionState, EventEnvelope, S11Display, SweepState, WorkerEvent};
 use crate::theme;
 use crate::widgets;
+use crate::workspace::{TraceDisplay, TraceEditor, TraceSettings};
 
 /// Debounce before persisting config changes to disk.
 const CONFIG_SAVE_DELAY: Duration = Duration::from_secs(1);
@@ -58,15 +58,6 @@ impl KcsdiApp {
             .name("device-worker".to_string())
             .spawn(move || device_worker::device_worker(cmd_rx, evt_tx, ctx, shutdown, preview))
             .expect("failed to spawn device worker thread");
-        state
-            .spec
-            .view
-            .reset(state.spec.start_hz, state.spec.stop_hz, -100.0, 0.0);
-        let (y_min, y_max) = state.s11.display.default_y();
-        state
-            .s11
-            .view
-            .reset(state.s11.start_hz, state.s11.stop_hz, y_min, y_max);
 
         Self {
             last_saved: AppConfig::from_state(&state),
@@ -91,69 +82,94 @@ impl KcsdiApp {
         {
             return;
         }
-        if let WorkerEvent::SweepTrace(data) = &envelope.event {
-            let Some(cycle) = envelope.cycle_id else {
-                return;
-            };
-            if !self.accepts_trace(data)
-                || self
-                    .state
-                    .last_completed_cycle
-                    .is_some_and(|last| cycle <= last)
-            {
-                return;
+        if let WorkerEvent::SweepTrace(delivery) = envelope.event {
+            if let Some(cycle) = envelope.cycle_id {
+                self.apply_delivery(delivery, cycle);
             }
-            self.state.last_completed_cycle = Some(cycle);
-            if self
+        } else {
+            self.apply_event(envelope.event);
+        }
+    }
+
+    fn accepts_group(&self, group: &AcquisitionGroup) -> bool {
+        self.state.connection == ConnectionState::Connected
+            && self.state.any_running()
+            && self
                 .state
+                .active_plan
+                .as_ref()
+                .is_some_and(|plan| plan.groups.contains(group))
+    }
+
+    fn apply_delivery(&mut self, delivery: SweepDelivery, cycle: u64) {
+        let group = AcquisitionGroup {
+            settings: delivery.snapshot.settings.clone(),
+            members: delivery.members,
+        };
+        if !self.accepts_group(&group)
+            || delivery.snapshot.session_id != self.state.session_id
+            || !group.settings.accepts(&delivery.snapshot.data)
+        {
+            return;
+        }
+        let range = self.state.workspace.range;
+        for trace in &mut self.state.workspace.traces {
+            if !trace.settings.visible
+                || !group.members.contains(&trace.id)
+                || trace.settings.acquisition(&range).ok().as_ref() != Some(&group.settings)
+                || !trace.settings.display.accepts(&delivery.snapshot.data)
+                || trace.last_completed_cycle.is_some_and(|last| cycle <= last)
+            {
+                continue;
+            }
+            trace.last_completed_cycle = Some(cycle);
+            if trace
                 .preview
                 .as_ref()
                 .is_some_and(|preview| preview.cycle_id <= cycle)
             {
-                self.state.preview = None;
+                trace.preview = None;
             }
+            trace.analysis.observe(&delivery.snapshot);
+            trace.completed = Some(delivery.snapshot.clone());
+            trace.needs_fit = true;
         }
-        self.apply_event(envelope.event);
+        self.state.status_message = None;
     }
 
     fn apply_preview(&mut self, preview: crate::preview::PreviewEnvelope) {
-        use kcsdi_core::protocol::StreamMode;
-        let expected = match self.state.mode {
-            AppMode::S11 => self.state.s11.points,
-            AppMode::Spec => self.state.spec.points,
-        };
-        let format_matches = match (self.state.mode, preview.data.mode) {
-            (AppMode::S11, StreamMode::S11) => {
-                preview.data.format == self.state.s11.display.wire_format().as_str()
-            }
-            (AppMode::Spec, StreamMode::Spec) => preview.data.format.is_empty(),
-            _ => false,
-        };
-        if self.state.connection != ConnectionState::Connected
-            || !self.state.running(self.state.mode)
-            || preview.session_id != self.state.session_id
+        if preview.session_id != self.state.session_id
             || preview.request_id != self.state.request_id
-            || !format_matches
-            || preview.expected_points != expected
-            || preview.data.points.len() > expected as usize
-            || self
-                .state
-                .last_completed_cycle
-                .is_some_and(|last| preview.cycle_id <= last)
-            || self
-                .state
-                .preview
-                .as_ref()
-                .is_some_and(|last| preview.cycle_id < last.cycle_id)
+            || !self.accepts_group(&preview.group)
+            || preview.data.mode != preview.group.settings.mode()
+            || preview.data.format != preview.group.settings.format()
+            || preview.data.points.len() > preview.group.settings.points() as usize
         {
             return;
         }
-        self.state.preview = Some(preview);
+        let range = self.state.workspace.range;
+        let preview = Arc::new(preview);
+        for trace in &mut self.state.workspace.traces {
+            if !trace.settings.visible
+                || !preview.group.members.contains(&trace.id)
+                || trace.settings.acquisition(&range).ok().as_ref() != Some(&preview.group.settings)
+                || !trace.settings.display.accepts(&preview.data)
+                || trace
+                    .last_completed_cycle
+                    .is_some_and(|last| preview.cycle_id <= last)
+                || trace
+                    .preview
+                    .as_ref()
+                    .is_some_and(|last| preview.cycle_id < last.cycle_id)
+            {
+                continue;
+            }
+            trace.preview = Some(preview.clone());
+        }
     }
 
-    /// Apply an event after checking the identity of its source operation.
-    fn apply_event(&mut self, evt: WorkerEvent) {
-        match evt {
+    fn apply_event(&mut self, event: WorkerEvent) {
+        match event {
             WorkerEvent::Connected(info) => {
                 self.connection_open = false;
                 info!("connected, serial {}", info.serial);
@@ -171,13 +187,14 @@ impl KcsdiApp {
                 self.state.connection = ConnectionState::Error(message.clone());
                 self.state.status_message = Some(message.into());
             }
-            WorkerEvent::Error(msg) => {
+            WorkerEvent::Error(message) => {
                 if self.state.connection == ConnectionState::Connecting {
-                    self.state.connection = ConnectionState::Error(msg.clone());
+                    self.state.connection = ConnectionState::Error(message.clone());
                 }
                 self.state.sweep = SweepState::Idle;
+                self.state.active_plan = None;
                 self.state.clear_preview();
-                self.state.status_message = Some(msg.into());
+                self.state.status_message = Some(message.into());
             }
             WorkerEvent::SweepStopped => {
                 if self.state.sweep == SweepState::Stopping {
@@ -185,26 +202,7 @@ impl KcsdiApp {
                     self.state.clear_preview();
                 }
             }
-            WorkerEvent::SweepTrace(data) => {
-                if !self.accepts_trace(&data) {
-                    return;
-                }
-                use kcsdi_core::protocol::StreamMode;
-                match data.mode {
-                    StreamMode::Spec => {
-                        self.state.spec.analysis.observe(&data);
-                        self.state.spec.needs_fit = true;
-                        self.state.spec.trace = Some(data);
-                    }
-                    StreamMode::S11 => {
-                        self.state.s11.analysis.observe(&data);
-                        self.state.s11.needs_fit = true;
-                        self.state.s11.trace = Some(data);
-                    }
-                    _ => {}
-                }
-                self.state.status_message = None;
-            }
+            WorkerEvent::SweepTrace(_) => {}
             WorkerEvent::Status {
                 temperature,
                 voltage,
@@ -215,34 +213,13 @@ impl KcsdiApp {
         }
     }
 
-    /// Check the active display before changing completed snapshots.
-    fn accepts_trace(&self, data: &kcsdi_core::data::SweepData) -> bool {
-        use kcsdi_core::protocol::StreamMode;
-
-        if self.state.connection != ConnectionState::Connected {
-            return false;
-        }
-        match (self.state.mode, data.mode) {
-            (AppMode::Spec, StreamMode::Spec) => {
-                self.state.running(AppMode::Spec)
-                    && data.format.is_empty()
-                    && data.points.len() == self.state.spec.points as usize
-            }
-            (AppMode::S11, StreamMode::S11) => {
-                self.state.running(AppMode::S11)
-                    && data.format == self.state.s11.display.wire_format().as_str()
-                    && data.points.len() == self.state.s11.points as usize
-            }
-            _ => false,
-        }
-    }
-
     fn clear_connection(&mut self) {
         self.state.connection = ConnectionState::Disconnected;
         self.state.device_info = None;
         self.state.temperature = None;
         self.state.voltage = None;
         self.state.sweep = SweepState::Idle;
+        self.state.active_plan = None;
         self.state.clear_preview();
         self.state.acquisition_cancel.cancel();
         self.state.session_cancel.cancel();
@@ -347,6 +324,9 @@ fn cartesian_series(
             column("R", 1, theme::TRACE_COLORS[1]),
             column("X", 2, theme::TRACE_COLORS[2]),
         ],
+        S11Display::Magnitude => vec![column("|Z|", 0, theme::TRACE_COLORS[0])],
+        S11Display::Resistance => vec![column("R", 1, theme::TRACE_COLORS[0])],
+        S11Display::Reactance => vec![column("X", 2, theme::TRACE_COLORS[0])],
         S11Display::Smith => Vec::new(),
     }
 }
@@ -416,6 +396,8 @@ impl eframe::App for KcsdiApp {
             .collapsible(false)
             .show(&ctx, |ui| panels::top_bar::show(ui, &mut self.state));
 
+        trace_editor(&ctx, &mut self.state);
+        self.state.reconcile_plan();
         ctx.request_repaint_after(Duration::from_millis(500));
         self.persist_config_debounced();
     }
@@ -458,26 +440,15 @@ impl KcsdiApp {
                     if ui.button(language.text(Text::Devices)).clicked() {
                         self.state.desktop.page = Page::Devices;
                     }
-                    ui.menu_button(language.text(Text::Function), |ui| {
-                        let mut mode = self.state.mode;
-                        if ui
-                            .selectable_value(&mut mode, AppMode::S11, "S11")
-                            .clicked()
-                        {
-                            ui.close();
-                        }
-                        if ui
-                            .selectable_value(
-                                &mut mode,
-                                AppMode::Spec,
-                                language.text(Text::Spectrum),
-                            )
-                            .clicked()
-                        {
-                            ui.close();
-                        }
-                        self.state.change_mode(mode);
-                    });
+                    if ui
+                        .add_enabled(
+                            self.state.workspace.traces.len() < crate::acquisition::MAX_TRACES,
+                            egui::Button::new(language.text(Text::AddTrace)),
+                        )
+                        .clicked()
+                    {
+                        self.state.workspace.open_add_editor();
+                    }
                     if ui.button(language.text(Text::Settings)).clicked() {
                         self.state.desktop.page = Page::Settings;
                     }
@@ -509,10 +480,7 @@ impl KcsdiApp {
                     .show(ui, |ui| {
                         trace_list(ui, &mut self.state);
                         ui.add_space(8.0);
-                        match self.state.mode {
-                            AppMode::Spec => panels::spec_panel::show_sweep(ui, &mut self.state),
-                            AppMode::S11 => panels::s11_panel::show_sweep(ui, &mut self.state),
-                        }
+                        panels::workspace_panel::show_sweep(ui, &mut self.state);
                     });
             });
         parameter_panel(ui, &mut self.state);
@@ -522,189 +490,273 @@ impl KcsdiApp {
     }
 
     fn plot_ui(&mut self, ui: &mut egui::Ui) {
-        let colors = theme::trace_colors(ui.visuals().dark_mode);
-        let preview = self
+        let cartesian = self
             .state
-            .preview
-            .as_ref()
-            .map(|preview| &preview.data)
-            .filter(|data| !data.points.is_empty());
-        let partial = preview.is_some();
-        match self.state.mode {
-            AppMode::Spec => {
-                let spec = &mut self.state.spec;
-                let curve = |t: &kcsdi_core::data::SweepData| widgets::plot::Series {
-                    name: self.state.language.text(Text::Level),
-                    color: colors[1],
-                    visible: spec.visible,
-                    points: t
-                        .points
-                        .iter()
-                        .map(|p| (p.freq_hz, p.values.first().copied().unwrap_or(f64::NAN)))
-                        .collect(),
-                };
-                let overlays = if spec.visible {
-                    spec.analysis.overlay_series(&[0])
-                } else {
-                    Vec::new()
-                };
-                if spec.needs_fit
-                    && !spec.view_locked
-                    && let Some(complete) = spec.trace.as_ref()
-                {
-                    let mut series = vec![curve(complete)];
-                    series.extend(overlays.iter().cloned());
-                    widgets::plot::fit_view(
-                        &mut spec.view,
-                        &widgets::plot::PlotOptions {
-                            y_label: "dBm",
-                            log_x: spec.log_x,
-                            series,
-                        },
-                    );
-                    spec.needs_fit = false;
-                }
-                let mut series: Vec<_> = preview
-                    .or(spec.trace.as_ref())
-                    .map(curve)
-                    .into_iter()
-                    .collect();
-                let base_count = series.len();
-                series.extend(overlays);
-                let mut opts = widgets::plot::PlotOptions {
-                    y_label: "dBm",
-                    log_x: spec.log_x,
+            .workspace
+            .traces
+            .iter()
+            .any(|trace| trace.settings.visible && !trace.settings.display.is_smith());
+        let smith = self
+            .state
+            .workspace
+            .traces
+            .iter()
+            .any(|trace| trace.settings.visible && trace.settings.display.is_smith());
+        if cartesian && smith {
+            let height = ui.available_height();
+            egui::Panel::top("cartesian_region")
+                .exact_size(height * 0.5)
+                .resizable(true)
+                .show(ui, |ui| self.cartesian_ui(ui));
+            egui::CentralPanel::default().show(ui, |ui| self.smith_ui(ui));
+        } else if smith {
+            self.smith_ui(ui);
+        } else {
+            self.cartesian_ui(ui);
+        }
+    }
+
+    fn cartesian_ui(&mut self, ui: &mut egui::Ui) {
+        let language = self.state.language;
+        let workspace = &mut self.state.workspace;
+        workspace.ensure_log_x_view();
+        let common_x = (workspace.x_view.x_min, workspace.x_view.x_max);
+        let mut prepared = Vec::new();
+        for trace in workspace
+            .traces
+            .iter_mut()
+            .filter(|trace| trace.settings.visible && !trace.settings.display.is_smith())
+        {
+            let complete = trace
+                .completed
+                .clone()
+                .filter(|snapshot| trace.settings.display.accepts(&snapshot.data));
+            let overlays = if trace.overlays_compatible() {
+                trace
+                    .analysis
+                    .overlay_series(trace.settings.display.columns())
+            } else {
+                Vec::new()
+            };
+            let completed_options = complete.map(|complete| {
+                let mut series = trace_series(
+                    &trace.settings,
+                    Some(&complete.data),
+                    language,
+                    ui.visuals().dark_mode,
+                );
+                series.extend(overlays.iter().cloned());
+                widgets::plot::PlotOptions {
+                    y_label: trace.settings.display.unit(),
+                    log_x: workspace.log_x,
                     series,
-                };
-                let interaction = if partial || spec.analysis.markers().is_empty() {
-                    widgets::plot::show(ui, &mut spec.view, &mut opts)
-                } else {
-                    widgets::plot::show_with_markers(
-                        ui,
-                        &mut spec.view,
-                        &mut opts,
-                        spec.analysis.markers_mut(),
-                    )
-                };
-                match interaction {
-                    widgets::plot::ViewLock::Locked => spec.view_locked = true,
-                    widgets::plot::ViewLock::Unlocked => spec.view_locked = false,
+                }
+            });
+            if trace.needs_fit
+                && !trace.view_locked
+                && let Some(options) = &completed_options
+            {
+                widgets::plot::fit_view(&mut trace.view, options);
+                trace.needs_fit = false;
+            }
+            // Auto-fit owns only this trace's Y. Every trace uses the common X.
+            trace.view.x_min = common_x.0;
+            trace.view.x_max = common_x.1;
+            let mut series = trace_series(
+                &trace.settings,
+                trace.display_data(),
+                language,
+                ui.visuals().dark_mode,
+            );
+            let base_count = series.len();
+            series.extend(overlays);
+            let partial = trace
+                .preview
+                .as_ref()
+                .is_some_and(|preview| !preview.data.points.is_empty());
+            prepared.push((
+                base_count,
+                partial,
+                widgets::plot::PlotOptions {
+                    y_label: trace.settings.display.unit(),
+                    log_x: workspace.log_x,
+                    series,
+                },
+                completed_options,
+            ));
+        }
+        let mut layers: Vec<_> = workspace
+            .traces
+            .iter_mut()
+            .filter(|trace| trace.settings.visible && !trace.settings.display.is_smith())
+            .zip(prepared.iter_mut())
+            .map(
+                |(trace, (_, partial, options, _))| widgets::plot::CartesianLayer {
+                    id: trace.id.0,
+                    label: format!("T{} {}", trace.id.0, trace.settings.display.label(language)),
+                    view: &mut trace.view,
+                    options: options.clone(),
+                    line_width: trace.settings.line_width,
+                    markers: if *partial {
+                        &mut []
+                    } else {
+                        trace.analysis.markers_mut()
+                    },
+                },
+            )
+            .collect();
+        let changes = widgets::plot::show_multi(ui, &mut layers, workspace.selected.map(|id| id.0));
+        if let Some(layer) = layers.first() {
+            workspace.x_view.x_min = layer.view.x_min;
+            workspace.x_view.x_max = layer.view.x_max;
+        }
+        let options: Vec<_> = layers.iter().map(|layer| layer.options.clone()).collect();
+        drop(layers);
+        let mut reset_x = None;
+        for ((trace, (base_count, _, _, completed_options)), options) in workspace
+            .traces
+            .iter_mut()
+            .filter(|trace| trace.settings.visible && !trace.settings.display.is_smith())
+            .zip(prepared)
+            .zip(options)
+        {
+            if let Some((_, lock)) = changes.iter().find(|(id, _)| *id == trace.id.0) {
+                match lock {
+                    widgets::plot::ViewLock::Locked => trace.view_locked = true,
+                    widgets::plot::ViewLock::Unlocked => {
+                        trace.view_locked = false;
+                        let (low, high) = trace.settings.display.default_y();
+                        trace.view.reset(
+                            workspace.range.start_hz,
+                            workspace.range.stop_hz,
+                            low,
+                            high,
+                        );
+                        if let Some(options) = &completed_options {
+                            widgets::plot::fit_view(&mut trace.view, options);
+                        }
+                        trace.needs_fit = false;
+                        reset_x = Some((trace.view.x_min, trace.view.x_max));
+                    }
                     widgets::plot::ViewLock::Unchanged => {}
                 }
-                if let Some(curve) = opts.series.first() {
-                    spec.visible = curve.visible;
-                }
-                spec.analysis
-                    .apply_overlay_visibility(&opts.series[base_count..]);
             }
-            AppMode::S11 => {
-                let s11 = &mut self.state.s11;
-                match s11.display {
-                    S11Display::Smith => {
-                        let trace = preview.or(s11.trace.as_ref()).filter(|_| s11.visible);
-                        let held = s11.visible.then(|| s11.analysis.held_trace()).flatten();
-                        let markers = if partial {
-                            &mut []
-                        } else {
-                            s11.analysis.markers_mut()
-                        };
-                        if held.is_some() {
-                            widgets::smith::show_layers(
-                                ui,
-                                &mut s11.smith,
-                                trace,
-                                held.as_ref(),
-                                markers,
-                            );
-                        } else if markers.is_empty() {
-                            widgets::smith::show(ui, &mut s11.smith, trace);
-                        } else {
-                            widgets::smith::show_with_markers(ui, &mut s11.smith, trace, markers);
-                        }
-                    }
-                    display => {
-                        let mut completed = cartesian_series(
-                            display,
-                            s11.trace.as_ref(),
-                            s11.impedance_visible,
-                            self.state.language,
-                        );
-                        for curve in &mut completed {
-                            curve.visible &= s11.visible;
-                        }
-                        let overlays = if s11.visible && !completed.is_empty() {
-                            let columns: &[usize] = match display {
-                                S11Display::Phase => &[1],
-                                S11Display::Impedance => &[0, 1, 2],
-                                _ => &[0],
-                            };
-                            s11.analysis.overlay_series(columns)
-                        } else {
-                            Vec::new()
-                        };
-                        if s11.needs_fit && !s11.view_locked && !completed.is_empty() {
-                            completed.extend(overlays.iter().cloned());
-                            widgets::plot::fit_view(
-                                &mut s11.view,
-                                &widgets::plot::PlotOptions {
-                                    y_label: display.y_label(),
-                                    log_x: s11.log_x,
-                                    series: completed,
-                                },
-                            );
-                            s11.needs_fit = false;
-                        }
-                        let mut series = cartesian_series(
-                            display,
-                            preview.or(s11.trace.as_ref()),
-                            s11.impedance_visible,
-                            self.state.language,
-                        );
-                        let base_count = series.len();
-                        for (i, curve) in series.iter_mut().enumerate() {
-                            curve.color = colors[i];
-                            curve.visible &= s11.visible;
-                        }
-                        series.extend(overlays);
-                        let mut opts = widgets::plot::PlotOptions {
-                            y_label: display.y_label(),
-                            log_x: s11.log_x,
-                            series,
-                        };
-                        match widgets::plot::show_with_markers(
-                            ui,
-                            &mut s11.view,
-                            &mut opts,
-                            if partial {
-                                &mut []
-                            } else {
-                                s11.analysis.markers_mut()
-                            },
-                        ) {
-                            widgets::plot::ViewLock::Locked => s11.view_locked = true,
-                            widgets::plot::ViewLock::Unlocked => s11.view_locked = false,
-                            widgets::plot::ViewLock::Unchanged => {}
-                        }
-                        if display == S11Display::Impedance && base_count == 3 && s11.visible {
-                            let visible = std::array::from_fn(|i| opts.series[i].visible);
-                            if s11.impedance_visible != visible {
-                                s11.impedance_visible = visible;
-                                s11.needs_fit = true;
-                                ui.ctx().request_repaint();
-                            }
-                        } else if base_count == 1 {
-                            s11.visible = opts.series[0].visible;
-                        }
-                        s11.analysis
-                            .apply_overlay_visibility(&opts.series[base_count..]);
-                    }
+            if trace.settings.display == TraceDisplay::S11(S11Display::Impedance) && base_count == 3
+            {
+                let visibility = std::array::from_fn(|i| options.series[i].visible);
+                if trace.settings.impedance_visible != visibility {
+                    trace.settings.impedance_visible = visibility;
+                    trace.needs_fit = true;
                 }
+            } else if base_count == 1 {
+                trace.settings.visible = options.series[0].visible;
             }
+            trace
+                .analysis
+                .apply_overlay_visibility(&options.series[base_count..]);
         }
+        if let Some((low, high)) = reset_x {
+            workspace.x_view.x_min = low;
+            workspace.x_view.x_max = high;
+            for trace in &mut workspace.traces {
+                trace.view.x_min = low;
+                trace.view.x_max = high;
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn smith_ui(&mut self, ui: &mut egui::Ui) {
+        let workspace = &mut self.state.workspace;
+        let prepared: Vec<_> = workspace
+            .traces
+            .iter()
+            .filter(|trace| trace.settings.visible && trace.settings.display.is_smith())
+            .map(|trace| {
+                (
+                    trace.display_data().cloned(),
+                    trace
+                        .overlays_compatible()
+                        .then(|| trace.analysis.held_trace())
+                        .flatten(),
+                )
+            })
+            .collect();
+        let mut layers: Vec<_> = workspace
+            .traces
+            .iter_mut()
+            .filter(|trace| trace.settings.visible && trace.settings.display.is_smith())
+            .zip(prepared.iter())
+            .map(|(trace, (data, held))| widgets::smith::SmithLayer {
+                id: trace.id.0,
+                label: format!("T{}", trace.id.0),
+                trace: data.as_ref(),
+                held: held.as_ref(),
+                color: displayed_color(trace.settings.color, ui.visuals().dark_mode),
+                line_width: trace.settings.line_width,
+                markers: if trace
+                    .preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.data.points.is_empty())
+                {
+                    &mut []
+                } else {
+                    trace.analysis.markers_mut()
+                },
+            })
+            .collect();
+        layers
+            .sort_by_key(|layer| Some(crate::acquisition::TraceId(layer.id)) == workspace.selected);
+        widgets::smith::show_multi(ui, &mut workspace.smith, &mut layers);
     }
 }
 
-pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut crate::state::AppState) {
+fn trace_series(
+    settings: &TraceSettings,
+    data: Option<&kcsdi_core::data::SweepData>,
+    language: Language,
+    dark: bool,
+) -> Vec<widgets::plot::Series<'static>> {
+    let Some(data) = data.filter(|data| settings.display.accepts(data)) else {
+        return Vec::new();
+    };
+    let mut series = match settings.display {
+        TraceDisplay::Spec => vec![widgets::plot::Series {
+            name: language.text(Text::Level),
+            color: settings.color,
+            visible: true,
+            points: data
+                .points
+                .iter()
+                .map(|point| {
+                    (
+                        point.freq_hz,
+                        point.values.first().copied().unwrap_or(f64::NAN),
+                    )
+                })
+                .collect(),
+        }],
+        TraceDisplay::S11(display) => {
+            cartesian_series(display, Some(data), settings.impedance_visible, language)
+        }
+    };
+    if let Some(first) = series.first_mut() {
+        first.color = settings.color;
+    }
+    for curve in &mut series {
+        curve.color = displayed_color(curve.color, dark);
+    }
+    series
+}
+
+fn displayed_color(color: egui::Color32, dark: bool) -> egui::Color32 {
+    theme::TRACE_COLORS
+        .iter()
+        .position(|candidate| *candidate == color)
+        .map_or(color, |index| theme::trace_colors(dark)[index])
+}
+
+pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let language = state.language;
     egui::Panel::right("params_panel")
         .exact_size(256.0)
@@ -714,110 +766,223 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut crate::state::AppSt
                 .inner_margin(8),
         )
         .show(ui, |ui| {
-            if state.mode == AppMode::S11 {
-                egui::Panel::bottom("s11_export")
-                    .default_size(128.0)
-                    .min_size(112.0)
-                    .show_separator_line(true)
-                    .show(ui, |ui| {
-                        crate::export::show(ui, &mut state.export, &state.s11, language);
-                    });
-            }
+            panels::workspace_panel::run_button(ui, state);
+            let completed = state
+                .workspace
+                .selected()
+                .and_then(|trace| trace.completed.clone());
+            egui::Panel::bottom("trace_export")
+                .default_size(128.0)
+                .min_size(112.0)
+                .show_separator_line(true)
+                .show(ui, |ui| {
+                    crate::export::show(ui, &mut state.export, completed.as_deref(), language)
+                });
             egui::ScrollArea::vertical()
                 .id_salt("analysis_scroll")
-                .show(ui, |ui| match state.mode {
-                    AppMode::Spec => {
-                        panels::spec_panel::show(ui, state);
-                        let spec = &mut state.spec;
-                        spec.analysis.controls(ui, language, spec.trace.as_ref());
-                        panels::spec_panel::show_display_controls(ui, state);
+                .show(ui, |ui| {
+                    let editable = state.sweep != SweepState::Stopping
+                        && state.connection != ConnectionState::Disconnecting;
+                    if let Some(trace) = state.workspace.selected_mut() {
+                        ui.push_id(trace.id.0, |ui| {
+                            ui.label(format!(
+                                "T{} {}",
+                                trace.id.0,
+                                trace.settings.display.label(language)
+                            ));
+                            let mut settings = trace.settings.clone();
+                            ui.add_enabled_ui(editable, |ui| {
+                                panels::workspace_panel::format_fields(ui, &mut settings, language);
+                                panels::s11_panel::receiver_fields(ui, &mut settings, language);
+                                if settings.display == TraceDisplay::Spec {
+                                    panels::spec_panel::receiver_fields(
+                                        ui,
+                                        &mut settings,
+                                        language,
+                                    );
+                                }
+                            });
+                            trace.update_settings(settings);
+                            let complete = trace
+                                .completed
+                                .clone()
+                                .filter(|snapshot| trace.settings.display.accepts(&snapshot.data));
+                            let columns = trace.settings.display.columns();
+                            trace
+                                .analysis
+                                .set_column((columns.len() == 1).then(|| columns[0]));
+                            trace.analysis.controls_for_display(
+                                ui,
+                                language,
+                                complete.as_deref(),
+                                trace.settings.display.is_smith(),
+                            );
+                            if trace.completed.is_some() && complete.is_none() {
+                                ui.label(language.text(Text::RunForDisplay));
+                            }
+                            panels::workspace_panel::display_fields(ui, trace, language);
+                        });
                     }
-                    AppMode::S11 => {
-                        panels::s11_panel::show(ui, state);
-                        let s11 = &mut state.s11;
-                        let trace = s11
-                            .trace
-                            .as_ref()
-                            .filter(|trace| trace.format == s11.display.wire_format().as_str());
-                        s11.analysis.controls_for_display(
-                            ui,
-                            language,
-                            trace,
-                            s11.display == S11Display::Smith,
-                        );
-                        panels::s11_panel::show_display_controls(ui, state);
+                    ui.label(language.text(Text::Display));
+                    if widgets::plot::log_x_control(ui, &mut state.workspace.log_x) {
+                        ui.ctx().request_repaint();
                     }
                 });
         });
 }
 
-fn trace_list(ui: &mut egui::Ui, state: &mut crate::state::AppState) {
+fn trace_list(ui: &mut egui::Ui, state: &mut AppState) {
     let language = state.language;
-    ui.label(egui::RichText::new(language.text(Text::TraceList)).monospace())
-        .on_hover_text(language.text(Text::SelectedTraceOnly));
-    ui.add_space(4.0);
-    for (index, mode) in [AppMode::S11, AppMode::Spec].into_iter().enumerate() {
-        let selected = state.mode == mode;
-        let color = theme::trace_colors(ui.visuals().dark_mode)[index];
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(language.text(Text::TraceList)).monospace())
+            .on_hover_text(language.text(Text::VisibleTracesRun));
+        if ui
+            .add_enabled(
+                state.workspace.traces.len() < crate::acquisition::MAX_TRACES,
+                egui::Button::new("+"),
+            )
+            .on_hover_text(language.text(
+                if state.workspace.traces.len() < crate::acquisition::MAX_TRACES {
+                    Text::AddTrace
+                } else {
+                    Text::TraceLimit
+                },
+            ))
+            .clicked()
+        {
+            state.workspace.open_add_editor();
+        }
+    });
+    if state.workspace.traces.is_empty() {
+        ui.label(language.text(Text::NoTraces));
+    }
+    let mut edit = None;
+    let mut delete = None;
+    for trace in &mut state.workspace.traces {
+        let selected = state.workspace.selected == Some(trace.id);
         let fill = if selected {
             ui.visuals().faint_bg_color
         } else {
             ui.visuals().panel_fill
         };
-        let card = egui::Frame::new()
-            .inner_margin(8)
-            .fill(fill)
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .corner_radius(4)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.spacing_mut().interact_size.y = 18.0;
-                ui.horizontal(|ui| {
-                    let title = format!("T{}", index + 1);
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new(title).strong()).frame(false))
-                        .clicked()
-                    {
-                        state.change_mode(mode);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.menu_button("...", |ui| {
-                            ui.set_min_width(220.0);
-                            ui.label(language.text(Text::TraceSettings));
-                            if mode == AppMode::S11 {
-                                panels::s11_panel::show_trace_editor(ui, state);
-                            } else {
-                                if widgets::plot::log_x_control(ui, &mut state.spec.log_x) {
-                                    state.spec.needs_fit = true;
-                                    state.spec.view_locked = false;
-                                }
+        let card = ui
+            .push_id(("trace_card", trace.id.0), |ui| {
+                egui::Frame::new()
+                    .inner_margin(8)
+                    .fill(fill)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(4)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("T{}", trace.id.0)).strong(),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                state.workspace.selected = Some(trace.id);
                             }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.menu_button("...", |ui| {
+                                        if ui.button(language.text(Text::Edit)).clicked() {
+                                            edit = Some(trace.id);
+                                            ui.close();
+                                        }
+                                        if ui.button(language.text(Text::Delete)).clicked() {
+                                            delete = Some(trace.id);
+                                            ui.close();
+                                        }
+                                    });
+                                    visibility_control(ui, &mut trace.settings.visible, language);
+                                },
+                            );
                         });
-                        let visible = match mode {
-                            AppMode::S11 => &mut state.s11.visible,
-                            AppMode::Spec => &mut state.spec.visible,
-                        };
-                        visibility_control(ui, visible, language);
-                    });
-                });
-                let label = match mode {
-                    AppMode::S11 => format!("S11  {}", state.s11.display.label(language)),
-                    AppMode::Spec => format!("{}  dBm", language.text(Text::Spectrum)),
-                };
-                if ui.add(egui::Button::new(label).frame(false)).clicked() {
-                    state.change_mode(mode);
-                }
-            });
+                        if ui
+                            .add(
+                                egui::Button::new(trace.settings.display.label(language))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            state.workspace.selected = Some(trace.id);
+                        }
+                    })
+            })
+            .inner;
         if selected {
             ui.painter().line_segment(
                 [
                     card.response.rect.left_top() + egui::vec2(1.0, 2.0),
                     card.response.rect.left_bottom() + egui::vec2(1.0, -2.0),
                 ],
-                egui::Stroke::new(3.0, color),
+                egui::Stroke::new(3.0, trace.settings.color),
             );
         }
         ui.add_space(4.0);
+    }
+    if let Some(id) = delete {
+        state.workspace.remove_trace(id);
+    }
+    if let Some(id) = edit
+        && let Some(trace) = state.workspace.traces.iter().find(|trace| trace.id == id)
+    {
+        state.workspace.editor = Some(TraceEditor {
+            id: Some(id),
+            settings: trace.settings.clone(),
+        });
+    }
+}
+
+fn trace_editor(ctx: &egui::Context, state: &mut AppState) {
+    let Some(mut editor) = state.workspace.editor.take() else {
+        return;
+    };
+    let language = state.language;
+    let mut open = true;
+    let mut save = false;
+    let mut cancel = false;
+    egui::Window::new(language.text(if editor.id.is_some() {
+        Text::TraceSettings
+    } else {
+        Text::AddTrace
+    }))
+    .id(egui::Id::new("trace_editor"))
+    .open(&mut open)
+    .resizable(false)
+    .collapsible(false)
+    .show(ctx, |ui| {
+        ui.add_enabled_ui(
+            state.sweep != SweepState::Stopping
+                && state.connection != ConnectionState::Disconnecting,
+            |ui| {
+                panels::workspace_panel::settings_fields(ui, &mut editor.settings, language);
+                ui.horizontal(|ui| {
+                    save = ui.button(language.text(Text::Save)).clicked();
+                    cancel = ui.button(language.text(Text::Cancel)).clicked();
+                });
+            },
+        );
+    });
+    if save {
+        if let Some(id) = editor.id {
+            if let Some(trace) = state
+                .workspace
+                .traces
+                .iter_mut()
+                .find(|trace| trace.id == id)
+            {
+                trace.update_settings(editor.settings);
+            }
+        } else if let Err(error) = state.workspace.add_trace(editor.settings) {
+            state.status_message = Some(error.to_string().into());
+        }
+    } else if open && !cancel {
+        state.workspace.editor = Some(editor);
     }
 }
 
@@ -853,10 +1018,14 @@ fn visibility_control(ui: &mut egui::Ui, visible: &mut bool, language: Language)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acquisition::{CompletedSweep, TraceId};
+    use crate::state::WorkerCommand;
+    use crate::workspace::{SweepRange, Workspace};
     use kcsdi_core::data::{SweepData, SweepPoint};
     use kcsdi_core::protocol::StreamMode;
+    use std::time::SystemTime;
 
-    fn test_app(state: crate::state::AppState) -> KcsdiApp {
+    fn test_app(state: AppState) -> KcsdiApp {
         let (_, evt_rx) = mpsc::channel();
         KcsdiApp {
             last_saved: AppConfig::from_state(&state),
@@ -869,55 +1038,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disconnect_clears_health_but_preserves_completed_export_data() {
-        let mut state = crate::state::AppState {
-            temperature: Some(42.0),
-            voltage: Some(kcsdi_core::data::Voltage {
-                external: 12.0,
-                battery: 8.0,
-            }),
-            ..Default::default()
-        };
-        state.s11.trace = Some(SweepData {
-            mode: StreamMode::S11,
-            format: "z".into(),
-            points: vec![],
-        });
-        let mut app = test_app(state);
-        app.apply_event(WorkerEvent::Disconnected);
-        assert!(app.state.temperature.is_none());
-        assert!(app.state.voltage.is_none());
-        assert!(app.state.s11.trace.is_some());
-    }
-
-    #[test]
-    fn completed_measurement_clears_the_request_to_run_again() {
-        let state = crate::state::AppState {
-            connection: ConnectionState::Connected,
-            mode: AppMode::S11,
-            sweep: SweepState::Running(AppMode::S11),
-            s11: crate::state::S11State {
-                display: S11Display::Impedance,
-                points: 3,
-                ..Default::default()
-            },
-            status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
-            ..Default::default()
-        };
-        let mut app = test_app(state);
-        app.apply_event(WorkerEvent::SweepTrace(completed_impedance()));
-        assert!(app.state.status_message.is_none());
-        assert!(app.state.s11.trace.is_some());
-    }
-
     fn completed_impedance() -> SweepData {
         SweepData {
             mode: StreamMode::S11,
             format: "z".into(),
             points: (0..3)
                 .map(|index| SweepPoint {
-                    freq_hz: 1_000_000.0 + f64::from(index) * 1_000_000.0,
+                    freq_hz: 1_000_000.0 + f64::from(index) * 500_000.0,
                     values: vec![50.0, 50.0, 0.0],
                 })
                 .collect(),
@@ -925,133 +1052,88 @@ mod tests {
     }
 
     fn active_impedance_app() -> KcsdiApp {
-        test_app(crate::state::AppState {
+        let mut state = AppState {
             connection: ConnectionState::Connected,
-            mode: AppMode::S11,
             session_id: 1,
-            request_id: 1,
-            sweep: SweepState::Running(AppMode::S11),
             temperature: Some(42.0),
-            s11: crate::state::S11State {
-                display: S11Display::Impedance,
-                points: 3,
-                trace: Some(completed_impedance()),
-                needs_fit: false,
-                ..Default::default()
-            },
-            status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
             ..Default::default()
-        })
+        };
+        state.workspace = Workspace::empty(SweepRange::new(1_000_000.0, 2_000_000.0, 3));
+        state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::Impedance),
+                ..Default::default()
+            })
+            .unwrap();
+        state.send(WorkerCommand::RunWorkspace(state.workspace.plan().unwrap()));
+        let snapshot = Arc::new(CompletedSweep {
+            data: completed_impedance(),
+            settings: state.active_plan.as_ref().unwrap().groups[0]
+                .settings
+                .clone(),
+            session_id: 1,
+            completed_at: SystemTime::UNIX_EPOCH,
+        });
+        let trace = state.workspace.selected_mut().unwrap();
+        trace.analysis.observe(&snapshot);
+        trace.completed = Some(snapshot);
+        trace.needs_fit = false;
+        test_app(state)
     }
 
-    fn prefix(app: &KcsdiApp, cycle_id: u64, points: usize) -> crate::preview::PreviewEnvelope {
+    fn complete_data(app: &KcsdiApp) -> Option<SweepData> {
+        app.state
+            .workspace
+            .selected()
+            .and_then(|trace| trace.completed.as_ref())
+            .map(|snapshot| snapshot.data.clone())
+    }
+
+    fn prefix(
+        app: &KcsdiApp,
+        group: usize,
+        cycle_id: u64,
+        points: usize,
+    ) -> crate::preview::PreviewEnvelope {
+        let group = app.state.active_plan.as_ref().unwrap().groups[group].clone();
         let mut data = completed_impedance();
+        data.mode = group.settings.mode();
+        data.format = group.settings.format().into();
         data.points.truncate(points);
+        if data.mode == StreamMode::Spec {
+            for point in &mut data.points {
+                point.values = vec![-20.0];
+            }
+        }
         crate::preview::PreviewEnvelope {
             session_id: app.state.session_id,
             request_id: app.state.request_id,
             cycle_id,
+            group,
             data,
-            expected_points: 3,
         }
     }
 
-    #[test]
-    fn previews_and_completions_keep_separate_cycle_watermarks_and_snapshots() {
-        let mut app = active_impedance_app();
-        let mut newer = prefix(&app, 2, 2);
-        newer.data.points[0].values[0] = 900.0;
-        app.apply_preview(newer);
-        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
-        assert!(!app.state.s11.needs_fit);
-        assert_eq!(app.state.last_completed_cycle, None);
-        let mut complete = completed_impedance();
-        complete.points[0].values[0] = 75.0;
-        app.apply_worker_event(EventEnvelope {
+    fn completion(app: &KcsdiApp, group: usize, cycle: u64) -> EventEnvelope {
+        let preview = prefix(app, group, cycle, 3);
+        EventEnvelope {
             session_id: app.state.session_id,
             request_id: app.state.request_id,
-            cycle_id: Some(1),
-            event: WorkerEvent::SweepTrace(complete.clone()),
-        });
-        assert_eq!(app.state.s11.trace, Some(complete));
-        assert_eq!(app.state.last_completed_cycle, Some(1));
-        assert_eq!(app.state.preview.as_ref().unwrap().cycle_id, 2);
-        app.apply_preview(prefix(&app, 1, 2));
-        assert_eq!(app.state.preview.as_ref().unwrap().cycle_id, 2);
-        app.apply_worker_event(EventEnvelope {
-            session_id: app.state.session_id,
-            request_id: app.state.request_id,
-            cycle_id: Some(2),
-            event: WorkerEvent::SweepTrace(completed_impedance()),
-        });
-        assert!(app.state.preview.is_none());
-        app.apply_preview(prefix(&app, 2, 2));
-        assert!(app.state.preview.is_none());
-        let obsolete = prefix(&app, 3, 2);
-        app.state.send(crate::state::WorkerCommand::StopSweep);
-        app.apply_preview(obsolete);
-        assert!(app.state.preview.is_none());
-        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
-    }
-
-    #[test]
-    fn new_previews_do_not_starve_fitting_or_supply_its_measurements() {
-        for points in [0, 2] {
-            let mut app = active_impedance_app();
-            app.state.s11.needs_fit = true;
-            let mut pending = prefix(&app, 2, points);
-            for point in &mut pending.data.points {
-                point.values = vec![10_000.0, 10_000.0, 0.0];
-            }
-            app.apply_preview(pending);
-            let ctx = egui::Context::default();
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(800.0, 600.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| app.plot_ui(ui),
-            );
-            output.textures_delta.clear();
-            assert!(!app.state.s11.needs_fit);
-            assert!(app.state.s11.view.y_max < 100.0);
-            assert!(app.state.s11.view.x_min <= 1_000_000.0);
-            assert!(app.state.s11.view.x_max >= 3_000_000.0);
-            assert!(app.state.preview.is_some());
-            assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+            cycle_id: Some(cycle),
+            event: WorkerEvent::SweepTrace(SweepDelivery {
+                members: preview.group.members,
+                snapshot: Arc::new(CompletedSweep {
+                    data: preview.data,
+                    settings: preview.group.settings,
+                    session_id: app.state.session_id,
+                    completed_at: SystemTime::UNIX_EPOCH,
+                }),
+            }),
         }
     }
 
-    #[test]
-    fn spectrum_fits_completed_data_while_a_new_prefix_is_visible() {
-        let mut app = test_app(AppState {
-            connection: ConnectionState::Connected,
-            sweep: SweepState::Running(AppMode::Spec),
-            ..Default::default()
-        });
-        let mut complete = completed_impedance();
-        complete.mode = StreamMode::Spec;
-        complete.format.clear();
-        for point in &mut complete.points {
-            point.values = vec![-20.0];
-        }
-        app.state.spec.points = 3;
-        app.state.spec.trace = Some(complete.clone());
-        let mut pending = complete.clone();
-        pending.points.truncate(2);
-        for point in &mut pending.points {
-            point.values = vec![10_000.0];
-        }
-        app.apply_preview(crate::preview::PreviewEnvelope {
-            session_id: 0,
-            request_id: 0,
-            cycle_id: 2,
-            data: pending,
-            expected_points: 3,
-        });
+    fn plot_frame(app: &mut KcsdiApp) {
         egui::Context::default()
             .run_ui(
                 egui::RawInput {
@@ -1064,126 +1146,548 @@ mod tests {
                 |ui| app.plot_ui(ui),
             )
             .drop_without_applying_deltas();
-        assert!(!app.state.spec.needs_fit);
-        assert!(app.state.spec.view.y_max < 0.0);
-        assert_eq!(app.state.spec.trace, Some(complete));
     }
 
     #[test]
-    fn a_phase_preview_does_not_relabel_impedance_holds_or_change_export_data() {
+    fn shared_group_routes_one_snapshot_without_advancing_other_group_watermarks() {
         let mut app = active_impedance_app();
-        let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 600.0));
-        let mut button = None;
-        for _ in 0..2 {
-            let output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    ..Default::default()
-                },
-                |ui| {
-                    app.state.s11.analysis.controls(
-                        ui,
-                        Language::English,
-                        app.state.s11.trace.as_ref(),
-                    );
-                },
-            );
-            button = output
-                .shapes
-                .iter()
-                .filter_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == "HOLD" => {
-                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
-                    }
-                    _ => None,
-                })
-                .next_back();
-            output.drop_without_applying_deltas();
-        }
-        let pos = button.expect("hold button must be visible");
-        for pressed in [true, false] {
-            ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events: vec![
-                        egui::Event::PointerMoved(pos),
-                        egui::Event::PointerButton {
-                            pos,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                    ..Default::default()
-                },
-                |ui| {
-                    app.state.s11.analysis.controls(
-                        ui,
-                        Language::English,
-                        app.state.s11.trace.as_ref(),
-                    );
-                },
-            )
-            .drop_without_applying_deltas();
-        }
-        assert_eq!(
-            app.state.s11.analysis.held_trace(),
-            Some(completed_impedance())
-        );
-        app.state.s11.display = S11Display::Phase;
-        app.state.send(crate::state::WorkerCommand::RunS11(
-            app.state.s11.s11_params().unwrap(),
-        ));
-        let mut pending = prefix(&app, 2, 2);
-        pending.data.format = "ma".into();
-        for point in &mut pending.data.points {
-            point.values = vec![0.5, 10.0];
-        }
-        app.apply_preview(pending);
-        let output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(800.0, 600.0),
-                )),
+        let first = app.state.workspace.selected.unwrap();
+        let second = app
+            .state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::Smith),
                 ..Default::default()
-            },
-            |ui| app.plot_ui(ui),
+            })
+            .unwrap();
+        let spec = app
+            .state
+            .workspace
+            .add_trace(TraceSettings::default())
+            .unwrap();
+        app.state.reconcile_plan();
+        assert_eq!(app.state.active_plan.as_ref().unwrap().groups.len(), 2);
+        app.apply_preview(prefix(&app, 0, 2, 2));
+        app.apply_preview(prefix(&app, 1, 3, 1));
+        let a = app.state.workspace.traces[0].preview.as_ref().unwrap();
+        let b = app.state.workspace.traces[1].preview.as_ref().unwrap();
+        assert!(Arc::ptr_eq(a, b));
+        app.apply_worker_event(completion(&app, 0, 1));
+        for id in [first, second] {
+            let trace = app
+                .state
+                .workspace
+                .traces
+                .iter()
+                .find(|trace| trace.id == id)
+                .unwrap();
+            assert_eq!(trace.last_completed_cycle, Some(1));
+            assert_eq!(trace.preview.as_ref().unwrap().cycle_id, 2);
+        }
+        let a = app.state.workspace.traces[0].completed.as_ref().unwrap();
+        let b = app.state.workspace.traces[1].completed.as_ref().unwrap();
+        assert!(Arc::ptr_eq(a, b));
+        let other = app
+            .state
+            .workspace
+            .traces
+            .iter()
+            .find(|trace| trace.id == spec)
+            .unwrap();
+        assert_eq!(other.last_completed_cycle, None);
+        assert_eq!(other.preview.as_ref().unwrap().cycle_id, 3);
+        app.apply_worker_event(completion(&app, 0, 2));
+        assert!(app.state.workspace.traces[0].preview.is_none());
+        assert!(app.state.workspace.traces[1].preview.is_none());
+        assert!(app.state.workspace.traces[2].preview.is_some());
+        app.apply_preview(prefix(&app, 0, 2, 2));
+        assert!(app.state.workspace.traces[0].preview.is_none());
+    }
+
+    #[test]
+    fn invalid_or_unowned_deliveries_do_not_poison_completed_snapshots() {
+        let mut app = active_impedance_app();
+        let original = complete_data(&app);
+        for kind in 0..5 {
+            let mut event = completion(&app, 0, 2);
+            if let WorkerEvent::SweepTrace(delivery) = &mut event.event {
+                match kind {
+                    0 => delivery.members.push(TraceId(999)),
+                    1 => Arc::make_mut(&mut delivery.snapshot).data.format = "ma".into(),
+                    2 => {
+                        Arc::make_mut(&mut delivery.snapshot).data.points.pop();
+                    }
+                    3 => Arc::make_mut(&mut delivery.snapshot).session_id += 1,
+                    _ => event.cycle_id = None,
+                }
+            }
+            app.apply_worker_event(event);
+            assert_eq!(complete_data(&app), original);
+            assert!(
+                app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .last_completed_cycle
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn stop_edit_restart_rejects_old_same_shape_results_and_errors() {
+        let mut app = active_impedance_app();
+        let stale = completion(&app, 0, 2);
+        let stale_preview = prefix(&app, 0, 3, 2);
+        let old_request = app.state.request_id;
+        app.state.send(WorkerCommand::StopSweep);
+        app.state.workspace.selected_mut().unwrap().settings.cal =
+            kcsdi_core::commands::Cal::CalSys;
+        app.state.send(WorkerCommand::RunWorkspace(
+            app.state.workspace.plan().unwrap(),
+        ));
+        app.apply_worker_event(stale);
+        app.apply_preview(stale_preview);
+        app.apply_worker_event(EventEnvelope {
+            session_id: 1,
+            request_id: old_request,
+            cycle_id: None,
+            event: WorkerEvent::Error("old acquisition rejected".into()),
+        });
+        assert!(app.state.any_running());
+        assert!(app.state.status_message.is_none());
+        assert_eq!(complete_data(&app), Some(completed_impedance()));
+        assert!(app.state.workspace.selected().unwrap().preview.is_none());
+        assert!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .last_completed_cycle
+                .is_none()
         );
-        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with("Hold "))));
-        output.drop_without_applying_deltas();
-        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+        app.apply_worker_event(completion(&app, 0, 4));
         assert_eq!(
-            app.state.s11.analysis.held_trace(),
-            Some(completed_impedance())
+            app.state.workspace.selected().unwrap().last_completed_cycle,
+            Some(4)
         );
+    }
+
+    #[test]
+    fn edits_are_checked_even_before_plan_reconciliation_and_deleted_ids_never_receive_data() {
+        let mut app = active_impedance_app();
+        let event = completion(&app, 0, 1);
+        app.state.workspace.selected_mut().unwrap().settings.rbw = kcsdi_core::model::Rbw::R3k;
+        app.apply_worker_event(event);
+        assert!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .last_completed_cycle
+                .is_none()
+        );
+        let stale = completion(&app, 0, 2);
+        let old_id = app.state.workspace.selected.unwrap();
+        app.state.workspace.remove_trace(old_id);
+        let id = app
+            .state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::Impedance),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_ne!(id, old_id);
+        app.apply_worker_event(stale);
+        assert!(app.state.workspace.selected().unwrap().completed.is_none());
     }
 
     #[test]
     fn stop_requires_the_current_workers_acknowledgement() {
         let mut app = active_impedance_app();
         let old_request = app.state.request_id;
-        app.state.send(crate::state::WorkerCommand::StopSweep);
-        assert_eq!(app.state.sweep, SweepState::Stopping);
-        app.apply_worker_event(EventEnvelope {
-            session_id: app.state.session_id,
-            request_id: old_request,
-            cycle_id: None,
-            event: WorkerEvent::SweepStopped,
-        });
-        assert_eq!(app.state.sweep, SweepState::Stopping);
-        app.apply_worker_event(EventEnvelope {
-            session_id: app.state.session_id,
-            request_id: app.state.request_id,
-            cycle_id: None,
-            event: WorkerEvent::SweepStopped,
-        });
-        assert_eq!(app.state.sweep, SweepState::Idle);
+        app.state.send(WorkerCommand::StopSweep);
+        for request in [old_request, app.state.request_id] {
+            app.apply_worker_event(EventEnvelope {
+                session_id: 1,
+                request_id: request,
+                cycle_id: None,
+                event: WorkerEvent::SweepStopped,
+            });
+            assert_eq!(
+                app.state.sweep,
+                if request == old_request {
+                    SweepState::Stopping
+                } else {
+                    SweepState::Idle
+                }
+            );
+        }
+        assert_eq!(complete_data(&app), Some(completed_impedance()));
         assert_eq!(app.state.connection, ConnectionState::Connected);
-        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
     }
 
+    #[test]
+    fn old_holds_are_not_drawn_with_new_condition_previews() {
+        for display in [
+            TraceDisplay::S11(S11Display::Impedance),
+            TraceDisplay::S11(S11Display::Smith),
+            TraceDisplay::Spec,
+        ] {
+            let mut app = active_impedance_app();
+            app.state.workspace.selected_mut().unwrap().settings.display = display;
+            app.state.reconcile_plan();
+            app.apply_worker_event(completion(&app, 0, 1));
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 700.0));
+            let mut draw = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let trace = app.state.workspace.selected_mut().unwrap();
+                        trace.analysis.controls_for_display(
+                            ui,
+                            Language::English,
+                            trace.completed.as_deref(),
+                            display.is_smith(),
+                        );
+                    },
+                )
+            };
+            let mut target = None;
+            for _ in 0..2 {
+                let output = draw(Vec::new());
+                target = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "HOLD" => {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                        }
+                        _ => None,
+                    })
+                    .next_back();
+                output.drop_without_applying_deltas();
+            }
+            let pos = target.unwrap();
+            for pressed in [true, false] {
+                draw(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ])
+                .drop_without_applying_deltas();
+            }
+            let snapshot = app
+                .state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .clone()
+                .unwrap();
+            assert!(
+                app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .analysis
+                    .held_trace()
+                    .is_some()
+            );
+            let settings = &mut app.state.workspace.selected_mut().unwrap().settings;
+            if display == TraceDisplay::Spec {
+                settings.ref_level_dbm -= 10;
+            } else {
+                settings.cal = kcsdi_core::commands::Cal::CalSys;
+            }
+            app.state.reconcile_plan();
+            app.apply_preview(prefix(&app, 0, 2, 0));
+            assert!(
+                app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .overlays_compatible()
+            );
+            app.apply_preview(prefix(&app, 0, 2, 2));
+            assert!(
+                !app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .overlays_compatible()
+            );
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.plot_ui(ui),
+            );
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("Hold "))));
+            output.drop_without_applying_deltas();
+            assert!(Arc::ptr_eq(
+                app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .completed
+                    .as_ref()
+                    .unwrap(),
+                &snapshot
+            ));
+            assert!(
+                app.state
+                    .workspace
+                    .selected()
+                    .unwrap()
+                    .analysis
+                    .held_trace()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn new_prefixes_do_not_fit_y_or_reset_the_shared_x_zoom() {
+        for points in [0, 2] {
+            let mut app = active_impedance_app();
+            app.state.workspace.x_view.x_min = 1_100_000.0;
+            app.state.workspace.x_view.x_max = 1_900_000.0;
+            app.state.workspace.selected_mut().unwrap().needs_fit = true;
+            let mut pending = prefix(&app, 0, 2, points);
+            for point in &mut pending.data.points {
+                point.values = vec![10_000.0, 10_000.0, 0.0];
+            }
+            app.apply_preview(pending);
+            plot_frame(&mut app);
+            let trace = app.state.workspace.selected().unwrap();
+            assert!(!trace.needs_fit);
+            assert!(trace.view.y_max < 100.0);
+            assert_eq!(
+                (trace.view.x_min, trace.view.x_max),
+                (1_100_000.0, 1_900_000.0)
+            );
+            assert_eq!(complete_data(&app), Some(completed_impedance()));
+            assert!(trace.preview.is_some());
+            if points == 0 {
+                assert_eq!(trace.display_data(), Some(&completed_impedance()));
+            }
+        }
+    }
+
+    #[test]
+    fn first_spec_log_preview_keeps_the_full_stop_without_modifying_sampling() {
+        let mut app = active_impedance_app();
+        app.state.workspace.range = SweepRange::new(0.0, 2_000_000.0, 3);
+        app.state.workspace.x_view.x_min = 0.0;
+        app.state.workspace.x_view.x_max = 2_000_000.0;
+        app.state.workspace.log_x = true;
+        let trace = app.state.workspace.selected_mut().unwrap();
+        trace.settings.display = TraceDisplay::Spec;
+        trace.completed = None;
+        app.state.reconcile_plan();
+        let settings = app.state.active_plan.as_ref().unwrap().clone();
+        let mut pending = prefix(&app, 0, 1, 2);
+        for (index, point) in pending.data.points.iter_mut().enumerate() {
+            point.freq_hz = index as f64 * 1_000_000.0;
+        }
+        app.apply_preview(pending);
+        plot_frame(&mut app);
+        assert_eq!(
+            (
+                app.state.workspace.x_view.x_min,
+                app.state.workspace.x_view.x_max
+            ),
+            (1_000_000.0, 2_000_000.0)
+        );
+        assert_eq!(app.state.active_plan.as_ref(), Some(&settings));
+        assert_eq!(app.state.workspace.range.start_hz, 0.0);
+        assert_eq!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .data
+                .points[0]
+                .freq_hz,
+            0.0
+        );
+    }
+
+    #[test]
+    fn double_click_fit_uses_completed_data_or_full_configured_range_not_a_prefix() {
+        for completed in [false, true] {
+            let mut app = active_impedance_app();
+            if !completed {
+                app.state.workspace.selected_mut().unwrap().completed = None;
+            }
+            app.state.workspace.selected_mut().unwrap().view_locked = true;
+            app.state.workspace.x_view.x_min = 1_100_000.0;
+            app.state.workspace.x_view.x_max = 1_900_000.0;
+            let mut pending = prefix(&app, 0, 2, 2);
+            for point in &mut pending.data.points {
+                point.values = vec![10_000.0, 10_000.0, 0.0];
+            }
+            app.apply_preview(pending);
+            let ctx = egui::Context::default();
+            let cursor = egui::pos2(350.0, 300.0);
+            let mut frame = |time, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.plot_ui(ui),
+                )
+                .drop_without_applying_deltas();
+            };
+            frame(0.0, Vec::new());
+            frame(0.02, vec![egui::Event::PointerMoved(cursor)]);
+            for (index, pressed) in [true, false, true, false].into_iter().enumerate() {
+                frame(
+                    0.04 + index as f64 * 0.02,
+                    vec![egui::Event::PointerButton {
+                        pos: cursor,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            let trace = app.state.workspace.selected().unwrap();
+            assert!(!trace.view_locked);
+            assert_eq!(
+                (
+                    app.state.workspace.x_view.x_min,
+                    app.state.workspace.x_view.x_max
+                ),
+                (1_000_000.0, 2_000_000.0)
+            );
+            assert_eq!(
+                (trace.view.x_min, trace.view.x_max),
+                (1_000_000.0, 2_000_000.0)
+            );
+            assert!(trace.view.y_max <= 200.0);
+            if !completed {
+                assert_eq!(
+                    (trace.view.y_min, trace.view.y_max),
+                    S11Display::Impedance.default_y()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_fits_completed_data_while_next_group_is_partial() {
+        let mut app = active_impedance_app();
+        let id = app
+            .state
+            .workspace
+            .add_trace(TraceSettings::default())
+            .unwrap();
+        app.state.reconcile_plan();
+        app.apply_worker_event(completion(&app, 1, 2));
+        let mut preview = prefix(&app, 1, 3, 2);
+        for point in &mut preview.data.points {
+            point.values = vec![10_000.0];
+        }
+        app.apply_preview(preview);
+        plot_frame(&mut app);
+        let trace = app
+            .state
+            .workspace
+            .traces
+            .iter()
+            .find(|trace| trace.id == id)
+            .unwrap();
+        assert!(!trace.needs_fit);
+        assert!(trace.view.y_max < 0.0);
+        assert!(
+            trace
+                .completed
+                .as_ref()
+                .unwrap()
+                .data
+                .points
+                .iter()
+                .all(|point| point.values == [-20.0])
+        );
+    }
+
+    #[test]
+    fn wire_format_switch_preserves_export_but_does_not_render_old_columns() {
+        let mut app = active_impedance_app();
+        let trace = app.state.workspace.selected_mut().unwrap();
+        let mut settings = trace.settings.clone();
+        settings.display = TraceDisplay::S11(S11Display::Phase);
+        trace.update_settings(settings);
+        app.state.reconcile_plan();
+        assert!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed_for_display()
+                .is_none()
+        );
+        let mut preview = prefix(&app, 0, 2, 2);
+        for point in &mut preview.data.points {
+            point.values = vec![0.5, 10.0];
+        }
+        app.apply_preview(preview);
+        plot_frame(&mut app);
+        assert_eq!(complete_data(&app), Some(completed_impedance()));
+        assert_eq!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .display_data()
+                .unwrap()
+                .format,
+            "ma"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_health_and_previews_but_keeps_completed_snapshots() {
+        for lost in [false, true] {
+            let mut app = active_impedance_app();
+            app.apply_preview(prefix(&app, 0, 2, 2));
+            app.apply_event(if lost {
+                WorkerEvent::ConnectionLost("connection reset".into())
+            } else {
+                WorkerEvent::Disconnected
+            });
+            assert!(app.state.temperature.is_none());
+            assert!(app.state.voltage.is_none());
+            assert!(app.state.workspace.selected().unwrap().preview.is_none());
+            assert_eq!(complete_data(&app), Some(completed_impedance()));
+            assert_eq!(app.state.sweep, SweepState::Idle);
+        }
+    }
     #[test]
     fn close_is_cancelled_until_the_owned_worker_finishes() {
         let mut app = active_impedance_app();
@@ -1244,45 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn late_same_format_results_and_errors_cannot_replace_a_new_request() {
-        let mut app = active_impedance_app();
-        let session_id = app.state.session_id;
-        let request_id = app.state.request_id;
-        app.state.send(crate::state::WorkerCommand::StopSweep);
-        app.state.s11.start_hz = 2_000_000.0;
-        let params = app.state.s11.s11_params().unwrap();
-        app.state.send(crate::state::WorkerCommand::RunS11(params));
-        let mut late = completed_impedance();
-        late.points[0].values = vec![75.0, 75.0, 0.0];
-        for event in [
-            WorkerEvent::SweepTrace(late.clone()),
-            WorkerEvent::Error("obsolete request failed".into()),
-        ] {
-            app.apply_worker_event(EventEnvelope {
-                session_id,
-                request_id,
-                cycle_id: Some(1),
-                event,
-            });
-            assert_eq!(app.state.s11.trace, Some(completed_impedance()));
-            assert!(app.state.running(AppMode::S11));
-            assert!(!app.state.s11.needs_fit);
-            assert!(matches!(
-                app.state.status_message,
-                Some(StatusMessage::Text(Text::RunForDisplay))
-            ));
-        }
-        app.apply_worker_event(EventEnvelope {
-            session_id,
-            request_id: app.state.request_id,
-            cycle_id: Some(2),
-            event: WorkerEvent::SweepTrace(late.clone()),
-        });
-        assert_eq!(app.state.s11.trace, Some(late));
-        assert!(app.state.status_message.is_none());
-    }
-
-    #[test]
     fn connection_lifecycle_rejects_old_session_events_before_worker_acknowledgement() {
         for reconnect in [false, true] {
             let mut app = active_impedance_app();
@@ -1332,7 +1797,7 @@ mod tests {
                 assert!(app.state.voltage.is_none());
                 assert_eq!(app.state.request_id, request_id);
                 assert!(!app.state.any_running());
-                assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+                assert_eq!(complete_data(&app), Some(completed_impedance()));
             }
         }
     }
@@ -1350,7 +1815,7 @@ mod tests {
         assert!(matches!(app.state.connection, ConnectionState::Error(_)));
         assert!(app.state.temperature.is_none());
         assert!(!app.state.any_running());
-        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+        assert_eq!(complete_data(&app), Some(completed_impedance()));
     }
 
     #[test]
@@ -1370,129 +1835,8 @@ mod tests {
             },
         });
         assert_eq!(app.state.temperature, Some(43.0));
-        assert!(app.state.running(AppMode::S11));
+        assert!(app.state.any_running());
         assert_eq!(app.state.request_id, 3);
-    }
-
-    #[test]
-    fn obsolete_sweeps_leave_the_completed_snapshot_and_status_unchanged() {
-        for case in 0..6 {
-            let state = crate::state::AppState {
-                connection: ConnectionState::Connected,
-                mode: AppMode::S11,
-                sweep: SweepState::Running(AppMode::S11),
-                s11: crate::state::S11State {
-                    display: S11Display::Smith,
-                    points: 3,
-                    trace: Some(completed_impedance()),
-                    needs_fit: false,
-                    ..Default::default()
-                },
-                status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
-                ..Default::default()
-            };
-            let mut app = test_app(state);
-            let mut late = completed_impedance();
-            late.points[0].values[0] = 123.0;
-            match case {
-                0 => app.state.connection = ConnectionState::Disconnected,
-                1 => app.state.sweep = SweepState::Idle,
-                2 => app.state.mode = AppMode::Spec,
-                3 => app.state.s11.display = S11Display::Phase,
-                4 => app.state.s11.points = 201,
-                5 => late.mode = StreamMode::Spec,
-                _ => unreachable!(),
-            }
-            app.apply_event(WorkerEvent::SweepTrace(late));
-            assert_eq!(
-                app.state.s11.trace.as_ref().unwrap().points[0].values[0],
-                50.0,
-                "case {case}"
-            );
-            assert!(!app.state.s11.needs_fit, "case {case}");
-            assert!(matches!(
-                app.state.status_message,
-                Some(StatusMessage::Text(Text::RunForDisplay))
-            ));
-            assert!(app.state.spec.trace.is_none());
-        }
-    }
-
-    #[test]
-    fn smith_and_impedance_accept_the_same_completed_wire_format() {
-        for display in [S11Display::Smith, S11Display::Impedance] {
-            let state = crate::state::AppState {
-                connection: ConnectionState::Connected,
-                mode: AppMode::S11,
-                sweep: SweepState::Running(AppMode::S11),
-                s11: crate::state::S11State {
-                    display,
-                    points: 3,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut app = test_app(state);
-            app.apply_event(WorkerEvent::SweepTrace(completed_impedance()));
-            assert_eq!(app.state.s11.trace.as_ref().unwrap().points.len(), 3);
-        }
-    }
-
-    #[test]
-    fn spectrum_accepts_only_active_count_and_wire_format() {
-        let state = crate::state::AppState {
-            connection: ConnectionState::Connected,
-            sweep: SweepState::Running(AppMode::Spec),
-            spec: crate::state::SpecState {
-                points: 3,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = test_app(state);
-        let mut trace = completed_impedance();
-        trace.mode = StreamMode::Spec;
-        trace.format.clear();
-        for point in &mut trace.points {
-            point.values = vec![-20.0];
-        }
-        app.apply_event(WorkerEvent::SweepTrace(trace.clone()));
-        assert!(app.state.spec.trace.is_some());
-        trace.format = "loss".into();
-        assert!(!app.accepts_trace(&trace));
-        trace.format.clear();
-        trace.points.pop();
-        assert!(!app.accepts_trace(&trace));
-    }
-
-    #[test]
-    fn connection_loss_clears_health_and_keeps_the_completed_export_snapshot() {
-        let mut state = crate::state::AppState {
-            connection: ConnectionState::Connected,
-            temperature: Some(42.0),
-            voltage: Some(kcsdi_core::data::Voltage {
-                external: 12.0,
-                battery: 8.0,
-            }),
-            ..Default::default()
-        };
-        state.sweep = SweepState::Running(AppMode::S11);
-        state.s11.trace = Some(SweepData {
-            mode: StreamMode::S11,
-            format: "z".into(),
-            points: vec![],
-        });
-        let mut app = test_app(state);
-        app.apply_event(WorkerEvent::ConnectionLost(
-            "Sweep failed: connection reset".into(),
-        ));
-        assert!(matches!(app.state.connection, ConnectionState::Error(_)));
-        assert!(app.state.device_info.is_none());
-        assert!(app.state.temperature.is_none());
-        assert!(app.state.voltage.is_none());
-        assert!(!app.state.any_running());
-        assert!(app.state.s11.trace.is_some());
-        assert!(app.state.status_message.is_some());
     }
 
     #[test]
@@ -1506,7 +1850,6 @@ mod tests {
                     i18n::set_language(&ctx, language);
                     let state = crate::state::AppState {
                         language,
-                        mode: AppMode::S11,
                         ..Default::default()
                     };
                     let mut app = test_app(state);
@@ -1594,7 +1937,7 @@ mod tests {
 
     #[test]
     fn impedance_visibility_defaults_to_all_and_survives_new_traces() {
-        let mut state = crate::state::S11State::default();
+        let mut state = TraceSettings::default();
         assert_eq!(state.impedance_visible, [true; 3]);
         let mut data = SweepData {
             mode: StreamMode::S11,
