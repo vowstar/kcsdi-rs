@@ -4,6 +4,7 @@
 //! kcsdi: command-line interface for KC901 instruments.
 
 mod export;
+mod source;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,11 @@ enum Command {
     Sweep {
         #[command(subcommand)]
         mode: SweepCommand,
+    },
+    /// Control RF or AF output with a bounded host run time
+    Source {
+        #[command(subcommand)]
+        command: source::SourceCommand,
     },
 }
 
@@ -181,6 +187,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Info(args) => info(&args),
+        Command::Source { command } => source::run(command),
         Command::Export { format } => export::run(format),
         Command::Sweep { mode } => match mode {
             SweepCommand::S11(args) => sweep_s11(&args),

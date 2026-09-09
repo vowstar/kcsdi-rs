@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use kcsdi_core::Device;
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
+use kcsdi_core::source::{SourceOutputState, SourceReport};
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
@@ -27,6 +28,9 @@ use crate::state::{CommandEnvelope, DEVICE_MODEL, EventEnvelope, WorkerCommand, 
 pub const EVENT_CAPACITY: usize = 16;
 const STATUS_COMMAND_GAP: Duration = Duration::from_millis(100);
 const WORKER_POLL: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+mod source_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunPhase {
@@ -248,6 +252,7 @@ fn run_worker(
     let mut identity = WorkerIdentity::default();
     let mut cycle_id = 0_u64;
     let mut pending_status = None;
+    let mut source_request = None;
 
     let emit = |evt: EventEnvelope| {
         send_event(&evt_tx, evt, &shutdown, None, &ctx);
@@ -269,6 +274,8 @@ fn run_worker(
                         break;
                     }
                     let cancel = cmd.cancel.clone();
+                    track_source_request(&cmd, identity, &mut source_request);
+                    let guard = source_rejection_guard(&cmd, &device, &source_request);
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
@@ -276,7 +283,16 @@ fn run_worker(
                         &mut device,
                         &mut job,
                         recording.pending.is_some(),
-                        &|event| send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx),
+                        &|event| {
+                            send_request_event(
+                                &evt_tx,
+                                event,
+                                &shutdown,
+                                &cancel,
+                                guard.as_ref(),
+                                &ctx,
+                            )
+                        },
                     );
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -294,6 +310,8 @@ fn run_worker(
                         break 'worker;
                     }
                     let cancel = cmd.cancel.clone();
+                    track_source_request(&cmd, identity, &mut source_request);
+                    let guard = source_rejection_guard(&cmd, &device, &source_request);
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
@@ -301,7 +319,16 @@ fn run_worker(
                         &mut device,
                         &mut job,
                         recording.pending.is_some(),
-                        &|event| send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx),
+                        &|event| {
+                            send_request_event(
+                                &evt_tx,
+                                event,
+                                &shutdown,
+                                &cancel,
+                                guard.as_ref(),
+                                &ctx,
+                            )
+                        },
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -310,19 +337,60 @@ fn run_worker(
         }
         if let Some(status) = pending_status.take() {
             let cancel = status.cancel.clone();
+            let guard = source_rejection_guard(&status, &device, &source_request);
             handle(status, &mut identity, &mut device, &mut job, &|event| {
-                send_event(&evt_tx, event, &shutdown, Some(&cancel), &ctx);
+                send_request_event(&evt_tx, event, &shutdown, &cancel, guard.as_ref(), &ctx);
             });
         }
         if shutdown.is_cancelled() {
             break;
+        }
+        if let Some(dev) = device.as_mut()
+            && matches!(dev.source_report().state, SourceOutputState::Requested(_))
+        {
+            let (source, cancel) = source_request.as_ref().expect("source start has an owner");
+            let before = dev.source_report();
+            match dev.poll_source_controlled(&shutdown) {
+                Ok(report) if report != before => {
+                    send_event(
+                        &evt_tx,
+                        source.event(WorkerEvent::SourceReport(report)),
+                        &shutdown,
+                        Some(cancel),
+                        &ctx,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A late failure can leave output enabled. Attempt stop
+                    // and local release before waiting for UI event capacity.
+                    let report = dev.source_report();
+                    if let Some(mut dev) = device.take() {
+                        dev.close();
+                    }
+                    discard_job(&mut job);
+                    send_event(
+                        &evt_tx,
+                        source.event(WorkerEvent::SourceReport(report)),
+                        &shutdown,
+                        Some(cancel),
+                        &ctx,
+                    );
+                    emit(source.event(WorkerEvent::ConnectionLost(format!(
+                        "Source failed: {error}"
+                    ))));
+                }
+            }
+            // Polling may have received a control command or filled the event
+            // queue. Drain control before considering another acquisition.
+            continue;
         }
         let cancel = job
             .as_ref()
             .map(|job| job.cancel.clone())
             .unwrap_or_default();
         if recording.poll(identity, &mut job, &|event| {
-            send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx);
+            send_request_event(&evt_tx, event, &shutdown, &cancel, None, &ctx);
         }) {
             // A progress event may have waited for UI capacity. Recheck queued
             // control and health commands before starting another acquisition.
@@ -470,6 +538,50 @@ fn run_worker(
     drop(recording);
 }
 
+fn track_source_request(
+    command: &CommandEnvelope,
+    identity: WorkerIdentity,
+    source_request: &mut Option<(WorkerIdentity, CancellationToken)>,
+) {
+    if matches!(&command.command, WorkerCommand::StartSource(params)
+        if params.validate(&DEVICE_MODEL.capabilities()).is_ok())
+        && command.session_id == identity.session_id
+        && command.request_id >= identity.request_id
+        && !command.cancel.is_cancelled()
+    {
+        *source_request = Some((
+            WorkerIdentity {
+                session_id: command.session_id,
+                request_id: command.request_id,
+            },
+            command.cancel.clone(),
+        ));
+    }
+}
+
+fn source_rejection_guard(
+    command: &CommandEnvelope,
+    device: &Option<Device<TcpTransport>>,
+    owner: &Option<(WorkerIdentity, CancellationToken)>,
+) -> Option<CancellationToken> {
+    let rejects_without_stopping = match &command.command {
+        WorkerCommand::RefreshStatus | WorkerCommand::RunWorkspace(_) => true,
+        WorkerCommand::StartSource(params) => {
+            params.validate(&DEVICE_MODEL.capabilities()).is_err()
+        }
+        _ => false,
+    };
+    if rejects_without_stopping
+        && device
+            .as_ref()
+            .is_some_and(|dev| matches!(dev.source_report().state, SourceOutputState::Requested(_)))
+    {
+        owner.as_ref().map(|(_, cancel)| cancel.clone())
+    } else {
+        None
+    }
+}
+
 fn measure_list<T: kcsdi_core::transport::Transport>(
     device: &mut Device<T>,
     settings: &kcsdi_core::device::PointSettings,
@@ -573,9 +685,15 @@ fn send_request_event(
     event: EventEnvelope,
     shutdown: &CancellationToken,
     cancel: &CancellationToken,
+    source_rejection: Option<&CancellationToken>,
     ctx: &egui::Context,
 ) {
-    let obsolete = matches!(event.event, WorkerEvent::RunProgress(_)).then_some(cancel);
+    let obsolete = match &event.event {
+        WorkerEvent::RunProgress(_) | WorkerEvent::SourceReport(_) => Some(cancel),
+        WorkerEvent::Status(_) | WorkerEvent::StatusFailed(_) => source_rejection.or(Some(cancel)),
+        WorkerEvent::Error(_) => source_rejection,
+        _ => None,
+    };
     // Progress becomes obsolete on Stop. A terminal error remains deliverable
     // after discarding the failed job has cancelled its acquisition token.
     send_event(sender, event, shutdown, obsolete, ctx);
@@ -689,8 +807,52 @@ fn handle_with_recording(
                 emit(WorkerEvent::SweepStopped);
             }
         }
+        WorkerCommand::StartSource(params) => {
+            discard_job(job);
+            if cancel.is_cancelled() {
+                return;
+            }
+            let result = device
+                .as_mut()
+                .ok_or(kcsdi_core::Error::NotConnected)
+                .and_then(|dev| {
+                    params.validate(&DEVICE_MODEL.capabilities())?;
+                    dev.stop_sweep()?;
+                    dev.start_source_controlled(&params, &cancel)
+                });
+            source_result(result, device, job, &emit);
+        }
+        WorkerCommand::StopSource => {
+            discard_job(job);
+            let result = device
+                .as_mut()
+                .ok_or(kcsdi_core::Error::NotConnected)
+                .and_then(|dev| dev.stop_source_controlled(&cancel));
+            source_result(result, device, job, &emit);
+        }
         WorkerCommand::RefreshStatus => {
             refresh_status(&cancel, device, job, &emit);
+        }
+    }
+}
+
+fn source_result(
+    result: kcsdi_core::Result<SourceReport>,
+    device: &mut Option<Device<TcpTransport>>,
+    job: &mut Option<SweepRequest>,
+    emit: &dyn Fn(WorkerEvent),
+) {
+    match result {
+        Ok(report) => emit(WorkerEvent::SourceReport(report)),
+        Err(error) => {
+            emit(WorkerEvent::SourceReport(device.as_ref().map_or(
+                SourceReport {
+                    state: SourceOutputState::Unknown,
+                    warning: None,
+                },
+                Device::source_report,
+            )));
+            fail(error, "Source failed", device, job, emit);
         }
     }
 }
@@ -702,6 +864,15 @@ fn refresh_status(
     emit: &dyn Fn(WorkerEvent),
 ) {
     let Some(dev) = device.as_mut() else { return };
+    if matches!(
+        dev.source_report().state,
+        SourceOutputState::Requested(_) | SourceOutputState::Unknown
+    ) {
+        emit(WorkerEvent::StatusFailed(
+            "Stop the source before refreshing status".into(),
+        ));
+        return;
+    }
     // Status belongs to the session, not a sweep. Stop cannot interrupt an
     // in-flight pair, which retains two 10-second query budgets and this gap.
     // Disconnect and shutdown cancel the session token instead.
@@ -760,6 +931,19 @@ fn start_sweep(
     } else if device.is_none() {
         fail(
             kcsdi_core::Error::NotConnected,
+            "Run failed",
+            device,
+            job,
+            emit,
+        );
+    } else if device.as_ref().is_some_and(|dev| {
+        matches!(
+            dev.source_report().state,
+            SourceOutputState::Requested(_) | SourceOutputState::Unknown
+        )
+    }) {
+        fail(
+            kcsdi_core::Error::DeviceBusy("stop the source before starting a sweep".into()),
             "Run failed",
             device,
             job,
@@ -1013,6 +1197,7 @@ mod tests {
                         source.event(WorkerEvent::RunProgress(progress)),
                         &shutdown,
                         &cancel,
+                        None,
                         &egui::Context::default(),
                     );
                     done.send(()).unwrap();
@@ -1032,6 +1217,7 @@ mod tests {
                 source.event(WorkerEvent::Error("Recording failed: disk full".into())),
                 &shutdown,
                 &cancel,
+                None,
                 &egui::Context::default(),
             );
             assert!(matches!(

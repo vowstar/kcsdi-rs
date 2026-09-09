@@ -21,6 +21,7 @@ mod panels;
 mod preview;
 mod recording;
 mod run_settings;
+mod source_panel;
 mod spreadsheet;
 mod state;
 mod theme;

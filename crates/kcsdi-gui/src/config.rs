@@ -34,7 +34,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Work
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 
 fn legacy_config_version() -> u32 {
     1
@@ -61,6 +61,8 @@ pub struct AppConfig {
     pub legacy_sweeps: Option<LegacySweeps>,
     pub workspace: WorkspaceConfig,
     pub desktop: DesktopConfig,
+    pub function: crate::source_panel::InstrumentFunction,
+    pub sources: crate::source_panel::SourceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -538,6 +540,8 @@ impl Default for AppConfig {
             legacy_sweeps: None,
             workspace: WorkspaceConfig::default(),
             desktop: DesktopConfig::default(),
+            function: Default::default(),
+            sources: Default::default(),
         }
     }
 }
@@ -591,6 +595,8 @@ impl AppConfig {
             },
             workspace: WorkspaceConfig::from_workspace(&state.workspace),
             desktop: state.desktop.settings.clone(),
+            function: state.function,
+            sources: state.source.config.clone(),
             ..Self::default()
         }
     }
@@ -632,6 +638,11 @@ impl AppConfig {
         state.active_plan = None;
         state.run_progress = None;
         state.last_recording = None;
+        state.function = self.function;
+        state.source = crate::source_panel::SourceUi {
+            config: self.sources.clone(),
+            ..Default::default()
+        };
     }
 
     fn legacy_workspace(&self) -> Workspace {
@@ -1443,6 +1454,45 @@ rbw = "30k"
         assert_eq!(state.workspace.run, Default::default());
         assert!(!state.workspace.run.recording.enabled);
         assert_eq!(state.workspace.run.interval_ms, 0);
+    }
+
+    #[test]
+    fn source_settings_restore_without_resuming_output_or_recording() {
+        use crate::source_panel::{InstrumentFunction, SourcePending};
+        use kcsdi_core::source::{SourceKind, SourceOutputState, SourceReport};
+        let mut state = AppState {
+            function: InstrumentFunction::AfSource,
+            ..Default::default()
+        };
+        state.source.config.af.frequency_hz = 123_456;
+        state.source.config.af.amplitude_mv = 1_234;
+        state.source.config.af.modulation = "pm".into();
+        state.source.config.af.pm_phase_deg = -123;
+        state.source.pending = Some(SourcePending::Start);
+        state.source.requested = Some(state.source.config.af.params(SourceKind::Af).unwrap());
+        state.source.report = SourceReport {
+            state: SourceOutputState::Requested(SourceKind::Af),
+            warning: None,
+        };
+        let config = AppConfig::from_state(&state);
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("pending"));
+        assert!(!text.contains("requested"));
+        assert!(!text.contains("report"));
+        let loaded: AppConfig = toml::from_str(&text).unwrap();
+        let mut restored = AppState::default();
+        loaded.apply_to(&mut restored);
+        assert_eq!(restored.function, state.function);
+        assert_eq!(restored.source.config, state.source.config);
+        assert_eq!(restored.source.report.state, SourceOutputState::NotStarted);
+        assert!(restored.source.pending.is_none());
+        assert!(restored.source.requested.is_none());
+        assert!(!restored.any_running());
+        assert!(restored.active_plan.is_none());
+        let old: AppConfig = toml::from_str("version = 6").unwrap();
+        old.apply_to(&mut restored);
+        assert_eq!(restored.function, InstrumentFunction::Measurements);
+        assert_eq!(restored.source.config, Default::default());
     }
 
     #[test]

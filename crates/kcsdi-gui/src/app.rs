@@ -80,6 +80,7 @@ impl KcsdiApp {
             WorkerEvent::SweepTrace(_)
                 | WorkerEvent::SweepStopped
                 | WorkerEvent::RunProgress(_)
+                | WorkerEvent::SourceReport(_)
                 | WorkerEvent::Error(_)
         ) && envelope.request_id != self.state.request_id
         {
@@ -96,6 +97,7 @@ impl KcsdiApp {
 
     fn accepts_group(&self, group: &AcquisitionGroup) -> bool {
         self.state.connection == ConnectionState::Connected
+            && self.state.function == crate::source_panel::InstrumentFunction::Measurements
             && self.state.any_running()
             && self
                 .state
@@ -189,6 +191,7 @@ impl KcsdiApp {
                 self.connection_open = false;
                 info!("connected, serial {}", info.serial);
                 self.state.connection = ConnectionState::Connected;
+                self.state.source.connected();
                 self.state.health = Default::default();
                 self.state.device_info = Some(info);
                 self.state.status_message = Some(StatusMessage::Text(Text::Connected));
@@ -204,6 +207,7 @@ impl KcsdiApp {
                 self.state.status_message = Some(message.into());
             }
             WorkerEvent::Error(message) => {
+                self.state.source.lost();
                 if self.state.connection == ConnectionState::Connecting {
                     self.state.connection = ConnectionState::Error(message.clone());
                 }
@@ -221,6 +225,11 @@ impl KcsdiApp {
                 }
             }
             WorkerEvent::SweepTrace(_) => {}
+            WorkerEvent::SourceReport(report) => {
+                if self.state.connection == ConnectionState::Connected {
+                    self.state.source.accept(report, self.state.function);
+                }
+            }
             WorkerEvent::RunProgress(progress) => {
                 if self.state.connection == ConnectionState::Connected && self.state.any_running() {
                     if let crate::run_settings::RunProgress::Saved { path, pass_id } = progress {
@@ -252,6 +261,7 @@ impl KcsdiApp {
     }
 
     fn clear_connection(&mut self) {
+        self.state.source.lost();
         self.state.connection = ConnectionState::Disconnected;
         self.state.device_info = None;
         self.state.health = Default::default();
@@ -517,9 +527,23 @@ impl KcsdiApp {
                     if ui.button(language.text(Text::Devices)).clicked() {
                         self.state.desktop.page = Page::Devices;
                     }
+                    for function in crate::source_panel::InstrumentFunction::ALL {
+                        if ui
+                            .selectable_label(
+                                self.state.function == function,
+                                function.label(language),
+                            )
+                            .clicked()
+                        {
+                            self.state.select_function(function);
+                        }
+                    }
                     if ui
                         .add_enabled(
-                            self.state.workspace.traces.len() < crate::acquisition::MAX_TRACES,
+                            self.state.function
+                                == crate::source_panel::InstrumentFunction::Measurements
+                                && self.state.workspace.traces.len()
+                                    < crate::acquisition::MAX_TRACES,
                             egui::Button::new(language.text(Text::AddTrace)),
                         )
                         .clicked()
@@ -545,6 +569,16 @@ impl KcsdiApp {
                     self.connection_open = true;
                 }
             });
+        if self.state.function.kind().is_some() {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(ui.visuals().panel_fill)
+                        .inner_margin(16),
+                )
+                .show(ui, |ui| crate::source_panel::show(ui, &mut self.state));
+            return;
+        }
         let panel_frame = egui::Frame::new()
             .fill(ui.visuals().panel_fill)
             .inner_margin(8);
@@ -1265,6 +1299,146 @@ mod tests {
         assert_eq!(app.state.sweep, SweepState::Stopping);
         assert!(app.state.run_progress.is_none());
         assert!(complete_data(&app).is_some());
+    }
+
+    #[test]
+    fn source_switches_stop_the_previous_operation_and_reject_stale_reports() {
+        use crate::source_panel::{InstrumentFunction, SourcePending};
+        use kcsdi_core::source::{SourceKind, SourceOutputState, SourceReport};
+        let mut app = active_impedance_app();
+        let complete = complete_data(&app).unwrap();
+        let sweep_request = app.state.request_id;
+        app.state.select_function(InstrumentFunction::RfSource);
+        assert_eq!(app.state.sweep, SweepState::Stopping);
+        assert!(app.state.active_plan.is_none());
+        let emit = |request_id, event| EventEnvelope {
+            session_id: 1,
+            request_id,
+            cycle_id: None,
+            event,
+        };
+        app.apply_worker_event(emit(sweep_request, WorkerEvent::SweepStopped));
+        assert_eq!(app.state.sweep, SweepState::Stopping);
+        app.apply_worker_event(emit(app.state.request_id, WorkerEvent::SweepStopped));
+        assert_eq!(app.state.sweep, SweepState::Idle);
+        let params = app.state.source.config.rf.params(SourceKind::Rf).unwrap();
+        app.state.send(WorkerCommand::StartSource(params));
+        let source_request = app.state.request_id;
+        let started = SourceReport {
+            state: SourceOutputState::Requested(SourceKind::Rf),
+            warning: None,
+        };
+        app.apply_worker_event(emit(source_request, WorkerEvent::SourceReport(started)));
+        assert_eq!(app.state.source.report, started);
+        app.state.reconcile_plan();
+        assert_eq!(app.state.request_id, source_request);
+        assert!(!app.state.any_running());
+        app.state.select_function(InstrumentFunction::AfSource);
+        let stop_request = app.state.request_id;
+        assert!(stop_request > source_request);
+        assert_eq!(app.state.source.pending, Some(SourcePending::Stop));
+        app.apply_worker_event(emit(source_request, WorkerEvent::SourceReport(started)));
+        assert_eq!(app.state.source.pending, Some(SourcePending::Stop));
+        app.apply_worker_event(emit(
+            stop_request,
+            WorkerEvent::SourceReport(SourceReport {
+                state: SourceOutputState::StopSent,
+                warning: None,
+            }),
+        ));
+        assert!(!app.state.source.busy());
+        assert!(app.state.source.requested.is_none());
+        assert_eq!(app.state.function, InstrumentFunction::AfSource);
+        assert_eq!(complete_data(&app).unwrap(), complete);
+        assert!(app.state.active_plan.is_none());
+    }
+
+    #[test]
+    fn unknown_source_blocks_measurements_and_health_after_reconnect() {
+        use crate::source_panel::InstrumentFunction;
+        use kcsdi_core::source::SourceOutputState;
+        let mut app = active_impedance_app();
+        app.state.sweep = SweepState::Idle;
+        app.state.active_plan = None;
+        app.state.source.report.state = SourceOutputState::Unknown;
+        app.clear_connection();
+        app.state.connection = ConnectionState::Connected;
+        app.state.source.connected();
+        app.state.function = InstrumentFunction::Measurements;
+        let request = app.state.request_id;
+        app.state.send(WorkerCommand::RunWorkspace(
+            app.state.workspace.plan().unwrap(),
+        ));
+        app.state.send(WorkerCommand::RefreshStatus);
+        assert_eq!(app.state.request_id, request);
+        assert!(app.state.source.busy());
+        assert!(!app.state.health.pending);
+        assert!(!app.state.any_running());
+    }
+
+    #[test]
+    fn full_source_pages_fit_both_languages_at_both_window_sizes() {
+        use crate::source_panel::InstrumentFunction;
+        use kcsdi_core::source::SourceKind;
+        for size in [egui::vec2(960.0, 600.0), egui::vec2(1280.0, 850.0)] {
+            for language in Language::ALL {
+                for mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+                    for function in [InstrumentFunction::RfSource, InstrumentFunction::AfSource] {
+                        let ctx = egui::Context::default();
+                        theme::setup(&ctx);
+                        theme::apply(&ctx, mode);
+                        let mut app = active_impedance_app();
+                        app.state.language = language;
+                        app.state.function = function;
+                        app.state.sweep = SweepState::Idle;
+                        app.state.active_plan = None;
+                        let kind = function.kind().unwrap();
+                        match kind {
+                            SourceKind::Rf => {
+                                app.state.source.config.rf.frequency_hz = kind.max_frequency_hz();
+                                app.state.source.config.rf.modulation = "ask".into();
+                            }
+                            SourceKind::Af => {
+                                app.state.source.config.af.frequency_hz = kind.max_frequency_hz();
+                                app.state.source.config.af.amplitude_mv = 3_000;
+                                app.state.source.config.af.modulation = "pm".into();
+                                app.state.source.config.af.pm_phase_deg = -180;
+                            }
+                        }
+                        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        for _ in 0..3 {
+                            let mut output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ui| app.instrument_ui(ui),
+                            );
+                            let shapes = std::mem::take(&mut output.shapes);
+                            output.drop_without_applying_deltas();
+                            for key in [
+                                Text::SourceStart,
+                                Text::SourcePort,
+                                Text::SourceModulation,
+                                Text::SourceModFrequency,
+                                Text::SourceAmplitude,
+                            ] {
+                                let shape = shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == language.text(key))).expect("source page label visible");
+                                let egui::Shape::Text(text) = &shape.shape else {
+                                    unreachable!()
+                                };
+                                let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                                assert!(
+                                    screen.contains_rect(bounds)
+                                        && shape.clip_rect.contains_rect(bounds),
+                                    "{function:?} {language:?} {key:?}: {bounds:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

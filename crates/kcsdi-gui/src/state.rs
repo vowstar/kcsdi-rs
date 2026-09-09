@@ -10,11 +10,13 @@ use kcsdi_core::commands::Format;
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::DeviceInfo;
 use kcsdi_core::model::Model;
+use kcsdi_core::source::{SourceParams, SourceReport};
 
 use crate::acquisition::{SweepDelivery, SweepPlan};
 use crate::health::{HealthSnapshot, HealthState};
 use crate::i18n::{Language, StatusMessage, Text};
 use crate::preview::PreviewMailbox;
+use crate::source_panel::{InstrumentFunction, SourcePending, SourceUi};
 use crate::workspace::Workspace;
 
 pub const DEVICE_MODEL: Model = Model::Kc901V;
@@ -25,6 +27,8 @@ pub enum WorkerCommand {
     Disconnect,
     RunWorkspace(SweepPlan),
     StopSweep,
+    StartSource(SourceParams),
+    StopSource,
     RefreshStatus,
     Shutdown,
 }
@@ -38,6 +42,7 @@ pub enum WorkerEvent {
     SweepTrace(SweepDelivery),
     SweepStopped,
     RunProgress(crate::run_settings::RunProgress),
+    SourceReport(SourceReport),
     Status(HealthSnapshot),
     StatusFailed(String),
 }
@@ -209,6 +214,8 @@ pub struct AppState {
     pub device_info: Option<DeviceInfo>,
     pub health: HealthState,
     pub workspace: Workspace,
+    pub function: InstrumentFunction,
+    pub source: SourceUi,
     pub active_plan: Option<SweepPlan>,
     pub run_progress: Option<crate::run_settings::RunProgress>,
     pub last_recording: Option<(u64, std::path::PathBuf)>,
@@ -237,6 +244,8 @@ impl Default for AppState {
             device_info: None,
             health: Default::default(),
             workspace: Default::default(),
+            function: Default::default(),
+            source: Default::default(),
             active_plan: None,
             run_progress: None,
             last_recording: None,
@@ -262,7 +271,7 @@ impl AppState {
 
     /// Replace acquisition when its conditions, members or run settings change.
     pub fn reconcile_plan(&mut self) {
-        if !self.any_running() {
+        if !self.any_running() || self.function != InstrumentFunction::Measurements {
             return;
         }
         match self.workspace.plan() {
@@ -278,8 +287,14 @@ impl AppState {
     }
 
     pub fn send(&mut self, command: WorkerCommand) {
+        if matches!(command, WorkerCommand::RunWorkspace(_)) && self.source.busy() {
+            self.status_message = Some(StatusMessage::Text(Text::SourceStopBeforeMeasure));
+            return;
+        }
         if matches!(command, WorkerCommand::RefreshStatus)
-            && (self.connection != ConnectionState::Connected || !self.health.begin())
+            && (self.connection != ConnectionState::Connected
+                || self.source.busy()
+                || !self.health.begin())
         {
             return;
         }
@@ -315,6 +330,23 @@ impl AppState {
                 self.sweep = SweepState::Running;
                 self.acquisition_cancel.clone()
             }
+            WorkerCommand::StartSource(params) => {
+                self.acquisition_cancel.cancel();
+                self.acquisition_cancel = CancellationToken::default();
+                self.active_plan = None;
+                self.sweep = SweepState::Idle;
+                self.source.pending = Some(SourcePending::Start);
+                self.source.requested = Some(*params);
+                self.source.report.warning = None;
+                self.acquisition_cancel.clone()
+            }
+            WorkerCommand::StopSource => {
+                self.acquisition_cancel.cancel();
+                self.active_plan = None;
+                self.sweep = SweepState::Idle;
+                self.source.pending = Some(SourcePending::Stop);
+                CancellationToken::default()
+            }
             WorkerCommand::StopSweep => {
                 self.acquisition_cancel.cancel();
                 self.active_plan = None;
@@ -322,12 +354,14 @@ impl AppState {
                 CancellationToken::default()
             }
             WorkerCommand::Connect { .. } => {
+                self.source.lost();
                 self.active_plan = None;
                 self.sweep = SweepState::Idle;
                 self.connection = ConnectionState::Connecting;
                 self.session_cancel.clone()
             }
             WorkerCommand::Disconnect | WorkerCommand::Shutdown => {
+                self.source.lost();
                 self.active_plan = None;
                 self.sweep = SweepState::Idle;
                 self.connection = ConnectionState::Disconnecting;
@@ -356,8 +390,36 @@ impl AppState {
         self.sweep == SweepState::Running
     }
 
+    pub fn select_function(&mut self, function: InstrumentFunction) {
+        if self.function == function {
+            return;
+        }
+        if self.connection == ConnectionState::Connected {
+            if self.source.busy() && self.source.pending != Some(SourcePending::Stop) {
+                self.send(WorkerCommand::StopSource);
+            } else if self.any_running() {
+                self.send(WorkerCommand::StopSweep);
+            }
+        }
+        self.function = function;
+        self.workspace.editor = None;
+        self.workspace.frequency_editor.cancel();
+        self.workspace.run_editor.cancel();
+    }
+
+    pub fn stop_operation(&mut self) {
+        if self.source.busy() {
+            if self.source.pending != Some(SourcePending::Stop) {
+                self.send(WorkerCommand::StopSource);
+            }
+        } else {
+            self.send(WorkerCommand::StopSweep);
+        }
+    }
+
     pub fn refresh_health_if_due(&mut self, now: Instant) {
         if self.connection == ConnectionState::Connected
+            && !self.source.busy()
             && self.sweep != SweepState::Stopping
             && self.health.due(now)
         {
@@ -371,6 +433,7 @@ impl AppState {
     }
 
     pub fn worker_stopped(&mut self) {
+        self.source.lost();
         self.session_cancel.cancel();
         self.acquisition_cancel.cancel();
         self.worker_shutdown.cancel();

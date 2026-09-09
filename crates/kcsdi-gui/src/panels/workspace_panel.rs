@@ -89,45 +89,48 @@ pub fn run_button(ui: &mut egui::Ui, state: &mut AppState) {
             egui::vec2(run_width, BUTTON_HEIGHT),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                ui.add_enabled_ui(state.connection == ConnectionState::Connected, |ui| {
-                    let size = [run_width, BUTTON_HEIGHT];
-                    if state.sweep == SweepState::Stopping {
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.add_sized(
-                                size,
-                                egui::Button::new(state.language.text(Text::Stopping)),
-                            );
-                        });
-                    } else if state.any_running() {
-                        let button = egui::Button::new(
-                            egui::RichText::new(state.language.text(Text::StopSweep)).strong(),
-                        )
-                        .fill(egui::Color32::from_rgb(0xd3, 0x2f, 0x2f));
-                        if ui.add_sized(size, button).clicked() {
-                            state.send(WorkerCommand::StopSweep);
-                        }
-                    } else {
-                        let plan = if !state.workspace.list_mode
-                            && sweep_controls::invalid_step(ui.ctx(), "workspace")
-                        {
-                            Err(kcsdi_core::Error::InvalidParameter(
-                                state.language.text(Text::InvalidStep).into(),
-                            ))
+                ui.add_enabled_ui(
+                    state.connection == ConnectionState::Connected && !state.source.busy(),
+                    |ui| {
+                        let size = [run_width, BUTTON_HEIGHT];
+                        if state.sweep == SweepState::Stopping {
+                            ui.add_enabled_ui(false, |ui| {
+                                ui.add_sized(
+                                    size,
+                                    egui::Button::new(state.language.text(Text::Stopping)),
+                                );
+                            });
+                        } else if state.any_running() {
+                            let button = egui::Button::new(
+                                egui::RichText::new(state.language.text(Text::StopSweep)).strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(0xd3, 0x2f, 0x2f));
+                            if ui.add_sized(size, button).clicked() {
+                                state.send(WorkerCommand::StopSweep);
+                            }
                         } else {
-                            state.workspace.plan()
-                        };
-                        let caption = if state.workspace.run.recording.enabled {
-                            Text::RunAndSave
-                        } else {
-                            Text::Run
-                        };
-                        if let Some(plan) =
-                            sweep_controls::run_button(ui, plan, state.language, caption)
-                        {
-                            state.send(WorkerCommand::RunWorkspace(plan));
+                            let plan = if !state.workspace.list_mode
+                                && sweep_controls::invalid_step(ui.ctx(), "workspace")
+                            {
+                                Err(kcsdi_core::Error::InvalidParameter(
+                                    state.language.text(Text::InvalidStep).into(),
+                                ))
+                            } else {
+                                state.workspace.plan()
+                            };
+                            let caption = if state.workspace.run.recording.enabled {
+                                Text::RunAndSave
+                            } else {
+                                Text::Run
+                            };
+                            if let Some(plan) =
+                                sweep_controls::run_button(ui, plan, state.language, caption)
+                            {
+                                state.send(WorkerCommand::RunWorkspace(plan));
+                            }
                         }
-                    }
-                });
+                    },
+                );
             },
         );
         if ui

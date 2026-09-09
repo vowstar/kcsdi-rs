@@ -355,9 +355,18 @@ fn show_about(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label(egui::RichText::new(language.text(Text::DeviceDetails)).strong());
         if ui
             .add_enabled(
-                state.connection == ConnectionState::Connected && !state.health.pending,
+                state.connection == ConnectionState::Connected
+                    && !state.health.pending
+                    && !state.source.busy(),
                 egui::Button::new(language.text(Text::Refresh)),
             )
+            .on_disabled_hover_text(language.text(if state.source.busy() {
+                Text::SourceStopForHealth
+            } else if state.health.pending {
+                Text::HealthUpdating
+            } else {
+                Text::DeviceInfoUnavailable
+            }))
             .clicked()
         {
             state.send(WorkerCommand::RefreshStatus);

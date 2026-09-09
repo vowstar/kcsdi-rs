@@ -56,6 +56,14 @@ pub const S12_STOP: &str = "$s12,stop\n";
 pub const SPEC_INIT: &str = "$spec,init\n";
 /// Stop and close spectrum analyzer mode.
 pub const SPEC_STOP: &str = "$spec,stop\n";
+/// Initialize the RF signal source (section 3.10).
+pub const RF_SOURCE_INIT: &str = "$rfsource,init\n";
+/// Stop and close the RF signal source.
+pub const RF_SOURCE_STOP: &str = "$rfsource,stop\n";
+/// Initialize the AF signal source (section 3.11).
+pub const AF_SOURCE_INIT: &str = "$afsource,init\n";
+/// Stop and close the AF signal source.
+pub const AF_SOURCE_STOP: &str = "$afsource,stop\n";
 
 macro_rules! wire_enum {
     ($(#[$meta:meta])* $name:ident { $( $variant:ident => $lit:literal ),+ $(,)? }) => {

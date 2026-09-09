@@ -17,7 +17,10 @@ use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64, telemet
 use crate::error::{Error, Result};
 use crate::model::{self, Capabilities, Model, Rbw};
 use crate::protocol::{Packet, PacketParser, StreamEvent, StreamMode, StreamParser};
+use crate::source::{SourceKind, SourceOutputState, SourceReport};
 use crate::transport::{GENERIC_TIMEOUT, TcpTransport, Transport, remaining_timeout};
+
+mod source_session;
 
 /// Conservative mode-control pacing, exercised on KC901V V1.6.1.
 /// This is not a documented minimum delay for every command.
@@ -150,6 +153,8 @@ pub struct Device<T: Transport> {
     active_mode: Option<StreamMode>,
     last_rbw: Option<Rbw>,
     session_failed: bool,
+    source: SourceReport,
+    source_kind: Option<SourceKind>,
 }
 
 impl Device<TcpTransport> {
@@ -198,6 +203,8 @@ impl<T: Transport> Device<T> {
             active_mode: None,
             last_rbw: None,
             session_failed: false,
+            source: SourceReport::default(),
+            source_kind: None,
         }
     }
 
@@ -208,6 +215,9 @@ impl<T: Transport> Device<T> {
     }
 
     fn record_result<U>(&mut self, result: Result<U>) -> Result<U> {
+        if result.is_err() && self.source_kind.is_some() {
+            self.source.state = SourceOutputState::Unknown;
+        }
         if matches!(
             &result,
             Err(Error::Io(_) | Error::Protocol(_) | Error::Timeout | Error::NotConnected)
@@ -344,6 +354,7 @@ impl<T: Transport> Device<T> {
     ) -> Result<SweepData> {
         cancel.check()?;
         params.validate(&self.caps)?;
+        self.check_acquisition_source()?;
         let wire_points = self.caps.wire_points(params.points)?;
         let result = (|| {
             self.prepare_mode(StreamMode::S11, cancel)?;
@@ -385,6 +396,7 @@ impl<T: Transport> Device<T> {
     ) -> Result<SweepData> {
         cancel.check()?;
         params.validate(&self.caps)?;
+        self.check_acquisition_source()?;
         let wire_points = self.caps.wire_points(params.points)?;
         let result = (|| {
             self.prepare_mode(StreamMode::S21, cancel)?;
@@ -428,6 +440,7 @@ impl<T: Transport> Device<T> {
     ) -> Result<SweepData> {
         cancel.check()?;
         params.validate(&self.caps)?;
+        self.check_acquisition_source()?;
         let wire_points = self.caps.wire_points(params.points)?;
         let result = (|| {
             self.prepare_mode(StreamMode::Spec, cancel)?;
@@ -475,6 +488,7 @@ impl<T: Transport> Device<T> {
     ) -> Result<SweepData> {
         cancel.check()?;
         params.validate(&self.caps)?;
+        self.check_acquisition_source()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
@@ -591,6 +605,7 @@ impl<T: Transport> Device<T> {
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
+        self.check_acquisition_source()?;
         if self.active_mode == Some(mode) {
             return Ok(());
         }
@@ -622,6 +637,18 @@ impl<T: Transport> Device<T> {
         self.streams = StreamParser::new();
     }
 
+    fn check_acquisition_source(&self) -> Result<()> {
+        if self.requires_reconnect() {
+            return Err(Error::NotConnected);
+        }
+        if self.source_kind.is_some() || self.source.state == SourceOutputState::Unknown {
+            return Err(Error::InvalidParameter(
+                "stop the signal source before starting an acquisition".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn cancel_sweep(&mut self, timeout: Duration) -> Result<()> {
         let started = Instant::now();
         self.reset_measurement();
@@ -650,12 +677,30 @@ impl<T: Transport> Device<T> {
     /// Exit remote mode (`$local`). Best effort; also called from `Drop`.
     pub fn close(&mut self) {
         self.session_failed = true;
+        let source_stop_needed = matches!(
+            self.source.state,
+            SourceOutputState::Requested(_) | SourceOutputState::Unknown
+        );
+        if self.source.state != SourceOutputState::NotStarted {
+            self.source.state = SourceOutputState::Unknown;
+        }
         if self.remote || self.release_on_close {
             let started = Instant::now();
-            if let Some(mode) = self.active_mode {
+            if source_stop_needed {
+                for &kind in self.source_stop_kinds() {
+                    if let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT) {
+                        let _ = self
+                            .transport
+                            .send_with_timeout(kind.stop_command().as_bytes(), remaining);
+                    }
+                }
+            }
+            if let Some(mode) = self.active_mode
+                && let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT)
+            {
                 let _ = self
                     .transport
-                    .send_with_timeout(stop_command(mode).as_bytes(), CLEANUP_TIMEOUT);
+                    .send_with_timeout(stop_command(mode).as_bytes(), remaining);
             }
             if let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT) {
                 let _ = self
@@ -664,6 +709,7 @@ impl<T: Transport> Device<T> {
             }
             self.remote = false;
             self.release_on_close = false;
+            self.source_kind = None;
             self.reset_measurement();
         }
     }
@@ -718,6 +764,10 @@ impl<T: Transport> Device<T> {
             // An interrupted query can leave a same-name reply pending.
             self.session_failed = true;
         }
+        if result.is_err() && self.source_kind.is_some() {
+            // A pending query reply cannot become a later source stop fence.
+            self.session_failed = true;
+        }
         self.record_result(result)
     }
 
@@ -737,6 +787,9 @@ impl<T: Transport> Device<T> {
         loop {
             let line = self.recv_controlled(started, timeout, cancel)?;
             let packet = self.packets.feed_line(&line)?;
+            if let Some(packet) = &packet {
+                self.note_source_packet(packet);
+            }
             remaining_timeout(started, timeout)?;
             cancel.check()?;
             if let Some(packet) = packet {
@@ -746,7 +799,10 @@ impl<T: Transport> Device<T> {
                 if packet.name == name {
                     return Ok(packet);
                 }
-                log::warn!("unexpected packet {}, waiting for {name}", packet.name);
+                if self.source_kind.is_none() && self.source.state != SourceOutputState::Unknown {
+                    // A synchronous logger must not hold source control open.
+                    log::warn!("unexpected packet {}, waiting for {name}", packet.name);
+                }
             }
         }
     }
@@ -911,6 +967,7 @@ impl<T: Transport> Drop for Device<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::{Modulation, SourceAmplitude, SourceParams, SourcePort, SourceWarning};
     use std::collections::VecDeque;
 
     struct MockTransport {
@@ -1528,7 +1585,8 @@ mod tests {
         dev.transport.send_delay = Duration::from_millis(3);
         dev.close();
         assert_eq!(dev.transport.write_timeouts.len(), 2);
-        assert_eq!(dev.transport.write_timeouts[0], CLEANUP_TIMEOUT);
+        assert!(!dev.transport.write_timeouts[0].is_zero());
+        assert!(dev.transport.write_timeouts[0] <= CLEANUP_TIMEOUT);
         assert!(dev.transport.write_timeouts[1] < CLEANUP_TIMEOUT);
         assert_eq!(dev.transport.sent_text(), "$s11,stop\n$local\n");
     }
@@ -2767,5 +2825,478 @@ mod tests {
             ref_level_dbm: -10,
         };
         assert!(matches!(dev.sweep_spec(&params), Err(Error::Device(ref n)) if n == "err_uninit"));
+    }
+
+    fn source_params(kind: SourceKind) -> SourceParams {
+        SourceParams {
+            kind,
+            port: SourcePort::Port1,
+            frequency_hz: 1_000_000,
+            amplitude: SourceAmplitude::Dbm(-10),
+            modulation: Modulation::Off,
+        }
+    }
+
+    fn active_source(mock: MockTransport, kind: SourceKind) -> Device<MockTransport> {
+        let mut dev = Device::new(mock);
+        dev.source_kind = Some(kind);
+        dev.source.state = SourceOutputState::Requested(kind);
+        dev.release_on_close = true;
+        dev
+    }
+
+    #[test]
+    fn source_start_is_fenced_and_warnings_are_not_output_acknowledgements() {
+        for kind in [SourceKind::Rf, SourceKind::Af] {
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.queue_identity();
+            mock.incoming
+                .extend(["$start,warn_gtr", "$clamped", "$end"].map(str::to_owned));
+            let mut dev = Device::new(mock);
+            let report = dev.start_source(&source_params(kind)).unwrap();
+            assert_eq!(report.state, SourceOutputState::Requested(kind));
+            assert_eq!(report.warning, Some(SourceWarning::AboveMaximum));
+            assert_eq!(dev.source_kind, Some(kind));
+            assert!(!dev.requires_reconnect());
+            assert_eq!(
+                dev.transport.sent_text(),
+                format!(
+                    "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$device\n{}$device\n{}",
+                    kind.init_command(),
+                    source_params(kind).command(),
+                )
+            );
+            assert!(
+                dev.transport
+                    .read_timeouts
+                    .iter()
+                    .all(|time| *time <= POLL_INTERVAL)
+            );
+
+            dev.transport
+                .incoming
+                .extend(["$start,warn_lt", "$clamped", "$end"].map(str::to_owned));
+            dev.transport.queue_identity();
+            let report = dev.stop_source().unwrap();
+            assert_eq!(report.state, SourceOutputState::StopSent);
+            assert_eq!(report.warning, Some(SourceWarning::BelowMinimum));
+            assert_eq!(dev.source_kind, None);
+            assert!(!dev.requires_reconnect());
+            assert!(
+                dev.transport
+                    .sent_text()
+                    .ends_with(&format!("{}$device\n", kind.stop_command()))
+            );
+        }
+    }
+
+    #[test]
+    fn source_replacement_stops_the_previous_kind_and_discards_its_warning() {
+        let mut mock = MockTransport::with_lines(&["$start,warn_gtr", "$clamped", "$end"]);
+        mock.queue_identity();
+        mock.queue_identity();
+        let mut dev = active_source(mock, SourceKind::Rf);
+        let report = dev.start_source(&source_params(SourceKind::Af)).unwrap();
+        assert_eq!(report.state, SourceOutputState::Requested(SourceKind::Af));
+        assert_eq!(report.warning, None);
+        assert_eq!(
+            dev.transport.sent_text(),
+            "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$device\n$afsource,init\n$device\n$afsource,run,off,port1,1000000,-10,0,0\n"
+        );
+    }
+
+    #[test]
+    fn source_preflight_rejections_do_not_send_or_change_the_report() {
+        let mut dev = active_source(MockTransport::with_lines(&[]), SourceKind::Rf);
+        let report = dev.source_report();
+        let mut params = source_params(SourceKind::Rf);
+        params.frequency_hz = 7_000_000_001;
+        assert!(matches!(
+            dev.start_source(&params),
+            Err(Error::InvalidParameter(_))
+        ));
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        params.frequency_hz = 1_000_000;
+        assert!(matches!(
+            dev.start_source_controlled(&params, &cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            dev.stop_source_controlled(&cancel),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(dev.source_report(), report);
+        assert_eq!(dev.transport.send_calls, 0);
+        assert!(dev.transport.read_timeouts.is_empty());
+
+        let mut dev = Device::new(MockTransport::with_lines(&[]));
+        dev.active_mode = Some(StreamMode::S11);
+        assert!(matches!(
+            dev.start_source(&params),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(matches!(dev.stop_source(), Err(Error::InvalidParameter(_))));
+        assert_eq!(dev.source_report(), SourceReport::default());
+        assert_eq!(dev.transport.send_calls, 0);
+    }
+
+    #[test]
+    fn acquisition_cannot_interrupt_or_reset_a_source_during_preflight() {
+        let mut dev = active_source(MockTransport::with_lines(&[]), SourceKind::Rf);
+        dev.packets.feed_line("$start,warn_gtr").unwrap();
+        let report = dev.source_report();
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            dev.sweep_s21(&s21_params(3)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            dev.sweep_spec(&spec_params(3)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            dev.measure_point(&point_params(StreamMode::S11)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert_eq!(dev.transport.send_calls, 0);
+        assert_eq!(dev.source_report(), report);
+        let packet = dev.packets.feed_line("$end").unwrap().unwrap();
+        assert_eq!(packet.name, "warn_gtr");
+    }
+
+    #[test]
+    fn source_cancel_after_init_or_run_cleans_up_without_resuming_output() {
+        for cancel_send in [7, 9] {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            if cancel_send == 9 {
+                mock.queue_identity();
+            }
+            mock.queue_identity();
+            mock.cancel_on_send = Some((cancel_send, cancel.clone()));
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.start_source_controlled(&source_params(SourceKind::Rf), &cancel),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+            assert_eq!(dev.source_kind, None);
+            assert!(!dev.requires_reconnect());
+            assert!(
+                dev.transport
+                    .sent_text()
+                    .ends_with("$rfsource,stop\n$device\n")
+            );
+            assert!(!dev.transport.sent_text().contains("$local"));
+            assert_eq!(
+                dev.transport.sent_text().matches(",run,").count(),
+                usize::from(cancel_send == 9)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_initial_source_normalization_does_not_initialize_output() {
+        for cancel_send in 1..=5 {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.cancel_on_send = Some((cancel_send, cancel.clone()));
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.start_source_controlled(&source_params(SourceKind::Rf), &cancel),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+            assert!(!dev.requires_reconnect());
+            assert!(
+                dev.transport
+                    .sent_text()
+                    .ends_with("$rfsource,stop\n$afsource,stop\n$device\n")
+            );
+            assert!(!dev.transport.sent_text().contains(",init"));
+            assert!(!dev.transport.sent_text().contains(",run,"));
+        }
+    }
+
+    #[test]
+    fn uncertain_source_requires_explicit_stop_before_acquiring_again() {
+        let cancel = CancellationToken::default();
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_identity();
+        mock.queue_identity();
+        mock.queue_identity();
+        mock.cancel_on_send = Some((9, cancel.clone()));
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.start_source_controlled(&source_params(SourceKind::Rf), &cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(!dev.requires_reconnect());
+        assert_eq!(dev.source_kind, None);
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        let sends = dev.transport.send_calls;
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert_eq!(dev.transport.send_calls, sends);
+        dev.transport.queue_identity();
+        assert_eq!(
+            dev.stop_source().unwrap().state,
+            SourceOutputState::StopSent
+        );
+        dev.transport.queue_sweep(StreamMode::S11, 3);
+        assert_eq!(dev.sweep_s11(&s11_params(3)).unwrap().points.len(), 3);
+        assert_eq!(dev.source_report().state, SourceOutputState::StopSent);
+    }
+
+    #[test]
+    fn cancelled_source_stop_keeps_unknown_and_never_reuses_its_identity() {
+        for cancel_send in [1, 2] {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.cancel_on_send = Some((cancel_send, cancel.clone()));
+            let mut dev = active_source(mock, SourceKind::Rf);
+            assert!(matches!(
+                dev.stop_source_controlled(&cancel),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+            assert_eq!(dev.transport.sent_text().matches("$device\n").count(), 1);
+            assert_eq!(dev.requires_reconnect(), cancel_send == 2);
+            assert_eq!(dev.transport.incoming.is_empty(), cancel_send == 1);
+        }
+    }
+
+    #[test]
+    fn missing_source_stop_fence_retires_the_connection() {
+        let mut dev = active_source(MockTransport::with_lines(&[]), SourceKind::Rf);
+        assert!(matches!(dev.stop_source(), Err(Error::Timeout)));
+        assert!(dev.requires_reconnect());
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        assert_eq!(
+            dev.transport.sent_text(),
+            "$rfsource,stop\n$device\n$rfsource,stop\n$local\n"
+        );
+        assert!(
+            dev.transport
+                .read_timeouts
+                .iter()
+                .all(|time| *time <= POLL_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn cancelled_source_identity_fences_never_reuse_a_late_identity() {
+        for cancel_send in [6, 8] {
+            let cancel = CancellationToken::default();
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_identity();
+            mock.queue_identity();
+            mock.cancel_on_send = Some((cancel_send, cancel.clone()));
+            let mut dev = Device::new(mock);
+            assert!(matches!(
+                dev.start_source_controlled(&source_params(SourceKind::Rf), &cancel),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+            assert!(dev.requires_reconnect());
+            let sent = dev.transport.sent_text();
+            assert_eq!(
+                sent.matches("$device\n").count(),
+                if cancel_send == 6 { 1 } else { 2 }
+            );
+            assert!(sent.ends_with("$local\n"));
+            assert!(!sent.contains(",run,"));
+            assert!(!dev.transport.incoming.is_empty());
+            let sends = dev.transport.send_calls;
+            assert!(matches!(dev.device_info(), Err(Error::NotConnected)));
+            assert!(matches!(
+                dev.start_source(&source_params(SourceKind::Af)),
+                Err(Error::NotConnected)
+            ));
+            assert_eq!(dev.transport.send_calls, sends);
+        }
+    }
+
+    #[test]
+    fn source_stop_rejects_malformed_or_error_fences_and_keeps_unknown() {
+        for lines in [
+            vec!["$start,device", "$invalid", "$end"],
+            vec!["$start,err_RfStop", "$stop failed", "$end"],
+        ] {
+            let mut mock = MockTransport::with_lines(&lines);
+            // This later packet must not become a second cleanup query's reply.
+            mock.queue_identity();
+            let mut dev = active_source(mock, SourceKind::Rf);
+            assert!(dev.stop_source().is_err());
+            assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+            assert!(dev.requires_reconnect());
+            assert_eq!(
+                dev.transport.sent_text(),
+                "$rfsource,stop\n$device\n$rfsource,stop\n$local\n"
+            );
+            assert!(!dev.transport.incoming.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_run_write_failure_closes_without_claiming_stopped() {
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_identity();
+        mock.queue_identity();
+        mock.fail_send = Some(9);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.start_source(&source_params(SourceKind::Rf)),
+            Err(Error::NotConnected)
+        ));
+        assert!(dev.requires_reconnect());
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        assert!(
+            dev.transport
+                .sent_text()
+                .ends_with("$rfsource,stop\n$local\n")
+        );
+        assert_eq!(dev.transport.sent_text().matches("$device\n").count(), 2);
+    }
+
+    #[test]
+    fn source_error_preserves_the_original_error_when_cleanup_also_fails() {
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_identity();
+        mock.queue_identity();
+        mock.incoming.extend(
+            [
+                "$start,err_par4",
+                "$invalid amplitude",
+                "$end",
+                "$start,err_RfStop",
+                "$stop failed",
+                "$end",
+            ]
+            .map(str::to_owned),
+        );
+        let mut dev = Device::new(mock);
+        assert!(
+            matches!(dev.start_source(&source_params(SourceKind::Rf)), Err(Error::Device(name)) if name == "err_par4")
+        );
+        assert!(dev.requires_reconnect());
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        assert!(
+            dev.transport
+                .sent_text()
+                .ends_with("$rfsource,stop\n$device\n$rfsource,stop\n$local\n")
+        );
+    }
+
+    #[test]
+    fn source_polls_preserve_partial_warnings_and_late_errors() {
+        let mut dev = active_source(
+            MockTransport::with_lines(&["$start,warn_gtr"]),
+            SourceKind::Rf,
+        );
+        let cancel = CancellationToken::default();
+        assert_eq!(dev.poll_source_controlled(&cancel).unwrap().warning, None);
+        dev.transport
+            .incoming
+            .extend(["$clamped", "$end"].map(str::to_owned));
+        assert_eq!(
+            dev.poll_source_controlled(&cancel).unwrap().warning,
+            Some(SourceWarning::AboveMaximum)
+        );
+        dev.transport
+            .incoming
+            .extend(["$start,err_par4", "$late rejection", "$end"].map(str::to_owned));
+        assert!(
+            matches!(dev.poll_source_controlled(&cancel), Err(Error::Device(name)) if name == "err_par4")
+        );
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        assert_eq!(
+            dev.source_report().warning,
+            Some(SourceWarning::AboveMaximum)
+        );
+        assert_eq!(dev.source_kind, Some(SourceKind::Rf));
+        assert_eq!(dev.transport.send_calls, 0);
+        assert!(
+            dev.transport
+                .read_timeouts
+                .iter()
+                .all(|time| *time <= POLL_INTERVAL)
+        );
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert_eq!(dev.transport.send_calls, 0);
+    }
+
+    #[test]
+    fn inactive_source_poll_performs_no_io() {
+        let mut dev = Device::new(MockTransport::with_lines(&["$start,warn_gtr", "$end"]));
+        assert_eq!(
+            dev.poll_source_controlled(&CancellationToken::default())
+                .unwrap(),
+            SourceReport::default()
+        );
+        assert!(dev.transport.read_timeouts.is_empty());
+        assert_eq!(dev.transport.send_calls, 0);
+    }
+
+    #[test]
+    fn queries_preserve_source_warnings_and_retire_uncertain_replies() {
+        let mut dev = active_source(
+            MockTransport::with_lines(&[
+                "$start,warn_lt",
+                "$clamped",
+                "$end",
+                "$start,temp",
+                "$42",
+                "$end",
+            ]),
+            SourceKind::Rf,
+        );
+        assert_eq!(dev.temperature().unwrap(), 42.0);
+        assert_eq!(
+            dev.source_report().warning,
+            Some(SourceWarning::BelowMinimum)
+        );
+        assert_eq!(
+            dev.source_report().state,
+            SourceOutputState::Requested(SourceKind::Rf)
+        );
+        dev.transport
+            .incoming
+            .extend(["$start,err_par1", "$query rejected", "$end"].map(str::to_owned));
+        dev.transport.queue_identity();
+        assert!(matches!(dev.device_info(), Err(Error::Device(name)) if name == "err_par1"));
+        assert!(dev.requires_reconnect());
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        let sends = dev.transport.send_calls;
+        assert!(matches!(dev.stop_source(), Err(Error::NotConnected)));
+        assert_eq!(dev.transport.send_calls, sends);
+    }
+
+    #[test]
+    fn closing_a_source_stops_before_local_with_one_total_budget() {
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.send_delay = Duration::from_millis(10);
+        let mut dev = active_source(mock, SourceKind::Af);
+        dev.close();
+        assert_eq!(dev.transport.sent_text(), "$afsource,stop\n$local\n");
+        assert_eq!(dev.source_report().state, SourceOutputState::Unknown);
+        assert!(dev.requires_reconnect());
+        assert!(dev.transport.write_timeouts[1] < dev.transport.write_timeouts[0]);
+        let sends = dev.transport.send_calls;
+        dev.close();
+        assert_eq!(dev.transport.send_calls, sends);
     }
 }
