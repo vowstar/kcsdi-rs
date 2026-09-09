@@ -321,41 +321,73 @@ pub(super) fn scale_fields(
     };
     let mut divisions = view.y_divisions;
     let mut per_division = (view.y_max - view.y_min) / divisions.max(1) as f64;
+    let seconds = unit == "s";
+    let drag_step = if seconds {
+        (per_division.abs() * 0.02).max(1e-15)
+    } else {
+        0.1
+    };
     let mut changed = false;
-    ui.columns(3, |columns| {
-        for column in columns.iter_mut() {
-            column.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-        }
-        let width = columns[0].available_width();
-        let reference_help = if unit.is_empty() {
-            language.text(Text::Reference).to_string()
-        } else {
-            format!("{} ({unit})", language.text(Text::Reference))
-        };
-        field_label(&mut columns[0], language.text(Text::Reference)).on_hover_text(reference_help);
-        changed |= columns[0]
-            .add_sized(
-                [width, 36.0],
-                egui::DragValue::new(&mut reference).speed(1.0),
-            )
-            .changed();
-        field_label(&mut columns[1], language.text(Text::Divisions));
-        changed |= columns[1]
-            .add_sized(
-                [width, 36.0],
-                egui::DragValue::new(&mut divisions).range(2..=30),
-            )
-            .changed();
-        field_label(&mut columns[2], language.text(Text::PerDivision));
-        changed |= columns[2]
-            .add_sized(
-                [width, 36.0],
-                egui::DragValue::new(&mut per_division)
-                    .range(0.000_001..=1e12)
-                    .speed(0.1),
-            )
-            .changed();
-    });
+    let label_width = [Text::Reference, Text::Divisions, Text::PerDivision]
+        .into_iter()
+        .map(|key| {
+            ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        language.text(key).to_owned(),
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    )
+                    .size()
+                    .x
+            })
+        })
+        .fold(0.0_f32, f32::max);
+    let width = (ui.available_width() - label_width - ui.spacing().item_spacing.x).max(40.0);
+    egui::Grid::new("scale_fields")
+        .num_columns(2)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            let reference_help = if unit.is_empty() {
+                language.text(Text::Reference).to_string()
+            } else {
+                format!("{} ({unit})", language.text(Text::Reference))
+            };
+            field_label(ui, language.text(Text::Reference)).on_hover_text(reference_help);
+            let mut reference_edit =
+                egui::DragValue::new(&mut reference).speed(if seconds { drag_step } else { 1.0 });
+            if seconds {
+                reference_edit = reference_edit.custom_formatter(|value, _| format!("{value:.3e}"));
+            }
+            changed |= ui.add_sized([width, 36.0], reference_edit).changed();
+            ui.end_row();
+            field_label(ui, language.text(Text::Divisions));
+            changed |= ui
+                .add_sized(
+                    [width, 36.0],
+                    egui::DragValue::new(&mut divisions).range(2..=30),
+                )
+                .changed();
+            ui.end_row();
+            field_label(ui, language.text(Text::PerDivision)).on_hover_text(if unit.is_empty() {
+                language.text(Text::PerDivision).to_owned()
+            } else {
+                format!("{} ({unit})", language.text(Text::PerDivision))
+            });
+            let mut division_edit = egui::DragValue::new(&mut per_division)
+                .range(if seconds {
+                    1e-15..=1e3
+                } else {
+                    0.000_001..=1e12
+                })
+                .clamp_existing_to_range(false)
+                .speed(drag_step);
+            if seconds {
+                division_edit = division_edit.custom_formatter(|value, _| format!("{value:.3e}"));
+            }
+            changed |= ui.add_sized([width, 36.0], division_edit).changed();
+            ui.end_row();
+        });
     let span = divisions as f64 * per_division;
     if changed && reference.is_finite() && span.is_finite() && span > 0.0 {
         view.y_max = if top_reference {
@@ -414,6 +446,82 @@ pub(super) fn group_heading(ui: &mut egui::Ui, text: &str) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delay_scale_fields_preserve_and_accept_nanosecond_divisions() {
+        let ctx = egui::Context::default();
+        let mut view = PlotView::new(1e6, 2e6, -4e-9, 4e-9);
+        let original = view;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 220.0));
+        let mut frame = |time, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    scale_fields(ui, &mut view, Language::English, "s", false);
+                },
+            )
+        };
+        frame(0.0, Vec::new()).drop_without_applying_deltas();
+        let output = frame(0.02, Vec::new());
+        let target = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "1.000e-9" => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .expect("nanosecond division must remain visible");
+        output.drop_without_applying_deltas();
+        frame(0.04, vec![egui::Event::PointerMoved(target)]).drop_without_applying_deltas();
+        for (index, pressed) in [true, false, true, false].into_iter().enumerate() {
+            frame(
+                0.06 + index as f64 * 0.02,
+                vec![egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            )
+            .drop_without_applying_deltas();
+        }
+        let command = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        frame(
+            0.16,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                },
+                egui::Event::Text("2.5e-10".into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert_eq!((view.x_min, view.x_max), (original.x_min, original.x_max));
+        assert_eq!(view.y_divisions, 8);
+        assert!((view.y_max - view.y_min - 2e-9).abs() < 1e-20, "{view:?}");
+    }
 
     #[test]
     fn explicit_range_edits_replace_x_zoom_and_preserve_manual_y_scale() {
@@ -639,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn scale_headings_stay_on_one_line_with_aligned_fields() {
+    fn scale_fields_keep_three_aligned_label_value_rows() {
         for language in Language::ALL {
             for (unit, top_reference) in [("dBm", true), ("ohm", false)] {
                 let ctx = egui::Context::default();
@@ -664,26 +772,44 @@ mod tests {
                 );
                 let labels = [Text::Reference, Text::Divisions, Text::PerDivision]
                     .map(|key| language.text(key));
-                let mut label_count = 0;
-                let mut field_tops = Vec::new();
-                for shape in &output.shapes {
+                let shapes = output.shapes.clone();
+                output.drop_without_applying_deltas();
+                let mut label_rects = Vec::new();
+                let mut field_rects = Vec::new();
+                for shape in &shapes {
                     if let egui::Shape::Text(text) = &shape.shape {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
                         if labels.contains(&text.galley.text()) {
                             assert_eq!(text.galley.rows.len(), 1);
-                            label_count += 1;
+                            label_rects.push(rect);
                         }
                         if text.galley.text().parse::<f64>().is_ok() {
-                            field_tops.push(text.pos.y);
+                            field_rects.push(rect);
                         }
                     }
                 }
-                assert_eq!(label_count, 3);
-                assert_eq!(field_tops.len(), 3);
+                assert_eq!(label_rects.len(), 3);
+                assert_eq!(field_rects.len(), 3);
+                for (label, value) in label_rects.iter().zip(&field_rects) {
+                    assert!(label.right() < value.left());
+                    assert!(label.top() < value.bottom() && value.top() < label.bottom());
+                    assert!(label.left() >= 1024.0 && value.right() <= 1280.0);
+                }
                 assert!(
-                    field_tops.iter().all(|y| (*y - field_tops[0]).abs() < 0.1),
-                    "{language:?}: {field_tops:?}"
+                    field_rects
+                        .windows(2)
+                        .all(|rows| rows[0].bottom() < rows[1].top())
                 );
-                output.drop_without_applying_deltas();
+                assert!(
+                    field_rects
+                        .iter()
+                        .all(|rect| (rect.center().x - field_rects[0].center().x).abs() <= 1.0)
+                );
+                assert!(
+                    label_rects
+                        .iter()
+                        .all(|rect| (rect.left() - label_rects[0].left()).abs() <= 0.1)
+                );
             }
         }
     }

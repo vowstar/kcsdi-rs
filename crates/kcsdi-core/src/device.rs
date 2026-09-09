@@ -29,8 +29,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 fn stop_command(mode: StreamMode) -> &'static str {
     match mode {
         StreamMode::S11 => commands::S11_STOP,
+        StreamMode::S21 => commands::S21_STOP,
         StreamMode::Spec => commands::SPEC_STOP,
-        _ => unreachable!("only S11 and SPEC sessions are implemented"),
+        _ => unreachable!("only S11, S21 and SPEC sessions are implemented"),
     }
 }
 
@@ -56,6 +57,21 @@ pub struct S11Params {
     /// When set, `$bw,<rbw>` is pushed before the run and the RBW factor is
     /// used for the sweep timeout. Otherwise the last selected bandwidth
     /// is used, or the slowest model bandwidth when it is unknown.
+    pub rbw: Option<Rbw>,
+}
+
+/// Parameters of an S21 transmission sweep (section 3.5).
+/// Delay values are returned in seconds, without display-unit conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S21Params {
+    pub cal: Cal,
+    pub format: Format,
+    pub lo: Lo,
+    /// Returned samples including both endpoints, not the wire count.
+    pub points: u32,
+    pub start_hz: u64,
+    pub stop_hz: u64,
+    /// Explicit bandwidth, or reuse the last selected bandwidth as in S11.
     pub rbw: Option<Rbw>,
 }
 
@@ -311,6 +327,48 @@ impl<T: Transport> Device<T> {
         self.finish_sweep(result)
     }
 
+    /// Run a finite S21 sweep using the source-based model limits (section 7.3).
+    pub fn sweep_s21(&mut self, params: &S21Params) -> Result<SweepData> {
+        self.sweep_s21_controlled(params, &CancellationToken::default(), |_| {})
+    }
+
+    /// Collect a complete transmission sweep with cancellation and prefixes.
+    pub fn sweep_s21_controlled(
+        &mut self,
+        params: &S21Params,
+        cancel: &CancellationToken,
+        progress: impl FnMut(SweepProgress<'_>),
+    ) -> Result<SweepData> {
+        cancel.check()?;
+        params.validate(&self.caps)?;
+        let wire_points = self.caps.wire_points(params.points)?;
+        let result = (|| {
+            self.prepare_mode(StreamMode::S21, cancel)?;
+            if let Some(rbw) = params.rbw {
+                self.set_rbw(rbw, cancel)?;
+            }
+            let run = commands::s21_run(
+                params.cal,
+                params.format,
+                params.lo,
+                wire_points,
+                ScanMode::StartStop,
+                params.start_hz,
+                Some(params.stop_hz),
+            );
+            self.send_controlled(run.as_bytes(), cancel)?;
+            self.collect_controlled(
+                StreamMode::S21,
+                Some(params.format),
+                params.points,
+                self.sweep_timeout(params.points),
+                cancel,
+                progress,
+            )
+        })();
+        self.finish_sweep(result)
+    }
+
     /// Run a spectrum sweep: `stop` -> `init` -> `$bw` -> `$specref` ->
     /// `run`, then consume the data stream until `$end`.
     pub fn sweep_spec(&mut self, params: &SpecParams) -> Result<SweepData> {
@@ -393,7 +451,7 @@ impl<T: Transport> Device<T> {
     }
 
     /// Stop the initialized measurement mode. This also permits switching
-    /// modes without err_S11Stop/err_SpecStop (section 12).
+    /// modes without a mode-conflict error (sections 3.4, 3.5, 3.8 and 12).
     pub fn stop_sweep(&mut self) -> Result<()> {
         if let Some(mode) = self.active_mode {
             let result = self.transport.send(stop_command(mode).as_bytes());
@@ -416,15 +474,16 @@ impl<T: Transport> Device<T> {
             self.stop_sweep()?;
         } else {
             // Front-panel or previous-session mode state is unknown.
-            for command in [commands::S11_STOP, commands::SPEC_STOP] {
+            for command in [commands::S11_STOP, commands::S21_STOP, commands::SPEC_STOP] {
                 self.send_controlled(command.as_bytes(), cancel)?;
                 cancel.pause(COMMAND_GAP)?;
             }
         }
         let init = match mode {
             StreamMode::S11 => commands::S11_INIT,
+            StreamMode::S21 => commands::S21_INIT,
             StreamMode::Spec => commands::SPEC_INIT,
-            _ => unreachable!("only S11 and SPEC sessions are implemented"),
+            _ => unreachable!("only S11, S21 and SPEC sessions are implemented"),
         };
         self.send_controlled(init.as_bytes(), cancel)?;
         self.active_mode = Some(mode);
@@ -766,6 +825,7 @@ mod tests {
         fn queue_sweep(&mut self, mode: StreamMode, samples: u32) {
             self.incoming.push_back(match mode {
                 StreamMode::S11 => "$start,s11,loss".into(),
+                StreamMode::S21 => "$start,s21,loss".into(),
                 StreamMode::Spec => "$start,spec".into(),
                 _ => unreachable!("only implemented sweep modes are tested"),
             });
@@ -813,6 +873,18 @@ mod tests {
             stop_hz: 2_000_000,
             rbw: Rbw::R10k,
             ref_level_dbm: -10,
+        }
+    }
+
+    fn s21_params(points: u32) -> S21Params {
+        S21Params {
+            cal: Cal::CalOff,
+            format: Format::Loss,
+            lo: Lo::HighLo,
+            points,
+            start_hz: 1_000_000,
+            stop_hz: 2_000_000,
+            rbw: None,
         }
     }
 
@@ -886,6 +958,10 @@ mod tests {
             dev.sweep_spec_controlled(&spec_params(3), &cancel, |_| panic!("no preview expected")),
             Err(Error::Cancelled)
         ));
+        assert!(matches!(
+            dev.sweep_s21_controlled(&s21_params(3), &cancel, |_| panic!("no preview expected")),
+            Err(Error::Cancelled)
+        ));
         assert!(dev.transport.sent.is_empty());
         assert!(dev.transport.read_timeouts.is_empty());
         assert!(!dev.requires_reconnect());
@@ -893,7 +969,7 @@ mod tests {
 
     #[test]
     fn cancelled_sweeps_discard_tails_and_require_a_fresh_identity_boundary() {
-        for mode in [StreamMode::S11, StreamMode::Spec] {
+        for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
             for cancel_after in [1, 3] {
                 let mut mock = MockTransport::with_lines(&[]);
                 mock.queue_sweep(mode, 3);
@@ -912,6 +988,7 @@ mod tests {
                 };
                 let result = match mode {
                     StreamMode::S11 => dev.sweep_s11_controlled(&s11_params(3), &cancel, progress),
+                    StreamMode::S21 => dev.sweep_s21_controlled(&s21_params(3), &cancel, progress),
                     StreamMode::Spec => {
                         dev.sweep_spec_controlled(&spec_params(3), &cancel, progress)
                     }
@@ -925,6 +1002,7 @@ mod tests {
                 assert!(!dev.requires_reconnect());
                 let data = match mode {
                     StreamMode::S11 => dev.sweep_s11(&s11_params(3)),
+                    StreamMode::S21 => dev.sweep_s21(&s21_params(3)),
                     StreamMode::Spec => dev.sweep_spec(&spec_params(3)),
                     _ => unreachable!(),
                 }
@@ -936,7 +1014,7 @@ mod tests {
 
     #[test]
     fn cancellation_during_setup_does_not_start_a_sweep() {
-        for send in 1..=3 {
+        for send in 1..=4 {
             let cancel = CancellationToken::default();
             let mut mock = MockTransport::with_lines(&[]);
             mock.cancel_on_send = Some((send, cancel.clone()));
@@ -1480,7 +1558,7 @@ mod tests {
         assert_eq!(data.points[0].values, vec![0.528, -0.269]);
         assert_eq!(
             dev.transport.sent_text(),
-            "$s11,stop\n$spec,stop\n$s11,init\n$s11,run,caloff,ri,2,ss,75000000,125000000\n"
+            "$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n$s11,run,caloff,ri,2,ss,75000000,125000000\n"
         );
     }
 
@@ -1525,7 +1603,255 @@ mod tests {
         assert_eq!(data.points[2].values, vec![-71.002]);
         assert_eq!(
             dev.transport.sent_text(),
-            "$s11,stop\n$spec,stop\n$spec,init\n$bw,10k\n$specref,-10\n$spec,run,caloff,highlo,2,ss,75000000,100000000\n"
+            "$s11,stop\n$s21,stop\n$spec,stop\n$spec,init\n$bw,10k\n$specref,-10\n$spec,run,caloff,highlo,2,ss,75000000,100000000\n"
+        );
+    }
+
+    #[test]
+    fn s21_formats_keep_raw_columns_units_and_exact_commands() {
+        for (format, row, values) in [
+            (Format::Ri, "-0.5,0.25", vec![-0.5, 0.25]),
+            (Format::Ma, "0.75,-90", vec![0.75, -90.0]),
+            (Format::Loss, "-3.25", vec![-3.25]),
+            (Format::Delay, "-5.147039e-09", vec![-5.147039e-9]),
+        ] {
+            for lo in [Lo::HighLo, Lo::LowLo] {
+                let header = format!("$start,s21,{format}");
+                let rows = [
+                    format!("$0,{row}"),
+                    format!("$500,{row}"),
+                    format!("$1000,{row}"),
+                ];
+                let mock =
+                    MockTransport::with_lines(&[&header, &rows[0], &rows[1], &rows[2], "$end"]);
+                let mut dev = Device::new(mock);
+                let params = S21Params {
+                    format,
+                    lo,
+                    start_hz: 0,
+                    stop_hz: 1000,
+                    rbw: Some(Rbw::R1k),
+                    ..s21_params(3)
+                };
+                let mut prefixes = Vec::new();
+                let data = dev
+                    .sweep_s21_controlled(&params, &CancellationToken::default(), |prefix| {
+                        assert_eq!(prefix.mode, StreamMode::S21);
+                        assert_eq!(prefix.format, format.as_str());
+                        prefixes.push(prefix.points.len());
+                    })
+                    .unwrap();
+                assert_eq!(prefixes, [0, 1, 2, 3]);
+                assert_eq!(data.mode, StreamMode::S21);
+                assert_eq!(data.format, format.as_str());
+                assert_eq!(data.points[0].freq_hz, 0.0);
+                assert!(data.points.iter().all(|point| point.values == values));
+                assert_eq!(
+                    dev.transport.sent_text(),
+                    format!(
+                        "$s11,stop\n$s21,stop\n$spec,stop\n$s21,init\n$bw,1k\n$s21,run,caloff,{format},{lo},2,ss,0,1000\n"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn s21_schema_mismatch_cannot_be_reused_as_a_later_sweep() {
+        for (format, header, row, count) in [
+            (Format::Ri, "$start,s21,ri", "0.5", 3),
+            (Format::Ma, "$start,s21,ma", "0.5,1,2", 3),
+            (Format::Delay, "$start,s21,delay", "1e-9,2e-9", 3),
+            (Format::Loss, "$start,s21,loss", "1", 2),
+            (Format::Loss, "$start,s21,loss", "1", 4),
+            (Format::Loss, "$start,s11,loss", "1", 3),
+            (Format::Loss, "$start,s21,delay", "1", 3),
+            (Format::Loss, "$start,s21,loss,extra", "1", 3),
+        ] {
+            let mut mock = MockTransport::with_lines(&[header]);
+            for index in 0..count {
+                mock.incoming
+                    .push_back(format!("${},{row}", 1_000_000 + index * 1000));
+            }
+            mock.incoming.push_back("$end".into());
+            mock.queue_sweep(StreamMode::S21, 3);
+            let mut dev = Device::new(mock);
+            let params = S21Params {
+                format,
+                ..s21_params(3)
+            };
+            assert!(
+                matches!(dev.sweep_s21(&params), Err(Error::Protocol(_))),
+                "{header} {row} {count}"
+            );
+            assert!(dev.requires_reconnect());
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(dev.sweep_s21(&params), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent, sent);
+        }
+    }
+
+    #[test]
+    fn invalid_s21_requests_do_not_change_an_initialized_mode() {
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_sweep(StreamMode::S11, 3);
+        let mut dev = Device::new(mock);
+        dev.sweep_s11(&s11_params(3)).unwrap();
+        let sent = dev.transport.sent.clone();
+        for params in [
+            S21Params {
+                start_hz: 2_000_000,
+                ..s21_params(3)
+            },
+            S21Params {
+                stop_hz: 7_000_000_001,
+                ..s21_params(3)
+            },
+            S21Params {
+                cal: Cal::CalOn,
+                ..s21_params(3)
+            },
+            S21Params {
+                format: Format::Z,
+                ..s21_params(3)
+            },
+            S21Params {
+                format: Format::Vswr,
+                ..s21_params(3)
+            },
+            S21Params {
+                rbw: Some(Rbw::R100Hz),
+                ..s21_params(3)
+            },
+            s21_params(2),
+            s21_params(1002),
+        ] {
+            assert!(matches!(
+                dev.sweep_s21(&params),
+                Err(Error::InvalidParameter(_))
+            ));
+            assert_eq!(dev.transport.sent, sent);
+            assert_eq!(dev.active_mode, Some(StreamMode::S11));
+            assert!(!dev.requires_reconnect());
+        }
+    }
+
+    #[test]
+    fn s21_repeats_switches_bandwidth_and_sample_count_conversion() {
+        for (samples, wire) in [(3, 2), (201, 200), (1001, 1000)] {
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.queue_sweep(StreamMode::S11, 3);
+            mock.queue_sweep(StreamMode::S21, samples);
+            mock.queue_sweep(StreamMode::S21, samples);
+            mock.queue_sweep(StreamMode::Spec, 3);
+            let mut dev = Device::new(mock);
+            dev.sweep_s11(&S11Params {
+                rbw: Some(Rbw::R1k),
+                ..s11_params(3)
+            })
+            .unwrap();
+            let before_s21 = dev.transport.sent.len();
+            dev.sweep_s21(&s21_params(samples)).unwrap();
+            assert_eq!(
+                &dev.transport.sent_text()[before_s21..],
+                format!(
+                    "$s11,stop\n$s21,init\n$s21,run,caloff,loss,highlo,{wire},ss,1000000,2000000\n"
+                )
+            );
+            assert_eq!(dev.last_rbw, Some(Rbw::R1k));
+            assert_eq!(
+                dev.sweep_timeout(samples),
+                model::sweep_timeout(Some(Rbw::R1k), samples)
+            );
+            let before_repeat = dev.transport.sent.len();
+            assert_eq!(
+                dev.sweep_s21(&s21_params(samples)).unwrap().points.len(),
+                samples as usize
+            );
+            assert_eq!(
+                &dev.transport.sent_text()[before_repeat..],
+                format!("$s21,run,caloff,loss,highlo,{wire},ss,1000000,2000000\n")
+            );
+            let before_spec = dev.transport.sent.len();
+            dev.sweep_spec(&spec_params(3)).unwrap();
+            assert!(dev.transport.sent[before_spec..].starts_with(b"$s21,stop\n$spec,init\n"));
+        }
+    }
+
+    #[test]
+    fn s21_setup_and_run_write_failure_retires_the_session() {
+        for failed_send in 1..=6 {
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.fail_send = Some(failed_send);
+            let mut dev = Device::new(mock);
+            let params = S21Params {
+                rbw: Some(Rbw::R1k),
+                ..s21_params(3)
+            };
+            assert!(matches!(dev.sweep_s21(&params), Err(Error::NotConnected)));
+            assert!(dev.requires_reconnect());
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(dev.sweep_s21(&params), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent, sent);
+        }
+    }
+
+    #[test]
+    fn s21_restart_preserves_reported_rounding_and_raw_measurement_values() {
+        // Synthetic edge values exercise the shared parser's preservation
+        // policy. They are not a claim about S21 firmware sentinel values.
+        let mock = MockTransport::with_lines(&[
+            "$start,s21,delay",
+            "$6999999000,999",
+            "$start,s21,delay",
+            "$6999999000,NaN",
+            "$6999999000,inf",
+            "$7000000200,-5e-9",
+            "$end",
+        ]);
+        let mut dev = Device::new(mock);
+        let params = S21Params {
+            format: Format::Delay,
+            start_hz: 6_999_999_000,
+            stop_hz: 7_000_000_000,
+            ..s21_params(3)
+        };
+        let mut prefixes = Vec::new();
+        let data = dev
+            .sweep_s21_controlled(&params, &CancellationToken::default(), |prefix| {
+                prefixes.push(prefix.points.len());
+            })
+            .unwrap();
+        assert_eq!(prefixes, [0, 1, 0, 1, 2, 3]);
+        assert_eq!(data.points[0].freq_hz, data.points[1].freq_hz);
+        assert_eq!(data.points[2].freq_hz, 7_000_000_200.0);
+        assert!(data.points[0].values[0].is_nan());
+        assert_eq!(data.points[1].values, [f64::INFINITY]);
+        assert_eq!(data.points[2].values, [-5e-9]);
+    }
+
+    #[test]
+    fn a_framed_s21_device_error_is_diagnosable_and_allows_reinitialization() {
+        let mut mock = MockTransport::with_lines(&[
+            "$start,s21,loss",
+            "$1000000,-10",
+            "$start,err_uninit",
+            "$invalid mode state",
+            "$end",
+        ]);
+        mock.queue_sweep(StreamMode::S21, 3);
+        let mut dev = Device::new(mock);
+        assert!(
+            matches!(dev.sweep_s21(&s21_params(3)), Err(Error::Device(name)) if name == "err_uninit")
+        );
+        assert!(!dev.requires_reconnect());
+        assert!(dev.active_mode.is_none());
+        let before_retry = dev.transport.sent.len();
+        let data = dev.sweep_s21(&s21_params(3)).unwrap();
+        assert_eq!(data.points.len(), 3);
+        assert!(
+            dev.transport.sent[before_retry..]
+                .starts_with(b"$s11,stop\n$s21,stop\n$spec,stop\n$s21,init\n")
         );
     }
 
@@ -1703,7 +2029,7 @@ mod tests {
         assert_eq!(
             dev.transport.sent_text(),
             concat!(
-                "$s11,stop\n$spec,stop\n$s11,init\n",
+                "$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n",
                 "$s11,run,caloff,loss,2,ss,1000000,2000000\n",
                 "$s11,stop\n$spec,init\n$bw,10k\n$specref,-10\n",
                 "$spec,run,caloff,highlo,2,ss,1000000,2000000\n",
@@ -1715,13 +2041,14 @@ mod tests {
 
     #[test]
     fn repeated_sweeps_reuse_the_initialized_mode() {
-        for mode in [StreamMode::S11, StreamMode::Spec] {
+        for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
             let mut mock = MockTransport::with_lines(&[]);
             mock.queue_sweep(mode, 3);
             mock.queue_sweep(mode, 3);
             let mut dev = Device::new(mock);
             let run = |dev: &mut Device<MockTransport>| match mode {
                 StreamMode::S11 => dev.sweep_s11(&s11_params(3)),
+                StreamMode::S21 => dev.sweep_s21(&s21_params(3)),
                 StreamMode::Spec => dev.sweep_spec(&spec_params(3)),
                 _ => unreachable!(),
             };
@@ -1769,13 +2096,14 @@ mod tests {
 
     #[test]
     fn close_stops_active_mode_before_returning_local() {
-        for mode in [StreamMode::S11, StreamMode::Spec] {
+        for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
             let mut mock = MockTransport::with_lines(&["[KC901]002015123456"]);
             mock.queue_sweep(mode, 3);
             let mut dev = Device::new(mock);
             dev.handshake().unwrap();
             match mode {
                 StreamMode::S11 => dev.sweep_s11(&s11_params(3)).unwrap(),
+                StreamMode::S21 => dev.sweep_s21(&s21_params(3)).unwrap(),
                 StreamMode::Spec => dev.sweep_spec(&spec_params(3)).unwrap(),
                 _ => unreachable!(),
             };
@@ -1785,6 +2113,7 @@ mod tests {
             assert!(!dev.remote);
             let expected = match mode {
                 StreamMode::S11 => b"$s11,stop\n$local\n".as_slice(),
+                StreamMode::S21 => b"$s21,stop\n$local\n".as_slice(),
                 StreamMode::Spec => b"$spec,stop\n$local\n".as_slice(),
                 _ => unreachable!(),
             };
@@ -1851,14 +2180,15 @@ mod tests {
         dev.sweep_s11(&s11_params(3)).unwrap();
         assert_eq!(dev.active_mode, Some(StreamMode::S11));
         assert!(
-            dev.transport.sent[before_retry..].starts_with(b"$s11,stop\n$spec,stop\n$s11,init\n")
+            dev.transport.sent[before_retry..]
+                .starts_with(b"$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n")
         );
     }
 
     #[test]
     fn setup_and_run_send_failures_require_a_fresh_connection() {
         // A send failure can leave an unknown amount of a command on the wire.
-        for failed_send in 1..=5 {
+        for failed_send in 1..=6 {
             let mut mock = MockTransport::with_lines(&[]);
             mock.fail_send = Some(failed_send);
             mock.queue_sweep(StreamMode::S11, 3);
@@ -1950,13 +2280,13 @@ mod tests {
             "$error:Please initialize the mode first!",
             "$end",
         ]);
-        // Fail the cleanup stop after the two initial stops, init and run.
-        mock.fail_send = Some(5);
+        // Fail the cleanup stop after the three initial stops, init and run.
+        mock.fail_send = Some(6);
         let mut dev = Device::new(mock);
         assert!(
             matches!(dev.sweep_s11(&s11_params(3)), Err(Error::Device(ref name)) if name == "err_uninit")
         );
-        assert_eq!(dev.transport.send_calls, 5);
+        assert_eq!(dev.transport.send_calls, 6);
         assert_eq!(dev.active_mode, None);
         assert_eq!(dev.last_rbw, None);
         assert!(dev.requires_reconnect());
@@ -1964,7 +2294,7 @@ mod tests {
             dev.sweep_s11(&s11_params(3)),
             Err(Error::NotConnected)
         ));
-        assert_eq!(dev.transport.send_calls, 5);
+        assert_eq!(dev.transport.send_calls, 6);
     }
 
     #[test]

@@ -234,6 +234,24 @@ impl Capabilities {
     pub fn spec_calibrations(&self) -> &'static [Cal] {
         &[Cal::CalOn, Cal::CalOff]
     }
+
+    /// S21 calibration literals represented by this API (section 7.3).
+    /// These choices are source-based, not hardware-verified S21 behavior.
+    pub fn s21_calibrations(&self) -> &'static [Cal] {
+        self.s11_calibrations()
+    }
+
+    /// S21 formats represented by this API (sections 3.5 and 7.3).
+    pub fn s21_formats(&self) -> &'static [Format] {
+        match self.model {
+            // Impedance requires a topology-specific wire format, which this
+            // command API does not yet represent (sections 3.5 and 4.5).
+            Model::Kc901K | Model::Kc901R | Model::Kc901J => {
+                &[Format::Ri, Format::Ma, Format::Vswr, Format::Loss]
+            }
+            _ => &[Format::Ri, Format::Ma, Format::Loss, Format::Delay],
+        }
+    }
 }
 
 const LEGACY_RBW: &[Rbw] = &[Rbw::R1k, Rbw::R3k, Rbw::R10k, Rbw::R30k];

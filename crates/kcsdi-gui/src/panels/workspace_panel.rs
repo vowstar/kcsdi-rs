@@ -5,7 +5,7 @@
 
 use super::sweep_controls::{self, BUTTON_HEIGHT, SweepEdit, SweepFields, group_heading};
 use crate::i18n::{Language, Text};
-use crate::state::{AppState, ConnectionState, S11Display, SweepState, WorkerCommand};
+use crate::state::{AppState, ConnectionState, S11Display, S21Display, SweepState, WorkerCommand};
 use crate::workspace::{TraceDisplay, TraceSettings, TraceState};
 
 pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
@@ -87,15 +87,28 @@ pub fn format_fields(ui: &mut egui::Ui, settings: &mut TraceSettings, language: 
                     format!("S11 {}", display.label(language)),
                 );
             }
+            for display in S21Display::ALL {
+                ui.selectable_value(
+                    &mut settings.display,
+                    TraceDisplay::S21(display),
+                    format!("S21 {}", display.label(language)),
+                );
+            }
         });
+}
+
+pub fn receiver_fields(ui: &mut egui::Ui, settings: &mut TraceSettings, language: Language) {
+    super::s11_panel::receiver_fields(ui, settings, language);
+    match settings.display {
+        TraceDisplay::Spec => super::spec_panel::receiver_fields(ui, settings, language),
+        TraceDisplay::S21(_) => super::spec_panel::lo_fields(ui, settings, language),
+        TraceDisplay::S11(_) => {}
+    }
 }
 
 pub fn settings_fields(ui: &mut egui::Ui, settings: &mut TraceSettings, language: Language) {
     format_fields(ui, settings, language);
-    super::s11_panel::receiver_fields(ui, settings, language);
-    if settings.display == TraceDisplay::Spec {
-        super::spec_panel::receiver_fields(ui, settings, language);
-    }
+    receiver_fields(ui, settings, language);
     ui.horizontal(|ui| {
         ui.label(language.text(Text::Color));
         ui.color_edit_button_srgba(&mut settings.color);

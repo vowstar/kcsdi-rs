@@ -12,8 +12,9 @@ use std::time::Duration;
 use kcsdi_core::commands::{Cal, Format, Lo};
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{Device, S11Params, SpecParams, SweepProgress};
+use kcsdi_core::device::{Device, S11Params, S21Params, SpecParams, SweepProgress};
 use kcsdi_core::model::Rbw;
+use kcsdi_core::protocol::StreamMode;
 use kcsdi_core::transport::TcpTransport;
 use kcsdi_core::{Error, Result};
 
@@ -56,16 +57,23 @@ fn handshake(peer: &mut BufReader<TcpStream>) {
         .unwrap();
 }
 
-fn expect_run(peer: &mut BufReader<TcpStream>, spectrum: bool) {
+fn expect_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
     assert_eq!(read_line(peer), "$s11,stop\n");
+    assert_eq!(read_line(peer), "$s21,stop\n");
     assert_eq!(read_line(peer), "$spec,stop\n");
-    if spectrum {
+    if mode == StreamMode::Spec {
         assert_eq!(read_line(peer), "$spec,init\n");
         assert_eq!(read_line(peer), "$bw,10k\n");
         assert_eq!(read_line(peer), "$specref,-10\n");
         assert_eq!(
             read_line(peer),
             "$spec,run,caloff,highlo,2,ss,1000000,2000000\n"
+        );
+    } else if mode == StreamMode::S21 {
+        assert_eq!(read_line(peer), "$s21,init\n");
+        assert_eq!(
+            read_line(peer),
+            "$s21,run,caloff,loss,highlo,2,ss,1000000,2000000\n"
         );
     } else {
         assert_eq!(read_line(peer), "$s11,init\n");
@@ -78,11 +86,11 @@ fn expect_run(peer: &mut BufReader<TcpStream>, spectrum: bool) {
 
 fn sweep(
     device: &mut Device<TcpTransport>,
-    spectrum: bool,
+    mode: StreamMode,
     cancel: &CancellationToken,
     progress: impl FnMut(SweepProgress<'_>),
 ) -> Result<SweepData> {
-    if spectrum {
+    if mode == StreamMode::Spec {
         device.sweep_spec_controlled(
             &SpecParams {
                 cal: Cal::CalOff,
@@ -92,6 +100,20 @@ fn sweep(
                 stop_hz: 2_000_000,
                 rbw: Rbw::R10k,
                 ref_level_dbm: -10,
+            },
+            cancel,
+            progress,
+        )
+    } else if mode == StreamMode::S21 {
+        device.sweep_s21_controlled(
+            &S21Params {
+                cal: Cal::CalOff,
+                format: Format::Loss,
+                lo: Lo::HighLo,
+                points: 3,
+                start_hz: 1_000_000,
+                stop_hz: 2_000_000,
+                rbw: None,
             },
             cancel,
             progress,
@@ -112,7 +134,7 @@ fn sweep(
     }
 }
 
-fn cancel_fragmented_sweep(spectrum: bool) {
+fn cancel_fragmented_sweep(mode: StreamMode) {
     let (mut device, mut peer) = connected_pair();
     let cancel = CancellationToken::default();
     let peer_cancel = cancel.clone();
@@ -120,9 +142,11 @@ fn cancel_fragmented_sweep(spectrum: bool) {
     thread::scope(|scope| {
         let server = scope.spawn(move || {
             handshake(&mut peer);
-            expect_run(&mut peer, spectrum);
-            let header = if spectrum {
+            expect_run(&mut peer, mode);
+            let header = if mode == StreamMode::Spec {
                 "$start,spec\n"
+            } else if mode == StreamMode::S21 {
+                "$start,s21,loss\n"
             } else {
                 "$start,s11,loss\n"
             };
@@ -141,19 +165,12 @@ fn cancel_fragmented_sweep(spectrum: bool) {
             // precede the fresh identity reply, including the fragmented row.
             peer.get_mut().write_all(b"2\n$2000000,3\n$end\n").unwrap();
             peer.get_mut().write_all(IDENTITY).unwrap();
-            expect_run(&mut peer, spectrum);
+            expect_run(&mut peer, mode);
             peer.get_mut().write_all(header.as_bytes()).unwrap();
             peer.get_mut()
                 .write_all(b"$1000000,10\n$1500000,20\n$2000000,30\n$end\n")
                 .unwrap();
-            assert_eq!(
-                read_line(&mut peer),
-                if spectrum {
-                    "$spec,stop\n"
-                } else {
-                    "$s11,stop\n"
-                }
-            );
+            assert_eq!(read_line(&mut peer), format!("${},stop\n", mode.name()));
             assert_eq!(read_line(&mut peer), "$local\n");
             let mut extra = [0];
             assert_eq!(peer.read(&mut extra).unwrap(), 0);
@@ -161,7 +178,7 @@ fn cancel_fragmented_sweep(spectrum: bool) {
 
         assert_eq!(device.handshake().unwrap(), "000000000001");
         let mut prefixes = Vec::new();
-        let result = sweep(&mut device, spectrum, &cancel, |prefix| {
+        let result = sweep(&mut device, mode, &cancel, |prefix| {
             prefixes.push(prefix.points.len());
             if prefix.points.len() == 1 {
                 prefix_seen.send(()).unwrap();
@@ -170,7 +187,7 @@ fn cancel_fragmented_sweep(spectrum: bool) {
         assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
         assert_eq!(prefixes, [0, 1]);
         assert!(!device.requires_reconnect());
-        let complete = sweep(&mut device, spectrum, &CancellationToken::default(), |_| {}).unwrap();
+        let complete = sweep(&mut device, mode, &CancellationToken::default(), |_| {}).unwrap();
         assert_eq!(complete.points.len(), 3);
         assert_eq!(
             complete
@@ -188,12 +205,17 @@ fn cancel_fragmented_sweep(spectrum: bool) {
 
 #[test]
 fn s11_cancellation_drains_a_fragmented_tail_before_reusing_the_socket() {
-    cancel_fragmented_sweep(false);
+    cancel_fragmented_sweep(StreamMode::S11);
 }
 
 #[test]
 fn spectrum_cancellation_drains_a_fragmented_tail_before_reusing_the_socket() {
-    cancel_fragmented_sweep(true);
+    cancel_fragmented_sweep(StreamMode::Spec);
+}
+
+#[test]
+fn s21_cancellation_drains_a_fragmented_tail_before_reusing_the_socket() {
+    cancel_fragmented_sweep(StreamMode::S21);
 }
 
 #[test]

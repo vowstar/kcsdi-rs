@@ -5,19 +5,20 @@
 
 [简体中文](README.zh-CN.md)
 
-A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11 and spectrum sweeps, and save measurements.
+A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11, S21 and spectrum sweeps, and save measurements.
 
 ![English impedance and Smith views of one recorded S11 sweep](https://github.com/user-attachments/assets/8eee9271-257a-42d9-8f8b-7aabc8dfcf17)
 
 | Measurement | Views and exports |
 | --- | --- |
 | S11 | Impedance, Smith chart, phase, return loss and VSWR |
+| S21 | Phase, loss and group delay |
 | Spectrum | Live trace with linear or logarithmic frequency axis |
 | Data | CSV and Touchstone `.s1p`. CLI assembly of `.s2p` from four complex measurements |
 | Analysis | Selectable traces, hold, maximum and minimum envelopes, markers, zoom, pan and fit |
 | Interface | English and Simplified Chinese. Saved devices, light, dark and system themes |
 
-Hardware tests use a KC901V with firmware V1.6.1. Other KC901 models need hardware tests.
+S11 and spectrum hardware tests use a KC901V with firmware V1.6.1. S21 has software and local replay tests. Other KC901 models need hardware tests.
 
 ## Build and connect
 
@@ -40,7 +41,7 @@ The binaries are in `target/release`. Add that directory to PATH to use the CLI 
 
 In the GUI, add a device with its address and TCP port, open it, then select Connect in the bottom bar. The instrument accepts one control connection at a time.
 
-Select S11 or Spectrum in the left panel. Use the trace menu to change the S11 view. Each mode keeps its last sweep. Only the selected mode acquires data. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
+Add up to ten traces in the left panel and choose their views and colors. Run acquires the visible traces in sequence and shares matching measurements. Each trace keeps its last complete sweep and Y scale. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
 
 Language follows the system by default. Choose English, Simplified Chinese or Follow system in Settings. Other system languages use English.
 
@@ -51,6 +52,9 @@ kcsdi info --host 192.0.2.10 --port 901
 kcsdi limits --model kc901v
 kcsdi sweep s11 --host 192.0.2.10 --port 901 \
     --start 5000 --stop 100000000 --points 201 --out antenna.s1p
+kcsdi sweep s21 --host 192.0.2.10 --port 901 \
+    --start 100000000 --stop 500000000 --points 201 \
+    --format delay --rbw 10k --out delay.csv
 kcsdi sweep spec --host 192.0.2.10 --port 901 \
     --start 100000000 --stop 500000000 --points 201 --rbw 10k --out spectrum.csv
 ```
@@ -66,7 +70,9 @@ These are tested command limits. Use the instrument specifications for measureme
 
 ## Export
 
-For GUI export, run a sweep in Phase, Smith or Impedance, then select Export .s1p. The file contains the full completed sweep, including hidden traces and points outside the current view. Return loss and VSWR alone lack phase.
+For GUI export, complete an S11 Phase, Smith or Impedance sweep, then select Export .s1p. The file contains the selected trace's full completed measurement, including hidden components and points outside the current view. Return loss and VSWR alone lack phase.
+
+S21 CLI exports use CSV. Phase uses degrees and group delay uses seconds. Loss values keep the sign reported by the instrument.
 
 The CLI can combine four complex CSV measurements on the same frequency grid:
 

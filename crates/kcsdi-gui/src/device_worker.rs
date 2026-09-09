@@ -113,6 +113,9 @@ pub fn device_worker(
                 AcquisitionSettings::S11(params) => {
                     dev.sweep_s11_controlled(params, &current.cancel, progress)
                 }
+                AcquisitionSettings::S21(params) => {
+                    dev.sweep_s21_controlled(params, &current.cancel, progress)
+                }
             };
             match result {
                 Ok(data) => {
@@ -490,10 +493,12 @@ mod tests {
         let cancel = CancellationToken::default();
         let settings = AcquisitionSettings::S11(s11());
         let spectrum = AcquisitionSettings::Spec(spec());
+        let transmission = AcquisitionSettings::S21(crate::acquisition::tests::s21());
         let plan = SweepPlan::from_requests([
             (TraceId(1), settings.clone()),
             (TraceId(2), spectrum.clone()),
             (TraceId(3), settings.clone()),
+            (TraceId(4), transmission.clone()),
         ])
         .unwrap();
         std::thread::scope(|scope| {
@@ -530,6 +535,7 @@ mod tests {
 
                 for command in [
                     "$s11,stop\n",
+                    "$s21,stop\n",
                     "$spec,stop\n",
                     "$s11,init\n",
                     "$bw,10k\n",
@@ -552,10 +558,23 @@ mod tests {
                 peer.get_mut()
                     .write_all(b"$start,spec\n$1000000,-10\n$1500000,-20\n$2000000,-30\n$end\n")
                     .unwrap();
+                for command in [
+                    "$spec,stop\n",
+                    "$s21,init\n",
+                    "$bw,10k\n",
+                    "$s21,run,caloff,delay,highlo,2,ss,1000000,2000000\n",
+                ] {
+                    expect_line(&mut peer, command);
+                }
+                peer.get_mut()
+                    .write_all(
+                        b"$start,s21,delay\n$1000000,-5e-9\n$1500000,0\n$2000000,8e-9\n$end\n",
+                    )
+                    .unwrap();
                 // The next pass returns to the first group, rather than
                 // measuring its second display member as a separate sweep.
                 for command in [
-                    "$spec,stop\n",
+                    "$s21,stop\n",
                     "$s11,init\n",
                     "$bw,10k\n",
                     "$s11,run,caloff,z,2,ss,1000000,2000000\n",
@@ -613,6 +632,7 @@ mod tests {
             for (cycle, members, expected_settings) in [
                 (1, vec![TraceId(1), TraceId(3)], settings),
                 (2, vec![TraceId(2)], spectrum),
+                (3, vec![TraceId(4)], transmission),
             ] {
                 let event = event_rx.recv_timeout(WAIT).unwrap();
                 assert_eq!(
@@ -647,6 +667,7 @@ mod tests {
             assert!(event_rx.try_recv().is_err());
             assert_eq!(completed[0].data.points[0].values, [50.0, 50.0, 0.0]);
             assert_eq!(completed[1].data.points[0].values, [-10.0]);
+            assert_eq!(completed[2].data.points[0].values, [-5e-9]);
             drop(cleanup);
             worker.join().unwrap();
             server.join().unwrap();
@@ -897,6 +918,9 @@ mod tests {
         for command in [
             WorkerCommand::RunWorkspace(plan(AcquisitionSettings::S11(s11()))),
             WorkerCommand::RunWorkspace(plan(AcquisitionSettings::Spec(spec()))),
+            WorkerCommand::RunWorkspace(plan(AcquisitionSettings::S21(
+                crate::acquisition::tests::s21(),
+            ))),
         ] {
             let mut identity = WorkerIdentity {
                 session_id: 1,
@@ -1080,7 +1104,7 @@ mod tests {
         impl kcsdi_core::transport::Transport for CleanupFailure {
             fn send_with_timeout(&mut self, _: &[u8], _: Duration) -> kcsdi_core::Result<()> {
                 self.sends += 1;
-                if self.sends == 6 {
+                if self.sends == 7 {
                     Err(Error::NotConnected)
                 } else {
                     Ok(())

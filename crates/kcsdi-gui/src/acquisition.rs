@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{S11Params, SpecParams};
+use kcsdi_core::device::{S11Params, S21Params, SpecParams};
 use kcsdi_core::protocol::StreamMode;
 use kcsdi_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -23,29 +23,39 @@ pub struct TraceId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquisitionSettings {
     S11(S11Params),
+    S21(S21Params),
     Spec(SpecParams),
 }
 
 impl AcquisitionSettings {
     pub fn validate(&self) -> Result<()> {
         let caps = crate::state::DEVICE_MODEL.capabilities();
-        match self {
+        let rbw = match self {
             Self::S11(params) => {
                 params.validate(&caps)?;
-                if params.rbw.is_none() {
-                    return Err(Error::InvalidParameter(
-                        "workspace sweeps require an explicit bandwidth".into(),
-                    ));
-                }
-                Ok(())
+                params.rbw
             }
-            Self::Spec(params) => params.validate(&caps),
+            Self::S21(params) => {
+                params.validate(&caps)?;
+                params.rbw
+            }
+            Self::Spec(params) => {
+                params.validate(&caps)?;
+                Some(params.rbw)
+            }
+        };
+        if rbw.is_none() {
+            return Err(Error::InvalidParameter(
+                "workspace sweeps require an explicit bandwidth".into(),
+            ));
         }
+        Ok(())
     }
 
     pub fn mode(&self) -> StreamMode {
         match self {
             Self::S11(_) => StreamMode::S11,
+            Self::S21(_) => StreamMode::S21,
             Self::Spec(_) => StreamMode::Spec,
         }
     }
@@ -53,6 +63,7 @@ impl AcquisitionSettings {
     pub fn format(&self) -> &'static str {
         match self {
             Self::S11(params) => params.format.as_str(),
+            Self::S21(params) => params.format.as_str(),
             Self::Spec(_) => "",
         }
     }
@@ -60,6 +71,7 @@ impl AcquisitionSettings {
     pub fn points(&self) -> u32 {
         match self {
             Self::S11(params) => params.points,
+            Self::S21(params) => params.points,
             Self::Spec(params) => params.points,
         }
     }
@@ -189,6 +201,18 @@ pub(crate) mod tests {
             stop_hz: 2_000_000,
             rbw: Rbw::R10k,
             ref_level_dbm: -10,
+        }
+    }
+
+    pub fn s21() -> S21Params {
+        S21Params {
+            cal: Cal::CalOff,
+            format: Format::Delay,
+            lo: Lo::HighLo,
+            points: 3,
+            start_hz: 1_000_000,
+            stop_hz: 2_000_000,
+            rbw: Some(Rbw::R10k),
         }
     }
 

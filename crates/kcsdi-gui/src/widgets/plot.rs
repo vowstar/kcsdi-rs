@@ -186,9 +186,9 @@ impl Mapping {
             rect,
             log_x,
             x_min,
-            x_span: (x_to_axis(log_x, view.x_max) - x_min).max(MIN_SPAN),
+            x_span: positive_span(x_to_axis(log_x, view.x_max) - x_min),
             y_min: view.y_min,
-            y_span: (view.y_max - view.y_min).max(MIN_SPAN),
+            y_span: positive_span(view.y_max - view.y_min),
         }
     }
 
@@ -210,6 +210,14 @@ impl Mapping {
 
     fn value_at(&self, screen_y: f32) -> f64 {
         self.y_min + ((self.rect.bottom() - screen_y) / self.rect.height()) as f64 * self.y_span
+    }
+}
+
+fn positive_span(span: f64) -> f64 {
+    if span.is_finite() && span > 0.0 {
+        span
+    } else {
+        MIN_SPAN
     }
 }
 
@@ -282,7 +290,7 @@ fn format_freq(hz: f64) -> String {
 
 /// Compact number for tick labels and readouts: fixed point inside a
 /// sane magnitude band, scientific outside, trailing zeros trimmed.
-fn format_value(v: f64) -> String {
+pub(crate) fn format_value(v: f64) -> String {
     let a = v.abs();
     if a != 0.0 && !(1e-3..1e6).contains(&a) {
         return format!("{:.3e}", v);
@@ -297,7 +305,7 @@ fn format_value(v: f64) -> String {
 
 /// Retain at least the resolution of one division, including narrow views.
 fn y_tick_text(value: f64, step: f64) -> String {
-    let precision = (-step.abs().log10().floor()).clamp(0.0, 16.0) as usize;
+    let precision = (2.0 - step.abs().log10().floor()).clamp(0.0, 16.0) as usize;
     let text = format!("{value:.precision$}");
     let text = if text.contains('.') {
         text.trim_end_matches('0').trim_end_matches('.')
@@ -434,7 +442,15 @@ fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
             x0 = x_from_axis(opts.log_x, axis - pad);
             x1 = x_from_axis(opts.log_x, axis + pad);
         }
-        let pad = ((y1 - y0) * 0.05).max(1.0);
+        let magnitude = y0.abs().max(y1.abs());
+        let minimum_pad = if magnitude > 0.0 && magnitude < 1.0 {
+            magnitude * 0.05
+        } else if magnitude == 0.0 && opts.y_label == "s" {
+            1e-9
+        } else {
+            1.0
+        };
+        let pad = ((y1 - y0) * 0.05).max(minimum_pad);
         (x0, x1, y0 - pad, y1 + pad)
     })
 }
@@ -880,9 +896,6 @@ fn pan_view(view: &mut PlotView, log_x: bool, rect: Rect, delta: egui::Vec2) {
 
 /// Zoom one axis around the cursor, refusing collapsed or infinite bounds.
 fn zoom_axis(min: &mut f64, max: &mut f64, anchor: f64, factor: f64) {
-    if (*max - *min) * factor < MIN_SPAN {
-        return;
-    }
     let new_min = anchor - (anchor - *min) * factor;
     let new_max = anchor + (*max - anchor) * factor;
     if new_min.is_finite() && new_max.is_finite() && new_min < new_max {
@@ -1778,6 +1791,37 @@ mod tests {
     }
 
     #[test]
+    fn delay_tick_multipliers_keep_fractional_steps_and_signed_values() {
+        for (low, high, expected) in [
+            (
+                -13.8e-9,
+                3.8e-9,
+                [
+                    "-13.8", "-11.6", "-9.4", "-7.2", "-5", "-2.8", "-0.6", "1.6", "3.8",
+                ],
+            ),
+            (
+                -50e-9,
+                50e-9,
+                [
+                    "-5", "-3.75", "-2.5", "-1.25", "0", "1.25", "2.5", "3.75", "5",
+                ],
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let view = PlotView::new(1e6, 100e6, low, high);
+            ctx.run_ui(Default::default(), |ui| {
+                let (ticks, caption) = y_tick_labels(ui.painter(), &view, "s");
+                assert!(caption.starts_with("s (x1e-"));
+                let text: Vec<_> = ticks.iter().map(|tick| tick.text()).collect();
+                assert_eq!(text, expected);
+                assert!(ticks.iter().all(|tick| tick.size().x <= MARGIN_LEFT - 8.0));
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
     fn repairing_log_x_from_dc_preserves_manual_y_scale() {
         for points in [vec![(0.0, -10.0), (1e6, -20.0), (5e6, -30.0)], vec![]] {
             let mut opts = options(&points, true);
@@ -1984,6 +2028,48 @@ mod tests {
             assert!(view.x_min < 1e6 && view.x_max > 1e6);
             assert_eq!((view.y_min, view.y_max), (-1.0, 1.0));
         }
+    }
+
+    #[test]
+    fn small_scalar_values_fit_without_a_whole_unit_padding() {
+        for unit in ["s", "ohm", "dB"] {
+            for (low, high) in [(-5e-9, 3e-9), (2e-12, 6e-12), (7e-9, 7e-9)] {
+                let mut opts = options(&[(1e6, low), (2e6, high)], false);
+                opts.y_label = unit;
+                let mut view = PlotView::new(1e6, 2e6, -1.0, 1.0);
+                fit_view(&mut view, &opts);
+                assert!(view.y_min < low && view.y_max > high);
+                assert!((view.y_max - view.y_min) < 2.0 * low.abs().max(high.abs()));
+                let mapping = Mapping::new(&view, false, rect());
+                assert_eq!(mapping.to_screen(1e6, view.y_min).y, rect().bottom());
+                assert_eq!(mapping.to_screen(2e6, view.y_max).y, rect().top());
+            }
+        }
+        let mut opts = options(&[(1e6, 0.0), (2e6, 0.0)], false);
+        opts.y_label = "s";
+        let mut view = PlotView::new(1e6, 2e6, -1.0, 1.0);
+        fit_view(&mut view, &opts);
+        assert_eq!((view.y_min, view.y_max), (-1e-9, 1e-9));
+    }
+
+    #[test]
+    fn sub_nanosecond_views_map_zoom_and_pan_without_clamping() {
+        let mut view = PlotView::new(1e6, 2e6, -5e-12, 3e-12);
+        let mapping = Mapping::new(&view, false, rect());
+        assert_eq!(mapping.to_screen(1e6, -5e-12).y, rect().bottom());
+        assert_eq!(mapping.to_screen(2e6, 3e-12).y, rect().top());
+        assert!((mapping.value_at(rect().center().y) + 1e-12).abs() < 1e-26);
+        zoom_axis(&mut view.y_min, &mut view.y_max, -1e-12, 0.5);
+        assert!((view.y_min + 3e-12).abs() < 1e-26);
+        assert!((view.y_max - 1e-12).abs() < 1e-26);
+        pan_view(
+            &mut view,
+            false,
+            rect(),
+            egui::vec2(0.0, rect().height() * 0.25),
+        );
+        assert!((view.y_min + 2e-12).abs() < 1e-26);
+        assert!((view.y_max - 2e-12).abs() < 1e-26);
     }
 
     #[test]

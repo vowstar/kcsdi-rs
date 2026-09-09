@@ -12,10 +12,10 @@ use kcsdi_core::commands::Cal;
 pub fn receiver_fields(ui: &mut egui::Ui, settings: &mut TraceSettings, language: Language) {
     group_heading(ui, language.text(Text::Calibration));
     let capabilities = DEVICE_MODEL.capabilities();
-    let calibrations = if settings.display == crate::workspace::TraceDisplay::Spec {
-        capabilities.spec_calibrations()
-    } else {
-        capabilities.s11_calibrations()
+    let calibrations = match settings.display {
+        crate::workspace::TraceDisplay::Spec => capabilities.spec_calibrations(),
+        crate::workspace::TraceDisplay::S11(_) => capabilities.s11_calibrations(),
+        crate::workspace::TraceDisplay::S21(_) => capabilities.s21_calibrations(),
     };
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 8.0 * calibrations.len().saturating_sub(1) as f32)

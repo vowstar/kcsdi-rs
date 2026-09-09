@@ -739,6 +739,25 @@ fn trace_series(
         TraceDisplay::S11(display) => {
             cartesian_series(display, Some(data), settings.impedance_visible, language)
         }
+        TraceDisplay::S21(display) => vec![widgets::plot::Series {
+            name: display.label(language),
+            color: settings.color,
+            visible: true,
+            points: data
+                .points
+                .iter()
+                .map(|point| {
+                    (
+                        point.freq_hz,
+                        point
+                            .values
+                            .get(settings.display.columns()[0])
+                            .copied()
+                            .unwrap_or(f64::NAN),
+                    )
+                })
+                .collect(),
+        }],
     };
     if let Some(first) = series.first_mut() {
         first.color = settings.color;
@@ -793,14 +812,11 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             let mut settings = trace.settings.clone();
                             ui.add_enabled_ui(editable, |ui| {
                                 panels::workspace_panel::format_fields(ui, &mut settings, language);
-                                panels::s11_panel::receiver_fields(ui, &mut settings, language);
-                                if settings.display == TraceDisplay::Spec {
-                                    panels::spec_panel::receiver_fields(
-                                        ui,
-                                        &mut settings,
-                                        language,
-                                    );
-                                }
+                                panels::workspace_panel::receiver_fields(
+                                    ui,
+                                    &mut settings,
+                                    language,
+                                );
                             });
                             trace.update_settings(settings);
                             let complete = trace
@@ -1019,7 +1035,7 @@ fn visibility_control(ui: &mut egui::Ui, visible: &mut bool, language: Language)
 mod tests {
     use super::*;
     use crate::acquisition::{CompletedSweep, TraceId};
-    use crate::state::WorkerCommand;
+    use crate::state::{S21Display, WorkerCommand};
     use crate::workspace::{SweepRange, Workspace};
     use kcsdi_core::data::{SweepData, SweepPoint};
     use kcsdi_core::protocol::StreamMode;
@@ -1105,6 +1121,15 @@ mod tests {
             for point in &mut data.points {
                 point.values = vec![-20.0];
             }
+        } else {
+            for point in &mut data.points {
+                point.values = match data.format.as_str() {
+                    "ma" => vec![0.5, -90.0],
+                    "loss" => vec![-3.0],
+                    "delay" => vec![-5e-9],
+                    _ => point.values.clone(),
+                };
+            }
         }
         crate::preview::PreviewEnvelope {
             session_id: app.state.session_id,
@@ -1146,6 +1171,131 @@ mod tests {
                 |ui| app.plot_ui(ui),
             )
             .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn transmission_series_keep_signed_raw_values_and_seconds_in_both_languages() {
+        for (display, format, values, expected, unit) in [
+            (S21Display::Phase, "ma", vec![0.5, -90.0], -90.0, "deg"),
+            (S21Display::Loss, "loss", vec![-3.0], -3.0, "dB"),
+            (S21Display::Delay, "delay", vec![-5e-9], -5e-9, "s"),
+        ] {
+            for language in Language::ALL {
+                let mut data = SweepData {
+                    mode: StreamMode::S21,
+                    format: format.into(),
+                    points: vec![SweepPoint {
+                        freq_hz: 1e6,
+                        values: values.clone(),
+                    }],
+                };
+                let settings = TraceSettings {
+                    display: TraceDisplay::S21(display),
+                    ..Default::default()
+                };
+                let series = trace_series(&settings, Some(&data), language, true);
+                assert_eq!(series[0].points, [(1e6, expected)]);
+                assert_eq!(series[0].name, display.label(language));
+                assert_eq!(settings.display.unit(), unit);
+                data.mode = StreamMode::S11;
+                assert!(trace_series(&settings, Some(&data), language, true).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn same_wire_s11_and_s21_results_stay_with_their_own_members_and_requests() {
+        let mut app = active_impedance_app();
+        app.state.workspace.selected_mut().unwrap().settings.display =
+            TraceDisplay::S11(S11Display::Phase);
+        let transmission = app
+            .state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S21(S21Display::Phase),
+                ..Default::default()
+            })
+            .unwrap();
+        app.state.reconcile_plan();
+        assert_eq!(app.state.active_plan.as_ref().unwrap().groups.len(), 2);
+        app.apply_worker_event(completion(&app, 0, 1));
+        assert!(app.state.workspace.selected().unwrap().completed.is_none());
+        app.apply_preview(prefix(&app, 1, 2, 2));
+        assert!(app.state.workspace.traces[0].preview.is_none());
+        app.apply_worker_event(completion(&app, 1, 2));
+        let complete = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .clone()
+            .unwrap();
+        assert_eq!(complete.data.mode, StreamMode::S21);
+        assert_eq!(
+            app.state.workspace.traces[0]
+                .completed
+                .as_ref()
+                .unwrap()
+                .data
+                .mode,
+            StreamMode::S11
+        );
+        let stale = completion(&app, 1, 3);
+        let request = app.state.request_id;
+        app.state.workspace.selected = Some(transmission);
+        app.state.workspace.selected_mut().unwrap().settings.lo = kcsdi_core::commands::Lo::LowLo;
+        app.state.reconcile_plan();
+        assert_eq!(app.state.request_id, request + 1);
+        app.apply_worker_event(stale);
+        assert!(Arc::ptr_eq(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap(),
+            &complete
+        ));
+        assert!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .last_completed_cycle
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn transmission_delay_fit_preserves_a_nanosecond_range() {
+        let mut app = active_impedance_app();
+        let trace = app.state.workspace.selected_mut().unwrap();
+        let mut settings = trace.settings.clone();
+        settings.display = TraceDisplay::S21(S21Display::Delay);
+        trace.update_settings(settings);
+        app.state.reconcile_plan();
+        let mut event = completion(&app, 0, 1);
+        if let WorkerEvent::SweepTrace(delivery) = &mut event.event {
+            for (point, delay) in Arc::make_mut(&mut delivery.snapshot)
+                .data
+                .points
+                .iter_mut()
+                .zip([-5e-9, 0.0, 8e-9])
+            {
+                point.values = vec![delay];
+            }
+        }
+        app.apply_worker_event(event);
+        plot_frame(&mut app);
+        let trace = app.state.workspace.selected().unwrap();
+        assert!(trace.view.y_min < -5e-9 && trace.view.y_max > 8e-9);
+        assert!(trace.view.y_max - trace.view.y_min < 20e-9);
+        assert_eq!(
+            trace.completed.as_ref().unwrap().data.points[0].values,
+            [-5e-9]
+        );
     }
 
     #[test]
@@ -1837,6 +1987,106 @@ mod tests {
         assert_eq!(app.state.temperature, Some(43.0));
         assert!(app.state.any_running());
         assert_eq!(app.state.request_id, 3);
+    }
+
+    #[test]
+    fn populated_transmission_panels_stay_within_their_fixed_width() {
+        for width in [1280.0, 960.0] {
+            for language in Language::ALL {
+                for theme_mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+                    let ctx = egui::Context::default();
+                    theme::setup(&ctx);
+                    theme::apply(&ctx, theme_mode);
+                    let mut app = active_impedance_app();
+                    app.state.language = language;
+                    app.state.workspace = Workspace::empty(SweepRange::new(1e6, 100e6, 201));
+                    for display in [
+                        S21Display::Delay,
+                        S21Display::Phase,
+                        S21Display::Loss,
+                        S21Display::Loss,
+                        S21Display::Loss,
+                    ] {
+                        app.state
+                            .workspace
+                            .add_trace(TraceSettings {
+                                display: TraceDisplay::S21(display),
+                                ..Default::default()
+                            })
+                            .unwrap();
+                        let range = app.state.workspace.range;
+                        let trace = app.state.workspace.selected_mut().unwrap();
+                        let snapshot = Arc::new(CompletedSweep {
+                            settings: trace.settings.acquisition(&range).unwrap(),
+                            session_id: 1,
+                            completed_at: SystemTime::UNIX_EPOCH,
+                            data: SweepData {
+                                mode: StreamMode::S21,
+                                format: display.wire_format().as_str().into(),
+                                points: (0..201)
+                                    .map(|index| SweepPoint {
+                                        freq_hz: 1e6 + f64::from(index) * 495000.0,
+                                        values: match display {
+                                            S21Display::Delay => vec![
+                                                -5.147039e-9
+                                                    + 8.39821e-9 * (f64::from(index) / 32.0).sin(),
+                                            ],
+                                            S21Display::Phase => vec![0.5, -90.0],
+                                            S21Display::Loss => {
+                                                vec![-123_456_789.123 + f64::from(index)]
+                                            }
+                                        },
+                                    })
+                                    .collect(),
+                            },
+                        });
+                        trace.analysis.observe(&snapshot);
+                        trace.completed = Some(snapshot);
+                    }
+                    let screen =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 850.0));
+                    for selected in [0, 2] {
+                        let trace = &app.state.workspace.traces[selected];
+                        let title =
+                            format!("T{} {}", trace.id.0, trace.settings.display.label(language));
+                        app.state.workspace.selected = Some(trace.id);
+                        for _ in 0..3 {
+                            let output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ui| app.instrument_ui(ui),
+                            );
+                            let panel = egui::containers::panel::PanelState::load(
+                                &ctx,
+                                egui::Id::new("params_panel"),
+                            )
+                            .unwrap();
+                            assert!(
+                                (panel.outer_rect.left() - (width - 256.0)).abs() <= 1.0,
+                                "{language:?} {theme_mode:?} panel {:?}",
+                                panel.outer_rect
+                            );
+                            assert!(panel.outer_rect.right() <= width + 1.0);
+                            for label in [&title, language.text(Text::CalSys)] {
+                                let shape = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)).expect("parameter label must remain visible");
+                                let egui::Shape::Text(text) = &shape.shape else {
+                                    unreachable!()
+                                };
+                                let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                                assert!(
+                                    shape.clip_rect.contains_rect(bounds),
+                                    "{label}: {bounds:?} outside {:?}",
+                                    shape.clip_rect
+                                );
+                            }
+                            output.drop_without_applying_deltas();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

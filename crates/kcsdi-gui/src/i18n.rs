@@ -201,6 +201,8 @@ catalog! {
     Spectrum => ("SPEC", "频谱"),
     Phase => ("Phase", "相位"),
     ReturnLoss => ("Return Loss", "回波损耗"),
+    Loss => ("Loss", "损耗"),
+    GroupDelay => ("Group delay", "群时延"),
     Vswr => ("VSWR", "驻波比"),
     Smith => ("Smith", "史密斯图"),
     Match => ("MATCH", "匹配"),
@@ -247,8 +249,8 @@ catalog! {
     ExportCancelled => ("Export cancelled", "已取消导出"),
     ExportFailed => ("Export failed", "导出失败"),
     ExportNeedsComplex => (
-        "Run Phase, Smith or Impedance to capture complex S11 data.",
-        "请在相位、史密斯图或阻抗视图运行扫描，以获取完整复数 S11 数据。"
+        "Select an S11 Phase, Smith or Impedance trace and run a sweep.",
+        "选择 S11 相位、史密斯图或阻抗轨迹并运行扫描。"
     ),
     ExportSnapshot => ("Last completed sweep", "最近完成的扫描"),
     ExportHelp => (

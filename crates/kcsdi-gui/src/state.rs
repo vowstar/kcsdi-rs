@@ -69,6 +69,7 @@ pub enum AppMode {
     #[default]
     Spec,
     S11,
+    S21,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -145,6 +146,50 @@ impl S11Display {
             Self::ReturnLoss => "dB",
             Self::Vswr | Self::Smith => "",
             _ => "ohm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum S21Display {
+    Phase,
+    #[default]
+    Loss,
+    Delay,
+}
+
+impl S21Display {
+    pub const ALL: [Self; 3] = [Self::Phase, Self::Loss, Self::Delay];
+
+    pub fn label(self, language: Language) -> &'static str {
+        language.text(match self {
+            Self::Phase => Text::Phase,
+            Self::Loss => Text::Loss,
+            Self::Delay => Text::GroupDelay,
+        })
+    }
+
+    pub fn wire_format(self) -> Format {
+        match self {
+            Self::Phase => Format::Ma,
+            Self::Loss => Format::Loss,
+            Self::Delay => Format::Delay,
+        }
+    }
+
+    pub fn default_y(self) -> (f64, f64) {
+        match self {
+            Self::Phase => (-180.0, 180.0),
+            Self::Loss => (-100.0, 20.0),
+            Self::Delay => (-50e-9, 50e-9),
+        }
+    }
+
+    pub fn y_label(self) -> &'static str {
+        match self {
+            Self::Phase => "deg",
+            Self::Loss => "dB",
+            Self::Delay => "s",
         }
     }
 }

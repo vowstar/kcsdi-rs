@@ -98,9 +98,10 @@ pub fn show(
     if let Some(completed) = completed {
         let trace = &completed.data;
         let label = ui.small(format!(
-            "{}: {} ({})",
+            "{}: {} ({} {})",
             language.text(Text::ExportSnapshot),
             trace.points.len(),
+            trace.mode.name().to_ascii_uppercase(),
             trace.format
         ));
         if let (Some(first), Some(last)) = (trace.points.first(), trace.points.last()) {
@@ -192,6 +193,36 @@ mod tests {
     use super::*;
     use kcsdi_core::data::{SweepData, SweepPoint};
     use kcsdi_core::protocol::StreamMode;
+
+    #[test]
+    fn transmission_data_cannot_be_exported_as_a_one_port_reflection_file() {
+        for format in ["ri", "ma", "loss", "delay"] {
+            let completed = CompletedSweep {
+                data: SweepData {
+                    mode: StreamMode::S21,
+                    format: format.into(),
+                    points: vec![
+                        SweepPoint {
+                            freq_hz: 1e6,
+                            values: vec![0.5, -90.0],
+                        },
+                        SweepPoint {
+                            freq_hz: 2e6,
+                            values: vec![0.25, -45.0],
+                        },
+                    ],
+                },
+                settings: crate::acquisition::AcquisitionSettings::S21(
+                    crate::acquisition::tests::s21(),
+                ),
+                session_id: 1,
+                completed_at: std::time::SystemTime::UNIX_EPOCH,
+            };
+            for version in [Version::V1, Version::V2] {
+                assert!(snapshot(Some(&completed), version).is_err());
+            }
+        }
+    }
 
     #[test]
     fn snapshot_uses_actual_trace_not_display_controls_and_is_frozen() {

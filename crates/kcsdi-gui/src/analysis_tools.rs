@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::acquisition::CompletedSweep;
 use crate::i18n::{Language, Text};
-use crate::widgets::plot::{Marker, Series};
+use crate::widgets::plot::{Marker, Series, format_value};
 
 const MAX_MARKERS: usize = 10;
 
@@ -399,7 +399,13 @@ impl AnalysisTools {
             .show(ui, |ui| {
                 ui.label("M");
                 ui.label("MHz");
-                ui.label(language.text(Text::AnalysisValue));
+                let label = language.text(Text::AnalysisValue);
+                let unit = column_unit(trace, self.column);
+                ui.label(if unit.is_empty() {
+                    label.to_owned()
+                } else {
+                    format!("{label} ({unit})")
+                });
                 ui.end_row();
                 for marker in self.markers() {
                     let label =
@@ -418,7 +424,7 @@ impl AnalysisTools {
                             (frequency, value)
                         };
                         ui.monospace(format!("{:.6}", df / 1e6));
-                        ui.monospace(format!("{dv:.4}"));
+                        ui.monospace(format_value(dv));
                     } else {
                         ui.label("-");
                         ui.label("-");
@@ -541,8 +547,20 @@ fn column_label(format: &str, column: usize, language: Language) -> &'static str
         ("z", 1) => "R (ohm)",
         ("z", 2) => "X (ohm)",
         ("loss", _) => "dB",
+        ("delay", _) => "s",
         ("vswr", _) => "VSWR",
         _ => language.text(Text::Level),
+    }
+}
+
+fn column_unit(trace: &SweepData, column: usize) -> &'static str {
+    match (trace.format.as_str(), column) {
+        ("ma", 1) => "deg",
+        ("z", _) => "ohm",
+        ("loss", _) => "dB",
+        ("delay", _) => "s",
+        ("", _) if trace.mode == kcsdi_core::protocol::StreamMode::Spec => "dBm",
+        _ => "",
     }
 }
 
@@ -590,6 +608,16 @@ mod tests {
             params.format = data.format.parse().unwrap();
             params.points = data.points.len() as u32;
             AcquisitionSettings::S11(params)
+        } else if data.mode == StreamMode::S21 {
+            AcquisitionSettings::S21(kcsdi_core::device::S21Params {
+                cal: kcsdi_core::commands::Cal::CalOff,
+                format: data.format.parse().unwrap(),
+                lo: kcsdi_core::commands::Lo::HighLo,
+                points: data.points.len() as u32,
+                start_hz: 1_000_000,
+                stop_hz: 2_000_000,
+                rbw: Some(kcsdi_core::model::Rbw::R10k),
+            })
         } else {
             let mut params = tests::spec();
             params.points = data.points.len() as u32;
@@ -601,6 +629,10 @@ mod tests {
         );
         match &mut settings {
             AcquisitionSettings::S11(params) => {
+                params.start_hz = start_hz;
+                params.stop_hz = stop_hz;
+            }
+            AcquisitionSettings::S21(params) => {
                 params.start_hz = start_hz;
                 params.stop_hz = stop_hz;
             }
@@ -720,6 +752,124 @@ mod tests {
             visible,
             "the marker row must be drawn in its own floating window"
         );
+    }
+
+    #[test]
+    fn marker_table_keeps_small_delay_values_and_deltas_in_seconds() {
+        let mut data = trace(&[-5.147039e-9, 0.375e-9]);
+        data.mode = StreamMode::S21;
+        data.format = "delay".into();
+        let mut tools = AnalysisTools::default();
+        tools.add_marker(&data);
+        tools.markers[0].frequency_hz = 1e6;
+        tools.markers[0].reference = true;
+        tools.add_marker(&data);
+        for language in [Language::English, Language::SimplifiedChinese] {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(Default::default(), |ui| {
+                tools.marker_table(ui, language, &data);
+            });
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
+            let header = format!("{} (s)", language.text(Text::AnalysisValue));
+            assert!(text.contains(&header.as_str()));
+            assert!(text.contains(&"-5.147e-9"));
+            assert!(text.contains(&"5.522e-9"));
+            assert!(!text.contains(&"0.0000") && !text.contains(&"-0.0000"));
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(data.points[0].values[0], -5.147039e-9);
+        assert_eq!(column_label("delay", 0, Language::English), "s");
+    }
+
+    #[test]
+    fn marker_units_match_the_raw_measurement_column() {
+        let mut data = trace(&[1.0, 2.0]);
+        assert_eq!(column_unit(&data, 0), "dBm");
+        data.mode = StreamMode::S21;
+        for (format, column, unit) in [
+            ("ma", 0, ""),
+            ("ma", 1, "deg"),
+            ("loss", 0, "dB"),
+            ("delay", 0, "s"),
+            ("ri", 0, ""),
+            ("ri", 1, ""),
+        ] {
+            data.format = format.into();
+            assert_eq!(column_unit(&data, column), unit);
+        }
+        data.mode = StreamMode::S11;
+        data.format = "z".into();
+        for column in 0..3 {
+            assert_eq!(column_unit(&data, column), "ohm");
+        }
+    }
+
+    #[test]
+    fn s21_holds_keep_raw_seconds_and_reset_for_calibration_or_lo_changes() {
+        use crate::acquisition::AcquisitionSettings;
+        use kcsdi_core::commands::{Cal, Lo};
+
+        let delay = |values: &[f64]| {
+            let mut data = trace(values);
+            data.mode = StreamMode::S21;
+            data.format = "delay".into();
+            snapshot(&data)
+        };
+        let first = delay(&[-5e-9, 2e-9, -3e-9]);
+        let second = delay(&[-4e-9, 1e-9, -8e-9]);
+        let mut tools = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            ..Default::default()
+        };
+        tools.observe(&first);
+        tools.observe(&second);
+        let overlays = tools.overlay_series(&[0]);
+        assert_eq!(overlays[0].points[0], (1e6, -5e-9));
+        assert_eq!(overlays[1].points[0], (1e6, -4e-9));
+        assert_eq!(overlays[2].points[2], (3e6, -8e-9));
+        for (cal, lo) in [(Cal::CalSys, Lo::HighLo), (Cal::CalOff, Lo::LowLo)] {
+            let mut changed = delay(&[1e-9, 2e-9, 3e-9]);
+            let AcquisitionSettings::S21(params) = &mut changed.settings else {
+                unreachable!()
+            };
+            params.cal = cal;
+            params.lo = lo;
+            tools.observe(&changed);
+            assert!(
+                tools
+                    .overlay_series(&[0])
+                    .iter()
+                    .all(|series| series.points[0] == (1e6, 1e-9))
+            );
+        }
+        assert_eq!(first.data.points[0].values[0], -5e-9);
+    }
+
+    #[test]
+    fn s21_phase_markers_search_phase_instead_of_magnitude() {
+        let mut data = trace(&[0.9, 0.1, 0.2]);
+        data.mode = StreamMode::S21;
+        data.format = "ma".into();
+        for (point, phase) in data.points.iter_mut().zip([-80.0, 120.0, -30.0]) {
+            point.values.push(phase);
+        }
+        let mut tools = AnalysisTools::default();
+        tools.observe(&snapshot(&data));
+        assert_eq!(tools.column, 1);
+        tools.add_marker(&data);
+        tools.search(&data, Search::Maximum);
+        assert_eq!(tools.markers[0].frequency_hz, 2e6);
+        tools.search(&data, Search::Minimum);
+        assert_eq!(tools.markers[0].frequency_hz, 1e6);
     }
 
     #[test]

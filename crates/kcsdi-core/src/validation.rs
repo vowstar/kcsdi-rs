@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 
 //! Shared CLI, GUI and session preflight checks for finite, ascending sweeps.
-//! KC901V limits were exercised on firmware V1.6.1 (section 12).
+//! KC901V S11 and SPEC limits were exercised on firmware V1.6.1 (section 12).
+//! S21 validation follows the source-based table in section 7.3.
 
 use std::fmt::Display;
 
-use crate::device::{S11Params, SpecParams};
+use crate::device::{S11Params, S21Params, SpecParams};
 use crate::error::{Error, Result};
 use crate::model::{Capabilities, FreqRange, Rbw};
 
@@ -34,10 +35,27 @@ impl S11Params {
         if !caps.s11.enabled {
             return Err(invalid(format!("{} does not support S11", caps.model)));
         }
-        validate_range("S11", caps.s11.range, self.start_hz, self.stop_hz)?;
+        validate_range("S11", caps.s11.range, self.start_hz, self.stop_hz, 5)?;
         caps.wire_points(self.points)?;
         choice("S11 calibration", self.cal, caps.s11_calibrations())?;
         choice("S11 format", self.format, caps.s11_formats())?;
+        if let Some(rbw) = self.rbw {
+            validate_rbw(caps, rbw)?;
+        }
+        Ok(())
+    }
+}
+
+impl S21Params {
+    /// Validate source-based S21 limits without touching the device.
+    pub fn validate(&self, caps: &Capabilities) -> Result<()> {
+        if !caps.s21.enabled {
+            return Err(invalid(format!("{} does not support S21", caps.model)));
+        }
+        validate_range("S21", caps.s21.range, self.start_hz, self.stop_hz, 6)?;
+        caps.wire_points(self.points)?;
+        choice("S21 calibration", self.cal, caps.s21_calibrations())?;
+        choice("S21 format", self.format, caps.s21_formats())?;
         if let Some(rbw) = self.rbw {
             validate_rbw(caps, rbw)?;
         }
@@ -51,7 +69,7 @@ impl SpecParams {
         if !caps.spec.enabled {
             return Err(invalid(format!("{} does not support SPEC", caps.model)));
         }
-        validate_range("SPEC", caps.spec.range, self.start_hz, self.stop_hz)?;
+        validate_range("SPEC", caps.spec.range, self.start_hz, self.stop_hz, 5)?;
         caps.wire_points(self.points)?;
         choice("SPEC calibration", self.cal, caps.spec_calibrations())?;
         validate_rbw(caps, self.rbw)?;
@@ -77,18 +95,25 @@ pub fn frequency_hz(value: f64, field: &str) -> Result<u64> {
     Ok(value.round() as u64)
 }
 
-fn validate_range(mode: &str, range: FreqRange, start: u64, stop: u64) -> Result<()> {
+fn validate_range(
+    mode: &str,
+    range: FreqRange,
+    start: u64,
+    stop: u64,
+    start_parameter: usize,
+) -> Result<()> {
     let max_start = range.max_hz.saturating_sub(range.min_span_hz);
     let min_stop = range.min_hz.saturating_add(range.min_span_hz);
     if !(range.min_hz..=max_start).contains(&start) {
         return Err(invalid(format!(
-            "{mode} start frequency {start} Hz (run parameter 5), expected {}..={max_start} Hz",
+            "{mode} start frequency {start} Hz (run parameter {start_parameter}), expected {}..={max_start} Hz",
             range.min_hz
         )));
     }
     if !(min_stop..=range.max_hz).contains(&stop) {
         return Err(invalid(format!(
-            "{mode} stop frequency {stop} Hz (run parameter 6), expected {min_stop}..={} Hz",
+            "{mode} stop frequency {stop} Hz (run parameter {}), expected {min_stop}..={} Hz",
+            start_parameter + 1,
             range.max_hz
         )));
     }
@@ -147,6 +172,121 @@ mod tests {
             rbw: Rbw::R1k,
             ref_level_dbm: -10,
         }
+    }
+
+    fn s21() -> S21Params {
+        S21Params {
+            cal: Cal::CalUser,
+            format: Format::Delay,
+            lo: Lo::HighLo,
+            points: 201,
+            start_hz: 0,
+            stop_hz: 7_000_000_000,
+            rbw: Some(Rbw::R1k),
+        }
+    }
+
+    #[test]
+    fn s21_boundaries_follow_the_source_table_and_report_correct_wire_fields() {
+        let caps = Model::Kc901V.capabilities();
+        for (start, stop, valid) in [
+            (0, 1000, true),
+            (0, 999, false),
+            (0, 7_000_000_000, true),
+            (6_999_999_000, 7_000_000_000, true),
+            (6_999_999_001, 7_000_000_000, false),
+            (0, 7_000_000_001, false),
+            (1_000_000, 100_000, false),
+        ] {
+            let params = S21Params {
+                start_hz: start,
+                stop_hz: stop,
+                ..s21()
+            };
+            assert_eq!(params.validate(&caps).is_ok(), valid, "{start}..{stop}");
+        }
+        for (params, field) in [
+            (
+                S21Params {
+                    start_hz: 7_000_000_000,
+                    ..s21()
+                },
+                "parameter 6",
+            ),
+            (
+                S21Params {
+                    stop_hz: 7_000_000_001,
+                    ..s21()
+                },
+                "parameter 7",
+            ),
+        ] {
+            assert!(
+                params
+                    .validate(&caps)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(field)
+            );
+        }
+        for points in [0, 1, 2, 1002, u32::MAX] {
+            assert!(S21Params { points, ..s21() }.validate(&caps).is_err());
+        }
+        for points in [3, 201, 1001] {
+            assert!(S21Params { points, ..s21() }.validate(&caps).is_ok());
+        }
+    }
+
+    #[test]
+    fn s21_format_calibration_and_bandwidth_choices_remain_model_specific() {
+        let caps = Model::Kc901V.capabilities();
+        for format in [
+            Format::Ri,
+            Format::Ma,
+            Format::Loss,
+            Format::Delay,
+            Format::Z,
+            Format::Vswr,
+        ] {
+            let valid = !matches!(format, Format::Z | Format::Vswr);
+            assert_eq!(S21Params { format, ..s21() }.validate(&caps).is_ok(), valid);
+        }
+        for cal in [Cal::CalSys, Cal::CalUser, Cal::CalOff, Cal::CalOn] {
+            assert_eq!(
+                S21Params { cal, ..s21() }.validate(&caps).is_ok(),
+                cal != Cal::CalOn
+            );
+        }
+        for rbw in Rbw::ALL {
+            assert_eq!(
+                S21Params {
+                    rbw: Some(rbw),
+                    ..s21()
+                }
+                .validate(&caps)
+                .is_ok(),
+                caps.rbw_list.contains(&rbw)
+            );
+        }
+        for model in [Model::Kc901K, Model::Kc901R, Model::Kc901J] {
+            let caps = model.capabilities();
+            let mut params = S21Params {
+                cal: Cal::CalOff,
+                stop_hz: 1_000_000,
+                ..s21()
+            };
+            assert!(params.validate(&caps).is_err());
+            assert!(!caps.s21_formats().contains(&Format::Delay));
+            params.format = Format::Z;
+            assert!(params.validate(&caps).is_err());
+            params.format = Format::Loss;
+            assert!(params.validate(&caps).is_ok());
+            params.cal = Cal::CalSys;
+            assert!(params.validate(&caps).is_err());
+        }
+        let mut caps = caps;
+        caps.s21.enabled = false;
+        assert!(s21().validate(&caps).is_err());
     }
 
     #[test]

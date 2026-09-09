@@ -25,7 +25,7 @@ use kcsdi_core::model::Rbw;
 use crate::acquisition::{MAX_TRACES, TraceId};
 use crate::desktop::{DesktopConfig, DeviceProfile};
 use crate::i18n::LanguagePreference;
-use crate::state::{AppMode, AppState, S11Display};
+use crate::state::{AppMode, AppState, S11Display, S21Display};
 use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Workspace};
 
 /// Environment variable that overrides the config file path.
@@ -115,6 +115,11 @@ impl TraceConfig {
             display: match settings.display {
                 TraceDisplay::Spec => "spec",
                 TraceDisplay::S11(display) => display_as_str(display),
+                TraceDisplay::S21(display) => match display {
+                    S21Display::Phase => "s21_phase",
+                    S21Display::Loss => "s21_loss",
+                    S21Display::Delay => "s21_delay",
+                },
             }
             .to_owned(),
             cal: settings.cal.as_str().to_owned(),
@@ -130,6 +135,9 @@ impl TraceConfig {
 
     fn settings(&self) -> TraceSettings {
         let display = match self.display.as_str() {
+            "s21_phase" => TraceDisplay::S21(S21Display::Phase),
+            "s21_loss" => TraceDisplay::S21(S21Display::Loss),
+            "s21_delay" => TraceDisplay::S21(S21Display::Delay),
             "phase" | "return_loss" | "vswr" | "smith" | "impedance" | "magnitude"
             | "resistance" | "reactance" => TraceDisplay::S11(parse_display(&self.display)),
             _ => TraceDisplay::Spec,
@@ -253,6 +261,7 @@ fn mode_as_str(mode: AppMode) -> &'static str {
     match mode {
         AppMode::Spec => "spec",
         AppMode::S11 => "s11",
+        AppMode::S21 => "s21",
     }
 }
 
@@ -398,7 +407,7 @@ impl AppConfig {
     fn legacy_workspace(&self) -> Workspace {
         let selected = parse_mode(&self.mode);
         let (range, log_x) = match selected {
-            AppMode::Spec => (
+            AppMode::Spec | AppMode::S21 => (
                 SweepRange::new(self.spec.start_hz, self.spec.stop_hz, self.spec.points),
                 self.spec.log_x,
             ),
@@ -433,7 +442,7 @@ impl AppConfig {
             })
             .expect("legacy S11 definition");
         workspace.selected = Some(match selected {
-            AppMode::Spec => spec,
+            AppMode::Spec | AppMode::S21 => spec,
             AppMode::S11 => s11,
         });
         workspace
@@ -500,6 +509,42 @@ pub fn save(cfg: &AppConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transmission_definitions_round_trip_without_reusing_s11_keys() {
+        let mut state = AppState::default();
+        for display in S21Display::ALL {
+            state
+                .workspace
+                .add_trace(TraceSettings {
+                    display: TraceDisplay::S21(display),
+                    cal: Cal::CalUser,
+                    lo: Lo::LowLo,
+                    rbw: Rbw::R3k,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        state.send(crate::state::WorkerCommand::RunWorkspace(
+            state.workspace.plan().unwrap(),
+        ));
+        let before = AppConfig::from_state(&state);
+        let encoded = toml::to_string(&before).unwrap();
+        for key in ["s21_phase", "s21_loss", "s21_delay"] {
+            assert!(encoded.contains(key));
+        }
+        let loaded: AppConfig = toml::from_str(&encoded).unwrap();
+        let mut restored = AppState::default();
+        loaded.apply_to(&mut restored);
+        assert_eq!(restored.sweep, crate::state::SweepState::Idle);
+        assert!(restored.active_plan.is_none());
+        assert_eq!(restored.workspace.selected, state.workspace.selected);
+        assert_eq!(
+            restored.workspace.plan().unwrap(),
+            state.workspace.plan().unwrap()
+        );
+        assert_eq!(AppConfig::from_state(&restored), before);
+    }
     use crate::theme::ThemeMode;
 
     #[test]

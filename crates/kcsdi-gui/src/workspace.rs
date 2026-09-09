@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::Color32;
 use kcsdi_core::commands::{Cal, Lo};
-use kcsdi_core::device::{S11Params, SpecParams};
+use kcsdi_core::device::{S11Params, S21Params, SpecParams};
 use kcsdi_core::model::{FreqRange, Rbw};
 use kcsdi_core::validation::frequency_hz;
 
@@ -15,7 +15,7 @@ use crate::acquisition::{AcquisitionSettings, CompletedSweep, SweepPlan, TraceId
 use crate::analysis_tools::AnalysisTools;
 use crate::i18n::{Language, Text};
 use crate::preview::PreviewEnvelope;
-use crate::state::{AppMode, DEVICE_MODEL, S11Display};
+use crate::state::{AppMode, DEVICE_MODEL, S11Display, S21Display};
 use crate::widgets::plot::PlotView;
 use crate::widgets::smith::SmithView;
 
@@ -26,6 +26,7 @@ pub enum TraceDisplay {
     #[default]
     Spec,
     S11(S11Display),
+    S21(S21Display),
 }
 
 impl TraceDisplay {
@@ -33,6 +34,7 @@ impl TraceDisplay {
         match self {
             Self::Spec => AppMode::Spec,
             Self::S11(_) => AppMode::S11,
+            Self::S21(_) => AppMode::S21,
         }
     }
 
@@ -40,6 +42,7 @@ impl TraceDisplay {
         match self {
             Self::Spec => language.text(Text::Spectrum).to_owned(),
             Self::S11(display) => format!("S11 {}", display.label(language)),
+            Self::S21(display) => format!("S21 {}", display.label(language)),
         }
     }
 
@@ -51,6 +54,7 @@ impl TraceDisplay {
         match self {
             Self::Spec => (-100.0, 0.0),
             Self::S11(display) => display.default_y(),
+            Self::S21(display) => display.default_y(),
         }
     }
 
@@ -58,12 +62,13 @@ impl TraceDisplay {
         match self {
             Self::Spec => "dBm",
             Self::S11(display) => display.y_label(),
+            Self::S21(display) => display.y_label(),
         }
     }
 
     pub fn columns(self) -> &'static [usize] {
         match self {
-            Self::S11(S11Display::Phase) => &[1],
+            Self::S11(S11Display::Phase) | Self::S21(S21Display::Phase) => &[1],
             Self::S11(S11Display::Resistance) => &[1],
             Self::S11(S11Display::Reactance) => &[2],
             Self::S11(S11Display::Impedance) => &[0, 1, 2],
@@ -78,6 +83,9 @@ impl TraceDisplay {
             Self::Spec => data.mode == StreamMode::Spec && data.format.is_empty(),
             Self::S11(display) => {
                 data.mode == StreamMode::S11 && data.format == display.wire_format().as_str()
+            }
+            Self::S21(display) => {
+                data.mode == StreamMode::S21 && data.format == display.wire_format().as_str()
             }
         }
     }
@@ -129,6 +137,15 @@ impl TraceSettings {
             TraceDisplay::S11(display) => AcquisitionSettings::S11(S11Params {
                 cal: self.cal,
                 format: display.wire_format(),
+                points: range.points,
+                start_hz,
+                stop_hz,
+                rbw: Some(self.rbw),
+            }),
+            TraceDisplay::S21(display) => AcquisitionSettings::S21(S21Params {
+                cal: self.cal,
+                format: display.wire_format(),
+                lo: self.lo,
                 points: range.points,
                 start_hz,
                 stop_hz,
@@ -380,6 +397,7 @@ impl Workspace {
                 let next = match trace.settings.display.mode() {
                     AppMode::Spec => caps.spec.range,
                     AppMode::S11 => caps.s11.range,
+                    AppMode::S21 => caps.s21.range,
                 };
                 FreqRange::new(
                     range.min_hz.max(next.min_hz),
@@ -506,6 +524,57 @@ mod tests {
             trace.settings.visible = false;
         }
         assert!(workspace.plan().is_err());
+    }
+
+    #[test]
+    fn transmission_groups_include_mode_format_calibration_lo_and_bandwidth() {
+        let mut workspace = Workspace::empty(SweepRange::new(1e6, 2e6, 3));
+        let base = TraceSettings {
+            display: TraceDisplay::S21(S21Display::Phase),
+            ..Default::default()
+        };
+        let first = workspace.add_trace(base.clone()).unwrap();
+        let second = workspace.add_trace(base.clone()).unwrap();
+        for settings in [
+            TraceSettings {
+                display: TraceDisplay::S11(S11Display::Phase),
+                ..base.clone()
+            },
+            TraceSettings {
+                display: TraceDisplay::S21(S21Display::Loss),
+                ..base.clone()
+            },
+            TraceSettings {
+                display: TraceDisplay::S21(S21Display::Delay),
+                ..base.clone()
+            },
+            TraceSettings {
+                cal: Cal::CalSys,
+                ..base.clone()
+            },
+            TraceSettings {
+                lo: Lo::LowLo,
+                ..base.clone()
+            },
+            TraceSettings {
+                rbw: Rbw::R3k,
+                ..base.clone()
+            },
+        ] {
+            workspace.add_trace(settings).unwrap();
+        }
+        let plan = workspace.plan().unwrap();
+        assert_eq!(plan.groups.len(), 7);
+        assert_eq!(plan.groups[0].members, [first, second]);
+        assert!(
+            matches!(&plan.groups[0].settings, AcquisitionSettings::S21(params)
+            if params.format == kcsdi_core::commands::Format::Ma && params.rbw == Some(Rbw::R10k))
+        );
+        workspace.range = SweepRange::new(0.0, 1e6, 3);
+        assert!(workspace.plan().is_err());
+        workspace.traces[2].settings.visible = false;
+        assert_eq!(workspace.visible_range().min_hz, 0);
+        assert!(workspace.plan().is_ok());
     }
 
     #[test]

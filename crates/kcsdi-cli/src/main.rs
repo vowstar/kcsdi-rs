@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use kcsdi_core::commands::{Cal, Format, Lo};
 use kcsdi_core::data::SweepData;
-use kcsdi_core::device::{Device, S11Params, SpecParams};
+use kcsdi_core::device::{Device, S11Params, S21Params, SpecParams};
 use kcsdi_core::model::{Model, Rbw};
 use kcsdi_core::protocol::StreamMode;
 use kcsdi_core::transport::TcpTransport;
@@ -49,6 +49,8 @@ enum Command {
 enum SweepCommand {
     /// S11 reflection sweep (port 1)
     S11(S11Args),
+    /// S21 transmission sweep (KC901V, CSV output)
+    S21(S21Args),
     /// Spectrum analyzer sweep
     Spec(SpecArgs),
 }
@@ -128,6 +130,39 @@ struct SpecArgs {
     out: PathBuf,
 }
 
+#[derive(Args)]
+struct S21Args {
+    #[command(flatten)]
+    conn: ConnArgs,
+    /// Instrument model, used for range validation
+    #[arg(long, default_value = "kc901v")]
+    model: Model,
+    /// Instrument format: ri, ma, loss or delay (seconds)
+    #[arg(long, default_value = "loss")]
+    format: Format,
+    /// Start frequency in Hz
+    #[arg(long)]
+    start: u64,
+    /// Stop frequency in Hz
+    #[arg(long)]
+    stop: u64,
+    /// Returned samples including endpoints (KC901V: 3..1001)
+    #[arg(long)]
+    points: u32,
+    /// Calibration applied to the measurement
+    #[arg(long, default_value = "caloff")]
+    cal: Cal,
+    /// Sampling bandwidth. Omission retains the current device setting
+    #[arg(long)]
+    rbw: Option<Rbw>,
+    /// Local oscillator side
+    #[arg(long, default_value = "highlo")]
+    lo: Lo,
+    /// Output .csv file
+    #[arg(long)]
+    out: PathBuf,
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     match run(Cli::parse()) {
@@ -149,6 +184,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Export { format } => export::run(format),
         Command::Sweep { mode } => match mode {
             SweepCommand::S11(args) => sweep_s11(&args),
+            SweepCommand::S21(args) => sweep_s21(&args),
             SweepCommand::Spec(args) => sweep_spec(&args),
         },
     }
@@ -159,7 +195,11 @@ fn limits(model: Model) -> String {
 
     let caps = model.capabilities();
     let mut text = format!("Model: {model}\nFinite ascending sweeps, frequencies in Hz\n");
-    for (name, range) in [("S11", caps.s11.range), ("SPEC", caps.spec.range)] {
+    for (name, range) in [
+        ("S11", caps.s11.range),
+        ("S21", caps.s21.range),
+        ("SPEC", caps.spec.range),
+    ] {
         writeln!(
             text,
             "{name}: start {}..={}, stop {}..={}, minimum span {}",
@@ -187,6 +227,15 @@ fn limits(model: Model) -> String {
         .expect("writing a String cannot fail");
     writeln!(
         text,
+        "S21 calibration: {}",
+        choices(caps.s21_calibrations())
+    )
+    .expect("writing a String cannot fail");
+    writeln!(text, "S21 format: {}", choices(caps.s21_formats()))
+        .expect("writing a String cannot fail");
+    writeln!(text, "S21 LO: lowlo, highlo").expect("writing a String cannot fail");
+    writeln!(
+        text,
         "SPEC calibration: {}",
         choices(caps.spec_calibrations())
     )
@@ -199,7 +248,7 @@ fn limits(model: Model) -> String {
         caps.spec.ref_min_dbm, caps.spec.ref_max_dbm
     )
     .expect("writing a String cannot fail");
-    text.push_str("Command limits do not establish measurement accuracy. KC901V V1.6.1 is hardware-verified. Other models are table-based.\n");
+    text.push_str("Command limits do not establish measurement accuracy. KC901V V1.6.1 S11 and SPEC are hardware-verified. S21 limits are table-based and await hardware testing.\n");
     text
 }
 
@@ -252,7 +301,7 @@ fn sweep_s11(args: &S11Args) -> Result<(), Box<dyn Error>> {
         kcsdi_core::touchstone::Document::s1p(&data, args.touchstone.touchstone_version.into())?
             .save(&args.out, args.touchstone.overwrite)?;
     } else {
-        write_csv(&args.out, s11_headers(format), &data)?;
+        write_csv(&args.out, s_parameter_headers(format), &data)?;
     }
     println!(
         "{} points written to {}",
@@ -288,8 +337,39 @@ fn sweep_spec(args: &SpecArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// CSV header for an S11 sweep, per format column semantics (doc 4.2).
-fn s11_headers(format: Format) -> &'static [&'static str] {
+fn sweep_s21(args: &S21Args) -> Result<(), Box<dyn Error>> {
+    if !args
+        .out
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+    {
+        return Err("S21 sweep output must be .csv. S21 alone cannot form .s1p or .s2p".into());
+    }
+    let params = S21Params {
+        cal: args.cal,
+        format: args.format,
+        lo: args.lo,
+        points: args.points,
+        start_hz: args.start,
+        stop_hz: args.stop,
+        rbw: args.rbw,
+    };
+    params.validate(&args.model.capabilities())?;
+    let mut dev =
+        Device::<TcpTransport>::connect_with_model(&args.conn.host, args.conn.port, args.model)?;
+    let data = dev.sweep_s21(&params)?;
+    dev.close();
+    write_csv(&args.out, s_parameter_headers(args.format), &data)?;
+    println!(
+        "{} points written to {}",
+        data.points.len(),
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// CSV headers for device S-parameter formats (section 4.2).
+fn s_parameter_headers(format: Format) -> &'static [&'static str] {
     match format {
         Format::Ri => &["freq_hz", "real", "imag"],
         Format::Ma => &["freq_hz", "magnitude", "phase_deg"],
@@ -340,8 +420,12 @@ mod tests {
         assert!(text.is_ascii());
         assert!(text.contains("S11: start 5000..=6999999000, stop 6000..=7000000000"));
         assert!(text.contains("SPEC: start 0..=6999999000, stop 1000..=7000000000"));
+        assert!(text.contains("S21: start 0..=6999999000, stop 1000..=7000000000"));
         assert!(text.contains("Samples: 3..=1001"));
         assert!(text.contains("S11 calibration: calsys, caluser, caloff"));
+        assert!(text.contains("S21 calibration: calsys, caluser, caloff"));
+        assert!(text.contains("S21 format: ri, ma, loss, delay"));
+        assert!(text.contains("S21 limits are table-based"));
         assert!(text.contains("RBW: 1k, 3k, 10k, 30k"));
         assert!(!text.contains("100Hz"));
     }
@@ -356,6 +440,11 @@ mod tests {
             ("spec", vec!["--cal", "caluser"], "SPEC calibration caluser"),
             ("spec", vec!["--ref-level", "11"], "reference 11"),
             ("spec", vec!["--points", "1002"], "points 1002"),
+            ("s21", vec!["--cal", "calon"], "S21 calibration calon"),
+            ("s21", vec!["--format", "z"], "S21 format z"),
+            ("s21", vec!["--format", "vswr"], "S21 format vswr"),
+            ("s21", vec!["--rbw", "300Hz"], "RBW 300Hz"),
+            ("s21", vec!["--points", "2"], "points 2"),
         ] {
             let mut argv = vec![
                 "kcsdi",
@@ -380,6 +469,42 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn s21_preserves_data_units_and_rejects_touchstone_before_connection() {
+        assert_eq!(
+            s_parameter_headers(Format::Ma),
+            &["freq_hz", "magnitude", "phase_deg"]
+        );
+        assert_eq!(s_parameter_headers(Format::Loss), &["freq_hz", "loss_db"]);
+        assert_eq!(s_parameter_headers(Format::Delay), &["freq_hz", "delay_s"]);
+        for output in ["unused.s1p", "unused.S2P", "unused.txt"] {
+            let cli = Cli::try_parse_from([
+                "kcsdi",
+                "sweep",
+                "s21",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--start",
+                "0",
+                "--stop",
+                "1000",
+                "--points",
+                "3",
+                "--out",
+                output,
+            ])
+            .unwrap();
+            assert!(
+                run(cli)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("S21 sweep output must be .csv")
+            );
         }
     }
 
