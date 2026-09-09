@@ -53,8 +53,7 @@ pub fn device_worker(
                 Ok(data) => emit(WorkerEvent::SweepTrace(data)),
                 Err(e) => {
                     error!("sweep failed: {e}");
-                    job = None;
-                    emit(WorkerEvent::Error(format!("Sweep failed: {e}")));
+                    fail(e, "Sweep failed", &mut device, &mut job, &emit);
                 }
             }
             loop {
@@ -120,7 +119,7 @@ fn handle(
             if let Some(dev) = device.as_mut()
                 && let Err(e) = dev.stop_sweep()
             {
-                emit(WorkerEvent::Error(format!("Stop failed: {e}")));
+                fail(e, "Stop failed", device, job, emit);
             }
         }
         WorkerCommand::RefreshStatus => {
@@ -135,9 +134,153 @@ fn handle(
                             voltage,
                         });
                     }
-                    Err(e) => emit(WorkerEvent::Error(format!("Status query failed: {e}"))),
+                    Err(e) => fail(e, "Status query failed", device, job, emit),
                 }
             }
         }
+    }
+}
+
+fn fail<T: kcsdi_core::transport::Transport>(
+    error: kcsdi_core::Error,
+    context: &str,
+    device: &mut Option<Device<T>>,
+    job: &mut Option<SweepJob>,
+    emit: &dyn Fn(WorkerEvent),
+) {
+    *job = None;
+    let message = format!("{context}: {error}");
+    if connection_failed(&error) || device.as_ref().is_some_and(Device::requires_reconnect) {
+        if let Some(mut dev) = device.take() {
+            dev.close();
+        }
+        emit(WorkerEvent::ConnectionLost(message));
+    } else {
+        emit(WorkerEvent::Error(message));
+    }
+}
+
+fn connection_failed(error: &kcsdi_core::Error) -> bool {
+    matches!(
+        error,
+        kcsdi_core::Error::Io(_)
+            | kcsdi_core::Error::NotConnected
+            | kcsdi_core::Error::Timeout
+            | kcsdi_core::Error::Protocol(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kcsdi_core::Error;
+    use std::cell::RefCell;
+
+    #[test]
+    fn fatal_failures_clear_the_job_and_report_connection_loss() {
+        for error in [
+            Error::Timeout,
+            Error::NotConnected,
+            Error::Protocol("oversized packet".into()),
+            Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        ] {
+            let mut device: Option<Device<TcpTransport>> = None;
+            let mut job = Some(SweepJob::S11(
+                crate::state::S11State::default().s11_params().unwrap(),
+            ));
+            let events = RefCell::new(Vec::new());
+            fail(error, "Sweep failed", &mut device, &mut job, &|event| {
+                events.borrow_mut().push(event);
+            });
+            assert!(job.is_none());
+            assert!(matches!(events.borrow()[0], WorkerEvent::ConnectionLost(_)));
+        }
+    }
+
+    #[test]
+    fn device_error_packets_do_not_invalidate_the_connection() {
+        for error in [
+            Error::Device("err_par5".into()),
+            Error::InvalidParameter("invalid frequency".into()),
+            Error::DeviceBusy("front-panel dialog".into()),
+        ] {
+            assert!(!connection_failed(&error));
+        }
+    }
+
+    #[test]
+    fn a_failed_status_query_releases_an_existing_connection() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(socket)
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "$temp\n");
+        });
+        let mut device = Some(Device::new(
+            TcpTransport::connect("127.0.0.1", port).unwrap(),
+        ));
+        let mut job = Some(SweepJob::S11(
+            crate::state::S11State::default().s11_params().unwrap(),
+        ));
+        let events = RefCell::new(Vec::new());
+        handle(
+            WorkerCommand::RefreshStatus,
+            &mut device,
+            &mut job,
+            &|event| {
+                events.borrow_mut().push(event);
+            },
+        );
+        server.join().unwrap();
+        assert!(device.is_none());
+        assert!(job.is_none());
+        assert!(matches!(events.borrow()[0], WorkerEvent::ConnectionLost(_)));
+    }
+
+    #[test]
+    fn a_device_error_with_failed_cleanup_cannot_keep_a_reusable_session() {
+        struct CleanupFailure {
+            lines: std::collections::VecDeque<&'static str>,
+            sends: usize,
+        }
+        impl kcsdi_core::transport::Transport for CleanupFailure {
+            fn send(&mut self, _: &[u8]) -> kcsdi_core::Result<()> {
+                self.sends += 1;
+                if self.sends == 5 {
+                    Err(Error::NotConnected)
+                } else {
+                    Ok(())
+                }
+            }
+            fn recv_line(&mut self, _: std::time::Duration) -> kcsdi_core::Result<String> {
+                self.lines
+                    .pop_front()
+                    .map(str::to_string)
+                    .ok_or(Error::Timeout)
+            }
+        }
+        let mut device = Some(Device::new(CleanupFailure {
+            lines: ["$start,err_par5", "$invalid frequency", "$end"].into(),
+            sends: 0,
+        }));
+        let params = crate::state::S11State::default().s11_params().unwrap();
+        let error = device.as_mut().unwrap().sweep_s11(&params).unwrap_err();
+        assert!(matches!(&error, Error::Device(name) if name == "err_par5"));
+        let mut job = Some(SweepJob::S11(params));
+        let events = RefCell::new(Vec::new());
+        fail(error, "Sweep failed", &mut device, &mut job, &|event| {
+            events.borrow_mut().push(event);
+        });
+        assert!(device.is_none());
+        assert!(job.is_none());
+        assert!(matches!(events.borrow()[0], WorkerEvent::ConnectionLost(_)));
     }
 }

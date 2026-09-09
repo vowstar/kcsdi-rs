@@ -86,13 +86,13 @@ impl KcsdiApp {
                 self.state.send(crate::state::WorkerCommand::RefreshStatus);
             }
             WorkerEvent::Disconnected => {
-                self.state.connection = ConnectionState::Disconnected;
-                self.state.device_info = None;
-                self.state.temperature = None;
-                self.state.voltage = None;
-                self.state.spec.running = false;
-                self.state.s11.running = false;
+                self.clear_connection();
                 self.state.status_message = Some(StatusMessage::Text(Text::Disconnected));
+            }
+            WorkerEvent::ConnectionLost(message) => {
+                self.clear_connection();
+                self.state.connection = ConnectionState::Error(message.clone());
+                self.state.status_message = Some(message.into());
             }
             WorkerEvent::Error(msg) => {
                 if self.state.connection == ConnectionState::Connecting {
@@ -127,6 +127,15 @@ impl KcsdiApp {
                 self.state.voltage = Some(voltage);
             }
         }
+    }
+
+    fn clear_connection(&mut self) {
+        self.state.connection = ConnectionState::Disconnected;
+        self.state.device_info = None;
+        self.state.temperature = None;
+        self.state.voltage = None;
+        self.state.spec.running = false;
+        self.state.s11.running = false;
     }
     /// Save the config after a quiet period, so bursts of edits (dragging
     /// a frequency field) produce at most one write.
@@ -661,6 +670,36 @@ mod tests {
         }));
         assert!(app.state.status_message.is_none());
         assert!(app.state.s11.trace.is_some());
+    }
+
+    #[test]
+    fn connection_loss_clears_health_and_keeps_the_completed_export_snapshot() {
+        let mut state = crate::state::AppState {
+            connection: ConnectionState::Connected,
+            temperature: Some(42.0),
+            voltage: Some(kcsdi_core::data::Voltage {
+                external: 12.0,
+                battery: 8.0,
+            }),
+            ..Default::default()
+        };
+        state.s11.running = true;
+        state.s11.trace = Some(SweepData {
+            mode: StreamMode::S11,
+            format: "z".into(),
+            points: vec![],
+        });
+        let mut app = test_app(state);
+        app.apply_event(WorkerEvent::ConnectionLost(
+            "Sweep failed: connection reset".into(),
+        ));
+        assert!(matches!(app.state.connection, ConnectionState::Error(_)));
+        assert!(app.state.device_info.is_none());
+        assert!(app.state.temperature.is_none());
+        assert!(app.state.voltage.is_none());
+        assert!(!app.state.any_running());
+        assert!(app.state.s11.trace.is_some());
+        assert!(app.state.status_message.is_some());
     }
 
     #[test]

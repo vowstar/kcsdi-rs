@@ -44,8 +44,10 @@ pub enum WorkerCommand {
 pub enum WorkerEvent {
     /// Handshake done and identity read.
     Connected(DeviceInfo),
-    /// Connection closed (requested or lost).
+    /// Connection closed on request.
     Disconnected,
+    /// The connection cannot safely be reused after a transport failure.
+    ConnectionLost(String),
     /// Any worker-side failure, already formatted for display.
     Error(String),
     /// A completed sweep (SPEC or S11; see `SweepData::mode`).

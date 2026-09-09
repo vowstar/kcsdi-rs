@@ -148,7 +148,7 @@ mod tests {
         let mut p = PacketParser::new();
         let mut out = None;
         for line in lines {
-            if let Some(packet) = p.feed_line(line) {
+            if let Some(packet) = p.feed_line(line).unwrap() {
                 out = Some(packet);
             }
         }

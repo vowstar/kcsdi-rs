@@ -59,6 +59,7 @@ pub struct Device<T: Transport> {
     caps: Capabilities,
     active_mode: Option<StreamMode>,
     last_rbw: Option<Rbw>,
+    cleanup_failed: bool,
 }
 
 impl Device<TcpTransport> {
@@ -95,7 +96,14 @@ impl<T: Transport> Device<T> {
             caps: model.capabilities(),
             active_mode: None,
             last_rbw: None,
+            cleanup_failed: false,
         }
+    }
+
+    /// A failed cleanup requires reconnecting even when the original
+    /// operation returned a normally recoverable device error.
+    pub fn requires_reconnect(&self) -> bool {
+        self.cleanup_failed
     }
 
     /// Send `C` and wait for the identity reply. Returns the serial number.
@@ -111,7 +119,7 @@ impl<T: Transport> Device<T> {
                 self.remote = true;
                 return Ok(serial.trim().to_string());
             }
-            if let Some(packet) = self.packets.feed_line(&line) {
+            if let Some(packet) = self.packets.feed_line(&line)? {
                 match packet.name.as_str() {
                     "id" => {
                         self.remote = true;
@@ -226,7 +234,9 @@ impl<T: Transport> Device<T> {
         if result.is_err() {
             // Preserve the original failure, but force initialization on
             // retry even if stopping the broken connection also fails.
-            let _ = self.stop_sweep();
+            if self.stop_sweep().is_err() {
+                self.cleanup_failed = true;
+            }
             self.active_mode = None;
             self.last_rbw = None;
             self.packets = PacketParser::new();
@@ -252,6 +262,9 @@ impl<T: Transport> Device<T> {
     }
 
     fn prepare_mode(&mut self, mode: StreamMode) -> Result<()> {
+        if self.requires_reconnect() {
+            return Err(Error::NotConnected);
+        }
         if self.active_mode == Some(mode) {
             return Ok(());
         }
@@ -289,7 +302,7 @@ impl<T: Transport> Device<T> {
     fn expect_packet(&mut self, name: &str) -> Result<Packet> {
         loop {
             let line = self.transport.recv_line(GENERIC_TIMEOUT)?;
-            if let Some(packet) = self.packets.feed_line(&line) {
+            if let Some(packet) = self.packets.feed_line(&line)? {
                 if packet.is_error() {
                     return Err(Error::Device(packet.name));
                 }
@@ -317,13 +330,18 @@ impl<T: Transport> Device<T> {
             let line = self.transport.recv_line(remaining.min(GENERIC_TIMEOUT))?;
             // Feed the packet parser too, so err_* packets interleaved with
             // a stream are still caught.
-            if let Some(packet) = self.packets.feed_line(&line)
+            if let Some(packet) = self.packets.feed_line(&line)?
                 && packet.is_error()
             {
                 return Err(Error::Device(packet.name));
             }
             match self.streams.feed_line(&line) {
-                Some(StreamEvent::Start { mode: m, format: f }) if m == mode => format = f,
+                Some(StreamEvent::Start { mode: m, format: f }) if m == mode => {
+                    // A new frame replaces an incomplete one. Never combine
+                    // data from before and after parser resynchronization.
+                    points.clear();
+                    format = f;
+                }
                 Some(StreamEvent::Data {
                     mode: m, fields, ..
                 }) if m == mode => {
@@ -500,6 +518,36 @@ mod tests {
             MockTransport::with_lines(&["$start,err_cmd", "$error:Command input error!", "$end"]);
         let mut dev = Device::new(mock);
         assert!(matches!(dev.temperature(), Err(Error::Device(ref n)) if n == "err_cmd"));
+    }
+
+    #[test]
+    fn restarted_stream_does_not_include_incomplete_frame_points() {
+        let mock = MockTransport::with_lines(&[
+            "$start,s11,loss",
+            "$5000,999",
+            "$start,s11,loss",
+            "$1000000,1",
+            "$1500000,2",
+            "$2000000,3",
+            "$end",
+        ]);
+        let data = Device::new(mock).sweep_s11(&s11_params(3)).unwrap();
+        assert_eq!(data.points.len(), 3);
+        assert_eq!(data.points[0].freq_hz, 1_000_000.0);
+        assert_eq!(data.points[0].values, [1.0]);
+    }
+
+    #[test]
+    fn device_error_inside_an_incomplete_stream_is_reported() {
+        let mock = MockTransport::with_lines(&[
+            "$start,s11,loss",
+            "$1000000,1",
+            "$start,err_par5",
+            "$invalid frequency",
+            "$end",
+        ]);
+        let error = Device::new(mock).sweep_s11(&s11_params(3)).unwrap_err();
+        assert!(matches!(error, Error::Device(name) if name == "err_par5"));
     }
 
     #[test]
@@ -878,6 +926,7 @@ mod tests {
         );
         assert_eq!(dev.active_mode, None);
         assert_eq!(dev.last_rbw, None);
+        assert!(!dev.requires_reconnect());
         let before_retry = dev.transport.sent.len();
         dev.sweep_s11(&s11_params(3)).unwrap();
         assert_eq!(dev.active_mode, Some(StreamMode::S11));
@@ -926,6 +975,12 @@ mod tests {
         assert_eq!(dev.transport.send_calls, 5);
         assert_eq!(dev.active_mode, None);
         assert_eq!(dev.last_rbw, None);
+        assert!(dev.requires_reconnect());
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::NotConnected)
+        ));
+        assert_eq!(dev.transport.send_calls, 5);
     }
 
     #[test]
