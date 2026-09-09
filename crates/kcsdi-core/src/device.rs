@@ -16,7 +16,7 @@ use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64};
 use crate::error::{Error, Result};
 use crate::model::{self, Capabilities, Model, Rbw};
 use crate::protocol::{Packet, PacketParser, StreamEvent, StreamMode, StreamParser};
-use crate::transport::{GENERIC_TIMEOUT, TcpTransport, Transport};
+use crate::transport::{GENERIC_TIMEOUT, TcpTransport, Transport, remaining_timeout};
 
 /// Conservative mode-control pacing, exercised on KC901V V1.6.1.
 /// This is not a documented minimum delay for every command.
@@ -59,7 +59,7 @@ pub struct Device<T: Transport> {
     caps: Capabilities,
     active_mode: Option<StreamMode>,
     last_rbw: Option<Rbw>,
-    cleanup_failed: bool,
+    session_failed: bool,
 }
 
 impl Device<TcpTransport> {
@@ -96,14 +96,24 @@ impl<T: Transport> Device<T> {
             caps: model.capabilities(),
             active_mode: None,
             last_rbw: None,
-            cleanup_failed: false,
+            session_failed: false,
         }
     }
 
-    /// A failed cleanup requires reconnecting even when the original
-    /// operation returned a normally recoverable device error.
+    /// Transport, framing or cleanup failures require a fresh connection.
+    /// A stop write alone does not establish that buffered replies are drained.
     pub fn requires_reconnect(&self) -> bool {
-        self.cleanup_failed
+        self.session_failed
+    }
+
+    fn record_result<U>(&mut self, result: Result<U>) -> Result<U> {
+        if matches!(
+            &result,
+            Err(Error::Io(_) | Error::Protocol(_) | Error::Timeout | Error::NotConnected)
+        ) {
+            self.session_failed = true;
+        }
+        result
     }
 
     /// Send `C` and wait for the identity reply. Returns the serial number.
@@ -112,14 +122,25 @@ impl<T: Transport> Device<T> {
     /// `[KC901]<serial>` plain-text form (doc 1.4). A `ConFail` packet maps
     /// to [`Error::DeviceBusy`].
     pub fn handshake(&mut self) -> Result<String> {
+        if self.requires_reconnect() {
+            return Err(Error::NotConnected);
+        }
+        let result = self.handshake_with_timeout(GENERIC_TIMEOUT);
+        self.record_result(result)
+    }
+
+    fn handshake_with_timeout(&mut self, timeout: Duration) -> Result<String> {
+        let started = Instant::now();
         self.transport.send(commands::HANDSHAKE)?;
         loop {
-            let line = self.transport.recv_line(GENERIC_TIMEOUT)?;
+            let line = self.recv_before_timeout(started, timeout)?;
             if let Some(serial) = line.strip_prefix("[KC901]") {
                 self.remote = true;
                 return Ok(serial.trim().to_string());
             }
-            if let Some(packet) = self.packets.feed_line(&line)? {
+            let packet = self.packets.feed_line(&line)?;
+            remaining_timeout(started, timeout)?;
+            if let Some(packet) = packet {
                 match packet.name.as_str() {
                     "id" => {
                         self.remote = true;
@@ -146,26 +167,33 @@ impl<T: Transport> Device<T> {
 
     /// `$device` -> parsed identity information.
     pub fn device_info(&mut self) -> Result<DeviceInfo> {
-        self.transport.send(commands::DEVICE.as_bytes())?;
-        DeviceInfo::from_packet(&self.expect_packet("device")?)
+        let result = self
+            .query_packet(commands::DEVICE, "device", GENERIC_TIMEOUT)
+            .and_then(|packet| DeviceInfo::from_packet(&packet));
+        self.record_result(result)
     }
 
     /// `$temp` -> internal temperature in deg C.
     pub fn temperature(&mut self) -> Result<f64> {
-        self.transport.send(commands::TEMP.as_bytes())?;
-        let packet = self.expect_packet("temp")?;
-        let field = packet
-            .args
-            .first()
-            .and_then(|row| row.first())
-            .ok_or_else(|| Error::Protocol("temp packet: empty body".into()))?;
-        parse_f64(field)
+        let result = self
+            .query_packet(commands::TEMP, "temp", GENERIC_TIMEOUT)
+            .and_then(|packet| {
+                let field = packet
+                    .args
+                    .first()
+                    .and_then(|row| row.first())
+                    .ok_or_else(|| Error::Protocol("temp packet: empty body".into()))?;
+                parse_f64(field)
+            });
+        self.record_result(result)
     }
 
     /// `$voltage` -> external and battery voltages.
     pub fn voltage(&mut self) -> Result<Voltage> {
-        self.transport.send(commands::VOLTAGE.as_bytes())?;
-        Voltage::from_packet(&self.expect_packet("voltage")?)
+        let result = self
+            .query_packet(commands::VOLTAGE, "voltage", GENERIC_TIMEOUT)
+            .and_then(|packet| Voltage::from_packet(&packet));
+        self.record_result(result)
     }
 
     /// Run an S11 sweep: `stop` -> `init` -> optional `$bw` -> `run`, then
@@ -187,7 +215,12 @@ impl<T: Transport> Device<T> {
                 Some(params.stop_hz),
             );
             self.transport.send(run.as_bytes())?;
-            self.collect_stream(StreamMode::S11, self.sweep_timeout(params.points))
+            self.collect_stream(
+                StreamMode::S11,
+                Some(params.format),
+                params.points,
+                self.sweep_timeout(params.points),
+            )
         })();
         self.finish_sweep(result)
     }
@@ -212,7 +245,12 @@ impl<T: Transport> Device<T> {
                 None,
             );
             self.transport.send(run.as_bytes())?;
-            self.collect_stream(StreamMode::Spec, self.sweep_timeout(params.points))
+            self.collect_stream(
+                StreamMode::Spec,
+                None,
+                params.points,
+                self.sweep_timeout(params.points),
+            )
         })();
         self.finish_sweep(result)
     }
@@ -231,11 +269,12 @@ impl<T: Transport> Device<T> {
     }
 
     fn finish_sweep(&mut self, result: Result<SweepData>) -> Result<SweepData> {
+        let result = self.record_result(result);
         if result.is_err() {
-            // Preserve the original failure, but force initialization on
-            // retry even if stopping the broken connection also fails.
+            // Preserve the original failure. A fully framed device error can
+            // recover by reinitializing, but broken sessions need reconnecting.
             if self.stop_sweep().is_err() {
-                self.cleanup_failed = true;
+                self.session_failed = true;
             }
             self.active_mode = None;
             self.last_rbw = None;
@@ -254,7 +293,8 @@ impl<T: Transport> Device<T> {
                 StreamMode::Spec => commands::SPEC_STOP,
                 _ => unreachable!("only S11 and SPEC sessions are implemented"),
             };
-            self.transport.send(command.as_bytes())?;
+            let result = self.transport.send(command.as_bytes());
+            self.record_result(result)?;
             sleep(COMMAND_GAP);
             self.active_mode = None;
         }
@@ -297,12 +337,33 @@ impl<T: Transport> Device<T> {
         }
     }
 
-    /// Read lines until the packet `name` completes. `err_*` packets abort
-    /// with [`Error::Device`]; other packets are logged and skipped.
-    fn expect_packet(&mut self, name: &str) -> Result<Packet> {
+    fn recv_before_timeout(&mut self, started: Instant, timeout: Duration) -> Result<String> {
+        let remaining = remaining_timeout(started, timeout)?;
+        let line = self.transport.recv_line(remaining.min(GENERIC_TIMEOUT))?;
+        remaining_timeout(started, timeout)?;
+        Ok(line)
+    }
+
+    /// Sending and reading share one budget. Unrelated replies do not extend it.
+    fn query_packet(&mut self, command: &str, name: &str, timeout: Duration) -> Result<Packet> {
+        if self.requires_reconnect() {
+            return Err(Error::NotConnected);
+        }
+        let started = Instant::now();
+        let result = self
+            .transport
+            .send(command.as_bytes())
+            .and_then(|()| self.expect_packet(name, started, timeout));
+        self.record_result(result)
+    }
+
+    /// Read until the expected packet completes. Device errors abort the query.
+    fn expect_packet(&mut self, name: &str, started: Instant, timeout: Duration) -> Result<Packet> {
         loop {
-            let line = self.transport.recv_line(GENERIC_TIMEOUT)?;
-            if let Some(packet) = self.packets.feed_line(&line)? {
+            let line = self.recv_before_timeout(started, timeout)?;
+            let packet = self.packets.feed_line(&line)?;
+            remaining_timeout(started, timeout)?;
+            if let Some(packet) = packet {
                 if packet.is_error() {
                     return Err(Error::Device(packet.name));
                 }
@@ -314,41 +375,91 @@ impl<T: Transport> Device<T> {
         }
     }
 
-    /// Consume a measurement stream until `$end`, collecting data rows.
-    ///
-    /// The overall deadline is the sweep timeout formula (doc 8.2); each
-    /// individual read is capped at the generic 10 s timeout, re-armed
-    /// after every line, so long sweeps survive while data keeps flowing.
-    fn collect_stream(&mut self, mode: StreamMode, timeout: Duration) -> Result<SweepData> {
-        let deadline = Instant::now() + timeout;
-        let mut format = String::new();
-        let mut points = Vec::new();
+    /// Collect one complete frame with the requested schema and sample count.
+    /// Reported frequencies remain authoritative, including repeated rounded
+    /// values and endpoint overshoot (sections 4.2 and 12.4).
+    fn collect_stream(
+        &mut self,
+        mode: StreamMode,
+        format: Option<Format>,
+        expected_points: u32,
+        timeout: Duration,
+    ) -> Result<SweepData> {
+        let started = Instant::now();
+        let expected_format = format.map_or("", Format::as_str);
+        let expected_header = format.map_or_else(
+            || mode.name().to_string(),
+            |format| format!("{},{format}", mode.name()),
+        );
+        let value_columns = match format {
+            Some(Format::Ri | Format::Ma) => 2,
+            Some(Format::Z) => 3,
+            _ => 1,
+        };
+        let mut points: Vec<SweepPoint> = Vec::new();
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(Error::Timeout)?;
-            let line = self.transport.recv_line(remaining.min(GENERIC_TIMEOUT))?;
+            let line = self.recv_before_timeout(started, timeout)?;
             // Feed the packet parser too, so err_* packets interleaved with
             // a stream are still caught.
-            if let Some(packet) = self.packets.feed_line(&line)?
-                && packet.is_error()
-            {
-                return Err(Error::Device(packet.name));
+            let packet = self.packets.feed_line(&line)?;
+            remaining_timeout(started, timeout)?;
+            if let Some(packet) = &packet {
+                if packet.is_error() {
+                    return Err(Error::Device(packet.name.clone()));
+                }
+                let packet_mode = packet
+                    .name
+                    .split(',')
+                    .next()
+                    .and_then(StreamMode::from_name);
+                if packet_mode.is_some() && packet.name != expected_header {
+                    return Err(Error::Protocol(format!(
+                        "unexpected measurement header {}, expected {expected_header}",
+                        packet.name
+                    )));
+                }
             }
             match self.streams.feed_line(&line) {
-                Some(StreamEvent::Start { mode: m, format: f }) if m == mode => {
+                Some(StreamEvent::Start { mode: m, format: f }) => {
+                    if m != mode || f != expected_format {
+                        return Err(Error::Protocol(format!(
+                            "unexpected measurement stream {},{f}, expected {expected_header}",
+                            m.name()
+                        )));
+                    }
                     // A new frame replaces an incomplete one. Never combine
                     // data from before and after parser resynchronization.
                     points.clear();
-                    format = f;
                 }
                 Some(StreamEvent::Data {
                     mode: m, fields, ..
                 }) if m == mode => {
-                    let freq = parse_f64(fields.first().map_or("", String::as_str))?;
-                    let values = fields
-                        .get(1..)
-                        .unwrap_or(&[])
+                    if points.len() >= expected_points as usize {
+                        return Err(Error::Protocol(format!(
+                            "measurement exceeds the requested {expected_points} samples"
+                        )));
+                    }
+                    if fields.len() != value_columns + 1 {
+                        return Err(Error::Protocol(format!(
+                            "measurement row has {} fields, expected {}",
+                            fields.len(),
+                            value_columns + 1
+                        )));
+                    }
+                    let freq = parse_f64(&fields[0])?;
+                    if !freq.is_finite() || freq < 0.0 {
+                        return Err(Error::Protocol(
+                            "measurement frequency must be finite and nonnegative".into(),
+                        ));
+                    }
+                    if points.last().is_some_and(|point| freq < point.freq_hz) {
+                        return Err(Error::Protocol(
+                            "measurement frequencies must not decrease".into(),
+                        ));
+                    }
+                    // Measurement sentinels are format-dependent. Preserve
+                    // parsed values until their device semantics are verified.
+                    let values = fields[1..]
                         .iter()
                         .map(|f| parse_f64(f))
                         .collect::<Result<Vec<_>>>()?;
@@ -358,9 +469,20 @@ impl<T: Transport> Device<T> {
                     });
                 }
                 Some(StreamEvent::End { mode: m, .. }) if m == mode => {
+                    if points.len() != expected_points as usize {
+                        return Err(Error::Protocol(format!(
+                            "measurement returned {} samples, expected {expected_points}",
+                            points.len()
+                        )));
+                    }
+                    if !packet.is_some_and(|packet| packet.name == expected_header) {
+                        return Err(Error::Protocol(
+                            "measurement ended without a complete packet".into(),
+                        ));
+                    }
                     return Ok(SweepData {
                         mode,
-                        format,
+                        format: expected_format.to_string(),
                         points,
                     });
                 }
@@ -387,6 +509,9 @@ mod tests {
         sent: Vec<u8>,
         send_calls: usize,
         fail_send: Option<usize>,
+        send_delay: Duration,
+        read_delay: Duration,
+        read_timeouts: Vec<Duration>,
     }
 
     impl MockTransport {
@@ -396,6 +521,9 @@ mod tests {
                 sent: Vec::new(),
                 send_calls: 0,
                 fail_send: None,
+                send_delay: Duration::ZERO,
+                read_delay: Duration::ZERO,
+                read_timeouts: Vec::new(),
             }
         }
 
@@ -443,6 +571,9 @@ mod tests {
     impl Transport for MockTransport {
         fn send(&mut self, data: &[u8]) -> Result<()> {
             self.send_calls += 1;
+            if !self.send_delay.is_zero() {
+                sleep(self.send_delay);
+            }
             if self.fail_send == Some(self.send_calls) {
                 return Err(Error::NotConnected);
             }
@@ -450,7 +581,11 @@ mod tests {
             Ok(())
         }
 
-        fn recv_line(&mut self, _timeout: Duration) -> Result<String> {
+        fn recv_line(&mut self, timeout: Duration) -> Result<String> {
+            self.read_timeouts.push(timeout);
+            if !self.read_delay.is_zero() {
+                sleep(self.read_delay);
+            }
             self.incoming.pop_front().ok_or(Error::Timeout)
         }
     }
@@ -518,6 +653,257 @@ mod tests {
             MockTransport::with_lines(&["$start,err_cmd", "$error:Command input error!", "$end"]);
         let mut dev = Device::new(mock);
         assert!(matches!(dev.temperature(), Err(Error::Device(ref n)) if n == "err_cmd"));
+    }
+
+    #[test]
+    fn handshake_budget_is_not_reset_by_unrelated_lines() {
+        let mut mock = MockTransport::with_lines(&["noise"; 100]);
+        mock.read_delay = Duration::from_millis(3);
+        let mut dev = Device::new(mock);
+        let budget = Duration::from_millis(25);
+        assert!(matches!(
+            dev.handshake_with_timeout(budget),
+            Err(Error::Timeout)
+        ));
+        assert!(!dev.transport.incoming.is_empty());
+        assert!(
+            dev.transport
+                .read_timeouts
+                .windows(2)
+                .all(|pair| pair[1] < pair[0])
+        );
+        assert!(!dev.remote);
+    }
+
+    #[test]
+    fn query_budget_is_not_reset_by_unrelated_packets() {
+        let mut mock = MockTransport::with_lines(&[]);
+        for _ in 0..100 {
+            mock.incoming.extend(["$start,other".into(), "$end".into()]);
+        }
+        mock.read_delay = Duration::from_millis(3);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.query_packet(commands::TEMP, "temp", Duration::from_millis(25)),
+            Err(Error::Timeout)
+        ));
+        assert!(!dev.transport.incoming.is_empty());
+        assert!(
+            dev.transport
+                .read_timeouts
+                .windows(2)
+                .all(|pair| pair[1] < pair[0])
+        );
+    }
+
+    #[test]
+    fn query_and_handshake_budgets_include_send_time() {
+        for handshake in [false, true] {
+            let mut mock = MockTransport::with_lines(&["$start,temp", "$47.3", "$end"]);
+            mock.send_delay = Duration::from_millis(20);
+            let mut dev = Device::new(mock);
+            let budget = Duration::from_millis(5);
+            let result = if handshake {
+                dev.handshake_with_timeout(budget).map(|_| ())
+            } else {
+                dev.query_packet(commands::TEMP, "temp", budget).map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::Timeout)));
+            assert!(dev.transport.read_timeouts.is_empty());
+        }
+    }
+
+    #[test]
+    fn reply_arriving_after_budget_is_not_accepted() {
+        let mut mock = MockTransport::with_lines(&["[KC901]000000000001"]);
+        mock.read_delay = Duration::from_millis(20);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.handshake_with_timeout(Duration::from_millis(5)),
+            Err(Error::Timeout)
+        ));
+        assert!(!dev.remote);
+
+        let mut mock = MockTransport::with_lines(&["$end"]);
+        mock.read_delay = Duration::from_millis(20);
+        let mut dev = Device::new(mock);
+        dev.packets.feed_line("$start,temp").unwrap();
+        dev.packets.feed_line("$47.3").unwrap();
+        assert!(matches!(
+            dev.expect_packet("temp", Instant::now(), Duration::from_millis(5)),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
+    fn maximum_timeout_does_not_overflow_an_instant() {
+        assert!(remaining_timeout(Instant::now(), Duration::MAX).is_ok());
+        let mock = MockTransport::with_lines(&["$start,temp", "$47.3", "$end"]);
+        let mut dev = Device::new(mock);
+        let packet = dev
+            .query_packet(commands::TEMP, "temp", Duration::MAX)
+            .unwrap();
+        assert_eq!(packet.name, "temp");
+        assert!(
+            dev.transport
+                .read_timeouts
+                .iter()
+                .all(|&timeout| timeout == GENERIC_TIMEOUT)
+        );
+    }
+
+    fn collect_s11(lines: &[&str], format: Format, points: u32) -> Result<SweepData> {
+        Device::new(MockTransport::with_lines(lines)).collect_stream(
+            StreamMode::S11,
+            Some(format),
+            points,
+            GENERIC_TIMEOUT,
+        )
+    }
+
+    #[test]
+    fn complete_streams_require_the_requested_sample_count() {
+        for samples in [0, 1, 2, 4] {
+            let mut mock = MockTransport::with_lines(&[]);
+            mock.incoming.push_back("$start,s11,loss".into());
+            for index in 0..samples {
+                mock.incoming.push_back(format!("${},1", 5000 + index));
+            }
+            mock.incoming.push_back("$end".into());
+            let mut dev = Device::new(mock);
+            let result =
+                dev.collect_stream(StreamMode::S11, Some(Format::Loss), 3, GENERIC_TIMEOUT);
+            assert!(matches!(result, Err(Error::Protocol(_))), "{samples}");
+            if samples > 3 {
+                assert_eq!(dev.transport.incoming.front().unwrap(), "$end");
+            }
+        }
+    }
+
+    #[test]
+    fn streams_require_the_requested_mode_and_exact_format_header() {
+        for header in [
+            "$start,spec",
+            "$start,s21,loss",
+            "$start,s11,ma",
+            "$start,s11,loss,extra",
+        ] {
+            let result = collect_s11(
+                &[header, "$5000,1", "$6000,2", "$7000,3", "$end"],
+                Format::Loss,
+                3,
+            );
+            assert!(matches!(result, Err(Error::Protocol(_))), "{header}");
+        }
+        let mut dev = Device::new(MockTransport::with_lines(&[
+            "$start,spec,loss",
+            "$5000,-80",
+            "$6000,-81",
+            "$7000,-82",
+            "$end",
+        ]));
+        assert!(matches!(
+            dev.collect_stream(StreamMode::Spec, None, 3, GENERIC_TIMEOUT),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn every_s11_format_requires_its_exact_value_column_count() {
+        for (format, columns) in [
+            (Format::Ri, 2),
+            (Format::Ma, 2),
+            (Format::Vswr, 1),
+            (Format::Loss, 1),
+            (Format::Z, 3),
+        ] {
+            for actual in [columns - 1, columns, columns + 1] {
+                let header = format!("$start,s11,{format}");
+                let row = format!("$5000{}", ",1".repeat(actual));
+                let result = collect_s11(&[&header, &row, "$end"], format, 1);
+                assert_eq!(result.is_ok(), actual == columns, "{format}: {actual}");
+            }
+        }
+        for row in ["$5000", "$5000,-80,-81"] {
+            let mock = MockTransport::with_lines(&["$start,spec", row, "$end"]);
+            assert!(matches!(
+                Device::new(mock).collect_stream(StreamMode::Spec, None, 1, GENERIC_TIMEOUT),
+                Err(Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_reported_frequencies_are_rejected() {
+        for frequency in ["NaN", "inf", "-inf", "-1", "not-a-number"] {
+            let row = format!("${frequency},1");
+            assert!(matches!(
+                collect_s11(&["$start,s11,loss", &row, "$end"], Format::Loss, 1),
+                Err(Error::Protocol(_))
+            ));
+        }
+        assert!(matches!(
+            collect_s11(
+                &["$start,s11,loss", "$6000,1", "$5000,2", "$end"],
+                Format::Loss,
+                2,
+            ),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn reported_frequency_rounding_and_measurement_sentinels_are_preserved() {
+        // Repeated frequencies and nonfinite values are synthetic cases, not
+        // an assertion about the firmware's precision or sentinel conventions.
+        let data = collect_s11(
+            &[
+                "$start,s11,loss",
+                "$6999999200,NaN",
+                "$6999999200,inf",
+                "$7000000200,-inf",
+                "$end",
+            ],
+            Format::Loss,
+            3,
+        )
+        .unwrap();
+        assert_eq!(data.points[0].freq_hz, 6_999_999_200.0);
+        assert_eq!(data.points[1].freq_hz, 6_999_999_200.0);
+        assert_eq!(data.points[2].freq_hz, 7_000_000_200.0);
+        assert!(data.points[0].values[0].is_nan());
+        assert_eq!(data.points[1].values[0], f64::INFINITY);
+        assert_eq!(data.points[2].values[0], f64::NEG_INFINITY);
+        let mock = MockTransport::with_lines(&["$start,spec", "$0,-80", "$end"]);
+        assert_eq!(
+            Device::new(mock)
+                .collect_stream(StreamMode::Spec, None, 1, GENERIC_TIMEOUT)
+                .unwrap()
+                .points[0]
+                .freq_hz,
+            0.0
+        );
+    }
+
+    #[test]
+    fn missing_stream_end_and_unrelated_lines_cannot_extend_the_budget() {
+        let mut mock = MockTransport::with_lines(&["noise"; 100]);
+        mock.read_delay = Duration::from_millis(3);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.collect_stream(
+                StreamMode::S11,
+                Some(Format::Loss),
+                3,
+                Duration::from_millis(25),
+            ),
+            Err(Error::Timeout)
+        ));
+        assert!(!dev.transport.incoming.is_empty());
+        assert!(matches!(
+            collect_s11(&["$start,s11,loss", "$5000,1"], Format::Loss, 1),
+            Err(Error::Timeout)
+        ));
     }
 
     #[test]
@@ -848,6 +1234,22 @@ mod tests {
     }
 
     #[test]
+    fn direct_stop_failure_retires_the_session() {
+        let mut dev = Device::new(MockTransport::with_lines(&[]));
+        dev.active_mode = Some(StreamMode::S11);
+        dev.transport.fail_send = Some(1);
+        assert!(matches!(dev.stop_sweep(), Err(Error::NotConnected)));
+        assert!(dev.requires_reconnect());
+        assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::NotConnected)
+        ));
+        assert!(!dev.transport.sent_text().contains("$temp"));
+        assert!(!dev.transport.sent_text().contains(",run,"));
+    }
+
+    #[test]
     fn close_stops_active_mode_before_returning_local() {
         for mode in [StreamMode::S11, StreamMode::Spec] {
             let mut mock = MockTransport::with_lines(&["[KC901]002015123456"]);
@@ -936,8 +1338,8 @@ mod tests {
     }
 
     #[test]
-    fn setup_and_run_send_failures_clear_state_before_retry() {
-        // Initial stops, init, bandwidth and run must all recover safely.
+    fn setup_and_run_send_failures_require_a_fresh_connection() {
+        // A send failure can leave an unknown amount of a command on the wire.
         for failed_send in 1..=5 {
             let mut mock = MockTransport::with_lines(&[]);
             mock.fail_send = Some(failed_send);
@@ -950,12 +1352,76 @@ mod tests {
             assert!(matches!(dev.sweep_s11(&params), Err(Error::NotConnected)));
             assert_eq!(dev.active_mode, None);
             assert_eq!(dev.last_rbw, None);
+            assert!(dev.requires_reconnect());
             let before_retry = dev.transport.sent.len();
-            dev.sweep_s11(&params).unwrap();
-            assert!(
-                dev.transport.sent[before_retry..]
-                    .starts_with(b"$s11,stop\n$spec,stop\n$s11,init\n")
-            );
+            assert!(matches!(dev.sweep_s11(&params), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent.len(), before_retry);
+        }
+    }
+
+    #[test]
+    fn rejected_frame_cannot_leak_into_another_request() {
+        let mut mock = MockTransport::with_lines(&[
+            "$start,s11,ma",
+            "$1000000,1,2",
+            "$1500000,3,4",
+            "$2000000,5,6",
+            "$end",
+        ]);
+        mock.queue_sweep(StreamMode::S11, 3);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::Protocol(_))
+        ));
+        assert!(dev.requires_reconnect());
+        let sent = dev.transport.sent.clone();
+        let remaining = dev.transport.incoming.clone();
+        assert!(!remaining.is_empty());
+        assert!(matches!(
+            dev.sweep_s11(&s11_params(3)),
+            Err(Error::NotConnected)
+        ));
+        assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+        assert_eq!(dev.transport.sent, sent);
+        assert_eq!(dev.transport.incoming, remaining);
+    }
+
+    #[test]
+    fn timed_out_query_cannot_consume_a_late_reply_on_retry() {
+        let mut mock = MockTransport::with_lines(&["$start,temp", "$47.3", "$end"]);
+        mock.read_delay = Duration::from_millis(20);
+        let mut dev = Device::new(mock);
+        assert!(matches!(
+            dev.query_packet(commands::TEMP, "temp", Duration::from_millis(5)),
+            Err(Error::Timeout)
+        ));
+        assert!(dev.requires_reconnect());
+        let remaining = dev.transport.incoming.clone();
+        let sent = dev.transport.sent.clone();
+        assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+        assert!(matches!(dev.handshake(), Err(Error::NotConnected)));
+        assert_eq!(dev.transport.incoming, remaining);
+        assert_eq!(dev.transport.sent, sent);
+    }
+
+    #[test]
+    fn malformed_query_fields_require_a_fresh_connection() {
+        for name in ["device", "temp", "voltage"] {
+            let header = format!("$start,{name}");
+            let mock = MockTransport::with_lines(&[&header, "$invalid", "$end"]);
+            let mut dev = Device::new(mock);
+            let result = match name {
+                "device" => dev.device_info().map(|_| ()),
+                "temp" => dev.temperature().map(|_| ()),
+                "voltage" => dev.voltage().map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Err(Error::Protocol(_))), "{name}");
+            assert!(dev.requires_reconnect(), "{name}");
+            let sent = dev.transport.sent.clone();
+            assert!(matches!(dev.temperature(), Err(Error::NotConnected)));
+            assert_eq!(dev.transport.sent, sent);
         }
     }
 

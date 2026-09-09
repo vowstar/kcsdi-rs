@@ -132,7 +132,7 @@ impl Transport for TcpTransport {
     }
 }
 
-fn remaining_timeout(started: Instant, timeout: Duration) -> Result<Duration> {
+pub(crate) fn remaining_timeout(started: Instant, timeout: Duration) -> Result<Duration> {
     timeout
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
@@ -406,16 +406,36 @@ mod tests {
 
     #[test]
     fn stalled_command_write_invalidates_the_stream() {
-        let bytes = vec![b'x'; 32 * 1024 * 1024];
+        let bytes = vec![b'x'; 1024 * 1024];
         let (release, wait) = std::sync::mpsc::channel();
-        let (port, server) = spawn_server(move |_sock| {
+        let (ready, started) = std::sync::mpsc::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&listener)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let socket = socket2::SockRef::from(&sock);
+            socket.set_recv_buffer_size(4096).unwrap();
+            ready.send(socket.recv_buffer_size().unwrap()).unwrap();
             let _ = wait.recv_timeout(Duration::from_secs(10));
         });
         let mut t = TcpTransport::connect("127.0.0.1", port).unwrap();
+        let socket = socket2::SockRef::from(&t.stream);
+        socket.set_send_buffer_size(4096).unwrap();
+        let send_buffer = socket.send_buffer_size().unwrap();
+        let receive_buffer = started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let began = Instant::now();
         let result = t.send_with_timeout(&bytes, Duration::from_millis(100));
-        release.send(()).unwrap();
+        let elapsed = began.elapsed();
+        let _ = release.send(());
         server.join().unwrap();
-        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(
+            matches!(result, Err(Error::Timeout)),
+            "{result:?}, send buffer {send_buffer}, receive buffer {receive_buffer}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         assert!(matches!(t.send(b"C"), Err(Error::NotConnected)));
         assert!(matches!(
             t.recv_line(Duration::ZERO),

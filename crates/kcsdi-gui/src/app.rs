@@ -103,6 +103,9 @@ impl KcsdiApp {
                 self.state.status_message = Some(msg.into());
             }
             WorkerEvent::SweepTrace(data) => {
+                if !self.accepts_trace(&data) {
+                    return;
+                }
                 use kcsdi_core::protocol::StreamMode;
                 match data.mode {
                     StreamMode::Spec => {
@@ -126,6 +129,28 @@ impl KcsdiApp {
                 self.state.temperature = Some(temperature);
                 self.state.voltage = Some(voltage);
             }
+        }
+    }
+
+    /// Check the active display before changing completed snapshots.
+    fn accepts_trace(&self, data: &kcsdi_core::data::SweepData) -> bool {
+        use kcsdi_core::protocol::StreamMode;
+
+        if self.state.connection != ConnectionState::Connected {
+            return false;
+        }
+        match (self.state.mode, data.mode) {
+            (AppMode::Spec, StreamMode::Spec) => {
+                self.state.spec.running
+                    && data.format.is_empty()
+                    && data.points.len() == self.state.spec.points as usize
+            }
+            (AppMode::S11, StreamMode::S11) => {
+                self.state.s11.running
+                    && data.format == self.state.s11.display.wire_format().as_str()
+                    && data.points.len() == self.state.s11.points as usize
+            }
+            _ => false,
         }
     }
 
@@ -659,17 +684,125 @@ mod tests {
     #[test]
     fn completed_measurement_clears_the_request_to_run_again() {
         let state = crate::state::AppState {
+            connection: ConnectionState::Connected,
+            mode: AppMode::S11,
+            s11: crate::state::S11State {
+                display: S11Display::Impedance,
+                running: true,
+                points: 3,
+                ..Default::default()
+            },
             status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
             ..Default::default()
         };
         let mut app = test_app(state);
-        app.apply_event(WorkerEvent::SweepTrace(SweepData {
-            mode: StreamMode::S11,
-            format: "z".into(),
-            points: vec![],
-        }));
+        app.apply_event(WorkerEvent::SweepTrace(completed_impedance()));
         assert!(app.state.status_message.is_none());
         assert!(app.state.s11.trace.is_some());
+    }
+
+    fn completed_impedance() -> SweepData {
+        SweepData {
+            mode: StreamMode::S11,
+            format: "z".into(),
+            points: (0..3)
+                .map(|index| SweepPoint {
+                    freq_hz: 1_000_000.0 + f64::from(index) * 1_000_000.0,
+                    values: vec![50.0, 50.0, 0.0],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn obsolete_sweeps_leave_the_completed_snapshot_and_status_unchanged() {
+        for case in 0..6 {
+            let state = crate::state::AppState {
+                connection: ConnectionState::Connected,
+                mode: AppMode::S11,
+                s11: crate::state::S11State {
+                    display: S11Display::Smith,
+                    points: 3,
+                    running: true,
+                    trace: Some(completed_impedance()),
+                    needs_fit: false,
+                    ..Default::default()
+                },
+                status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
+                ..Default::default()
+            };
+            let mut app = test_app(state);
+            let mut late = completed_impedance();
+            late.points[0].values[0] = 123.0;
+            match case {
+                0 => app.state.connection = ConnectionState::Disconnected,
+                1 => app.state.s11.running = false,
+                2 => app.state.mode = AppMode::Spec,
+                3 => app.state.s11.display = S11Display::Phase,
+                4 => app.state.s11.points = 201,
+                5 => late.mode = StreamMode::Spec,
+                _ => unreachable!(),
+            }
+            app.apply_event(WorkerEvent::SweepTrace(late));
+            assert_eq!(
+                app.state.s11.trace.as_ref().unwrap().points[0].values[0],
+                50.0,
+                "case {case}"
+            );
+            assert!(!app.state.s11.needs_fit, "case {case}");
+            assert!(matches!(
+                app.state.status_message,
+                Some(StatusMessage::Text(Text::RunForDisplay))
+            ));
+            assert!(app.state.spec.trace.is_none());
+        }
+    }
+
+    #[test]
+    fn smith_and_impedance_accept_the_same_completed_wire_format() {
+        for display in [S11Display::Smith, S11Display::Impedance] {
+            let state = crate::state::AppState {
+                connection: ConnectionState::Connected,
+                mode: AppMode::S11,
+                s11: crate::state::S11State {
+                    display,
+                    points: 3,
+                    running: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut app = test_app(state);
+            app.apply_event(WorkerEvent::SweepTrace(completed_impedance()));
+            assert_eq!(app.state.s11.trace.as_ref().unwrap().points.len(), 3);
+        }
+    }
+
+    #[test]
+    fn spectrum_accepts_only_active_count_and_wire_format() {
+        let state = crate::state::AppState {
+            connection: ConnectionState::Connected,
+            spec: crate::state::SpecState {
+                points: 3,
+                running: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = test_app(state);
+        let mut trace = completed_impedance();
+        trace.mode = StreamMode::Spec;
+        trace.format.clear();
+        for point in &mut trace.points {
+            point.values = vec![-20.0];
+        }
+        app.apply_event(WorkerEvent::SweepTrace(trace.clone()));
+        assert!(app.state.spec.trace.is_some());
+        trace.format = "loss".into();
+        assert!(!app.accepts_trace(&trace));
+        trace.format.clear();
+        trace.points.pop();
+        assert!(!app.accepts_trace(&trace));
     }
 
     #[test]
