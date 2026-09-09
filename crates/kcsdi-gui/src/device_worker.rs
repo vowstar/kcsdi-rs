@@ -17,12 +17,23 @@ use kcsdi_core::data::SweepData;
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
-use crate::acquisition::{AcquisitionSettings, CompletedSweep, SweepDelivery, SweepPlan};
+use crate::acquisition::{AcquisitionSettings, CompletedSweep, SweepDelivery, SweepPlan, TraceId};
 use crate::preview::{PreviewEnvelope, PreviewMailbox};
+use crate::recording::{RecordKey, RecordResult, RecordWriter};
+use crate::run_settings::RunProgress;
+use crate::spreadsheet::FrozenSnapshots;
 use crate::state::{CommandEnvelope, DEVICE_MODEL, EventEnvelope, WorkerCommand, WorkerEvent};
 
 pub const EVENT_CAPACITY: usize = 16;
 const STATUS_COMMAND_GAP: Duration = Duration::from_millis(100);
+const WORKER_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPhase {
+    Acquiring,
+    Saving,
+    Waiting { until: Instant },
+}
 
 #[derive(Debug, Clone)]
 struct SweepRequest {
@@ -30,6 +41,163 @@ struct SweepRequest {
     cancel: CancellationToken,
     plan: SweepPlan,
     next_group: usize,
+    pass_id: u64,
+    pass: Vec<(TraceId, Arc<CompletedSweep>)>,
+    phase: RunPhase,
+}
+
+impl SweepRequest {
+    fn new(request_id: u64, cancel: CancellationToken, plan: SweepPlan) -> Self {
+        Self {
+            request_id,
+            cancel,
+            plan,
+            next_group: 0,
+            pass_id: 1,
+            pass: Vec::new(),
+            phase: RunPhase::Acquiring,
+        }
+    }
+
+    fn finish_pass(&mut self, now: Instant) -> Result<RunProgress, String> {
+        self.pass_id = self
+            .pass_id
+            .checked_add(1)
+            .ok_or("recording pass ID exhausted")?;
+        let interval = self.plan.run.interval();
+        if interval.is_zero() {
+            self.phase = RunPhase::Acquiring;
+            Ok(RunProgress::Acquiring)
+        } else {
+            let until = now
+                .checked_add(interval)
+                .ok_or("run interval exceeds the host clock range")?;
+            self.phase = RunPhase::Waiting { until };
+            Ok(RunProgress::Waiting { until })
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingState {
+    writer: Option<RecordWriter>,
+    pending: Option<RecordKey>,
+}
+
+impl RecordingState {
+    fn finish_pass(
+        &mut self,
+        session_id: u64,
+        job: &mut SweepRequest,
+    ) -> Result<RunProgress, String> {
+        if !job.plan.run.recording.enabled {
+            return job.finish_pass(Instant::now());
+        }
+        if self.pending.is_some() {
+            return Err("a previous recording task is still pending".into());
+        }
+        let snapshots = FrozenSnapshots::new(std::mem::take(&mut job.pass))?;
+        let key = RecordKey {
+            session_id,
+            request_id: job.request_id,
+            pass_id: job.pass_id,
+        };
+        if self.writer.is_none() {
+            self.writer = Some(RecordWriter::new()?);
+        }
+        self.writer.as_mut().expect("created above").try_save(
+            key,
+            job.plan.run.recording.clone(),
+            snapshots,
+            job.cancel.clone(),
+        )?;
+        self.pending = Some(key);
+        job.phase = RunPhase::Saving;
+        Ok(RunProgress::Saving)
+    }
+
+    fn poll(
+        &mut self,
+        identity: WorkerIdentity,
+        job: &mut Option<SweepRequest>,
+        emit: &dyn Fn(EventEnvelope),
+    ) -> bool {
+        if let Some(result) = self.writer.as_mut().and_then(RecordWriter::poll) {
+            self.accept_result(result, identity, job, Instant::now(), emit);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn accept_result(
+        &mut self,
+        result: RecordResult,
+        identity: WorkerIdentity,
+        job: &mut Option<SweepRequest>,
+        now: Instant,
+        emit: &dyn Fn(EventEnvelope),
+    ) {
+        if self.pending != Some(result.key) {
+            return;
+        }
+        self.pending = None;
+        let Some(current) = job.as_mut() else { return };
+        if current.cancel.is_cancelled()
+            || identity.session_id != result.key.session_id
+            || current.request_id != result.key.request_id
+            || current.pass_id != result.key.pass_id
+            || current.phase != RunPhase::Saving
+        {
+            return;
+        }
+        let source = WorkerIdentity {
+            session_id: result.key.session_id,
+            request_id: result.key.request_id,
+        };
+        let result = match result.result {
+            Ok(Some(path)) => {
+                emit(source.event(WorkerEvent::RunProgress(RunProgress::Saved {
+                    path,
+                    pass_id: result.key.pass_id,
+                })));
+                current.finish_pass(now)
+            }
+            Ok(None) => {
+                discard_job(job);
+                return;
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(progress) => emit(source.event(WorkerEvent::RunProgress(progress))),
+            Err(error) => recording_failed(error, job, &|event| emit(source.event(event))),
+        }
+    }
+}
+
+fn discard_job(job: &mut Option<SweepRequest>) {
+    if let Some(job) = job.take() {
+        job.cancel.cancel();
+    }
+}
+
+fn recording_failed(error: String, job: &mut Option<SweepRequest>, emit: &dyn Fn(WorkerEvent)) {
+    discard_job(job);
+    emit(WorkerEvent::Error(format!("Recording failed: {error}")));
+}
+
+fn advance_wait(job: &mut SweepRequest, writer_pending: bool, now: Instant) -> Option<RunProgress> {
+    if writer_pending {
+        return None;
+    }
+    match job.phase {
+        RunPhase::Saving => {}
+        RunPhase::Waiting { until } if now >= until => {}
+        _ => return None,
+    }
+    job.phase = RunPhase::Acquiring;
+    Some(RunProgress::Acquiring)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -57,6 +225,24 @@ pub fn device_worker(
     shutdown: CancellationToken,
     preview: PreviewMailbox,
 ) {
+    run_worker(
+        cmd_rx,
+        evt_tx,
+        ctx,
+        shutdown,
+        preview,
+        RecordingState::default(),
+    );
+}
+
+fn run_worker(
+    cmd_rx: mpsc::Receiver<CommandEnvelope>,
+    evt_tx: mpsc::SyncSender<EventEnvelope>,
+    ctx: egui::Context,
+    shutdown: CancellationToken,
+    preview: PreviewMailbox,
+    mut recording: RecordingState,
+) {
     let mut device: Option<Device<TcpTransport>> = None;
     let mut job: Option<SweepRequest> = None;
     let mut identity = WorkerIdentity::default();
@@ -71,22 +257,30 @@ pub fn device_worker(
         if shutdown.is_cancelled() {
             break;
         }
-        if device.is_none() || job.is_none() {
-            match cmd_rx.recv() {
+        if device.is_none()
+            || job
+                .as_ref()
+                .is_none_or(|job| job.phase != RunPhase::Acquiring)
+            || recording.pending.is_some()
+        {
+            match cmd_rx.recv_timeout(WORKER_POLL) {
                 Ok(cmd) => {
                     if shutdown.is_cancelled() || matches!(cmd.command, WorkerCommand::Shutdown) {
                         break;
                     }
+                    let cancel = cmd.cancel.clone();
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
                         &mut identity,
                         &mut device,
                         &mut job,
-                        &emit,
+                        recording.pending.is_some(),
+                        &|event| send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx),
                     );
                 }
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Control commands take precedence over health queries and the next group.
@@ -99,13 +293,15 @@ pub fn device_worker(
                     if matches!(cmd.command, WorkerCommand::Shutdown) {
                         break 'worker;
                     }
+                    let cancel = cmd.cancel.clone();
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
                         &mut identity,
                         &mut device,
                         &mut job,
-                        &emit,
+                        recording.pending.is_some(),
+                        &|event| send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -121,11 +317,50 @@ pub fn device_worker(
         if shutdown.is_cancelled() {
             break;
         }
+        let cancel = job
+            .as_ref()
+            .map(|job| job.cancel.clone())
+            .unwrap_or_default();
+        if recording.poll(identity, &mut job, &|event| {
+            send_request_event(&evt_tx, event, &shutdown, &cancel, &ctx);
+        }) {
+            // A progress event may have waited for UI capacity. Recheck queued
+            // control and health commands before starting another acquisition.
+            continue;
+        }
+        if job.as_ref().is_some_and(|job| job.cancel.is_cancelled()) {
+            discard_job(&mut job);
+        }
+        if let Some(job) = job.as_mut()
+            && let Some(progress) = advance_wait(job, recording.pending.is_some(), Instant::now())
+        {
+            let source = WorkerIdentity {
+                session_id: identity.session_id,
+                request_id: job.request_id,
+            };
+            send_event(
+                &evt_tx,
+                source.event(WorkerEvent::RunProgress(progress)),
+                &shutdown,
+                Some(&job.cancel),
+                &ctx,
+            );
+        }
+        if recording.pending.is_some()
+            || job
+                .as_ref()
+                .is_some_and(|job| job.phase != RunPhase::Acquiring)
+        {
+            continue;
+        }
+        if shutdown.is_cancelled() {
+            break;
+        }
         if device.is_some() && job.is_some() {
             // A stream is owned exclusively until its complete frame or cleanup.
             let current = job.clone().expect("checked above");
             if current.cancel.is_cancelled() {
-                job = None;
+                discard_job(&mut job);
                 continue;
             }
             let group = &current.plan.groups[current.next_group];
@@ -175,19 +410,45 @@ pub fn device_worker(
             };
             match result {
                 Ok(data) => {
+                    let snapshot = Arc::new(CompletedSweep {
+                        data,
+                        settings: group.settings.clone(),
+                        session_id: source.session_id,
+                        completed_at: SystemTime::now(),
+                    });
                     let mut event = source.event(WorkerEvent::SweepTrace(SweepDelivery {
                         members: group.members.clone(),
-                        snapshot: Arc::new(CompletedSweep {
-                            data,
-                            settings: group.settings.clone(),
-                            session_id: source.session_id,
-                            completed_at: SystemTime::now(),
-                        }),
+                        snapshot: snapshot.clone(),
                     }));
                     event.cycle_id = Some(cycle_id);
                     send_event(&evt_tx, event, &shutdown, Some(&current.cancel), &ctx);
-                    if let Some(job) = job.as_mut() {
-                        job.next_group = (current.next_group + 1) % current.plan.groups.len();
+                    if current.cancel.is_cancelled() || shutdown.is_cancelled() {
+                        discard_job(&mut job);
+                        continue;
+                    }
+                    if let Some(active) = job.as_mut() {
+                        if active.plan.run.recording.enabled {
+                            active
+                                .pass
+                                .extend(group.members.iter().map(|id| (*id, snapshot.clone())));
+                        }
+                        active.next_group = (current.next_group + 1) % current.plan.groups.len();
+                        if active.next_group == 0 {
+                            match recording.finish_pass(source.session_id, active) {
+                                Ok(progress) => {
+                                    if active.phase != current.phase {
+                                        send_event(
+                                            &evt_tx,
+                                            source.event(WorkerEvent::RunProgress(progress)),
+                                            &shutdown,
+                                            Some(&current.cancel),
+                                            &ctx,
+                                        );
+                                    }
+                                }
+                                Err(error) => recording_failed(error, &mut job, &emit_result),
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -200,9 +461,13 @@ pub fn device_worker(
         }
     }
     shutdown.cancel();
+    discard_job(&mut job);
     if let Some(mut dev) = device.take() {
         dev.close();
     }
+    // A filesystem call may be uninterruptible. Release remote control before
+    // the writer joins, regardless of how long that final file operation takes.
+    drop(recording);
 }
 
 fn measure_list<T: kcsdi_core::transport::Transport>(
@@ -254,6 +519,7 @@ fn handle_or_defer(
     identity: &mut WorkerIdentity,
     device: &mut Option<Device<TcpTransport>>,
     job: &mut Option<SweepRequest>,
+    writer_pending: bool,
     emit: &dyn Fn(EventEnvelope),
 ) {
     if matches!(envelope.command, WorkerCommand::RefreshStatus) {
@@ -261,7 +527,7 @@ fn handle_or_defer(
             *pending_status = Some(envelope);
         }
     } else {
-        handle(envelope, identity, device, job, emit);
+        handle_with_recording(envelope, identity, device, job, writer_pending, emit);
         if pending_status
             .as_ref()
             .is_some_and(|status| status.session_id != identity.session_id)
@@ -302,12 +568,36 @@ fn send_event(
     }
 }
 
+fn send_request_event(
+    sender: &mpsc::SyncSender<EventEnvelope>,
+    event: EventEnvelope,
+    shutdown: &CancellationToken,
+    cancel: &CancellationToken,
+    ctx: &egui::Context,
+) {
+    let obsolete = matches!(event.event, WorkerEvent::RunProgress(_)).then_some(cancel);
+    // Progress becomes obsolete on Stop. A terminal error remains deliverable
+    // after discarding the failed job has cancelled its acquisition token.
+    send_event(sender, event, shutdown, obsolete, ctx);
+}
+
 /// Apply one command to the worker-local connection state.
 fn handle(
     envelope: CommandEnvelope,
     identity: &mut WorkerIdentity,
     device: &mut Option<Device<TcpTransport>>,
     job: &mut Option<SweepRequest>,
+    emit_event: &dyn Fn(EventEnvelope),
+) {
+    handle_with_recording(envelope, identity, device, job, false, emit_event);
+}
+
+fn handle_with_recording(
+    envelope: CommandEnvelope,
+    identity: &mut WorkerIdentity,
+    device: &mut Option<Device<TcpTransport>>,
+    job: &mut Option<SweepRequest>,
+    writer_pending: bool,
     emit_event: &dyn Fn(EventEnvelope),
 ) {
     let CommandEnvelope {
@@ -345,7 +635,7 @@ fn handle(
     let emit = |event| emit_event(source.event(event));
     match command {
         WorkerCommand::Connect { host, port } => {
-            *job = None;
+            discard_job(job);
             // Drop an old session before opening the device's single
             // control connection, including reconnect after a failure.
             *device = None;
@@ -369,17 +659,28 @@ fn handle(
             }
         }
         WorkerCommand::Disconnect | WorkerCommand::Shutdown => {
-            *job = None;
+            discard_job(job);
             if let Some(mut dev) = device.take() {
                 dev.close();
             }
             emit(WorkerEvent::Disconnected);
         }
         WorkerCommand::RunWorkspace(plan) => {
-            start_sweep(plan, request_id, cancel, device, job, &emit);
+            start_sweep(plan, request_id, cancel, device, job, &|event| {
+                if writer_pending
+                    && matches!(event, WorkerEvent::RunProgress(RunProgress::Acquiring))
+                {
+                    emit(WorkerEvent::RunProgress(RunProgress::Saving));
+                } else {
+                    emit(event);
+                }
+            });
+            if writer_pending && let Some(job) = job.as_mut() {
+                job.phase = RunPhase::Saving;
+            }
         }
         WorkerCommand::StopSweep => {
-            *job = None;
+            discard_job(job);
             if let Some(dev) = device.as_mut()
                 && let Err(e) = dev.stop_sweep()
             {
@@ -450,9 +751,11 @@ fn start_sweep(
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
+    discard_job(job);
     if cancel.is_cancelled() {
-        *job = None;
-    } else if let Err(error) = next.validate() {
+        return;
+    }
+    if let Err(error) = next.validate() {
         fail(error, "Run failed", device, job, emit);
     } else if device.is_none() {
         fail(
@@ -463,12 +766,8 @@ fn start_sweep(
             emit,
         );
     } else {
-        *job = Some(SweepRequest {
-            request_id,
-            cancel,
-            plan: next,
-            next_group: 0,
-        });
+        *job = Some(SweepRequest::new(request_id, cancel, next));
+        emit(WorkerEvent::RunProgress(RunProgress::Acquiring));
     }
 }
 
@@ -479,7 +778,7 @@ fn fail<T: kcsdi_core::transport::Transport>(
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
-    *job = None;
+    discard_job(job);
     let message = format!("{context}: {error}");
     if connection_failed(&error) || device.as_ref().is_some_and(Device::requires_reconnect) {
         if let Some(mut dev) = device.take() {
@@ -514,12 +813,707 @@ mod tests {
     }
 
     fn request(settings: AcquisitionSettings) -> SweepRequest {
-        SweepRequest {
-            request_id: 0,
-            cancel: CancellationToken::default(),
-            plan: plan(settings),
-            next_group: 0,
+        SweepRequest::new(0, CancellationToken::default(), plan(settings))
+    }
+
+    #[test]
+    fn matching_save_ack_starts_the_interval_and_preserves_request_identity() {
+        let key = RecordKey {
+            session_id: 2,
+            request_id: 7,
+            pass_id: 1,
+        };
+        let mut recording = RecordingState {
+            pending: Some(key),
+            ..Default::default()
+        };
+        let mut current = request(AcquisitionSettings::S11(s11()));
+        current.request_id = key.request_id;
+        current.phase = RunPhase::Saving;
+        current.plan.run.interval_ms = 250;
+        let mut job = Some(current);
+        let now = Instant::now();
+        let events = RefCell::new(Vec::new());
+        let path = std::path::PathBuf::from("pass-1.csv");
+        recording.accept_result(
+            RecordResult {
+                key,
+                result: Ok(Some(path.clone())),
+            },
+            WorkerIdentity {
+                session_id: 2,
+                request_id: 99,
+            },
+            &mut job,
+            now,
+            &|event| events.borrow_mut().push(event),
+        );
+        assert!(recording.pending.is_none());
+        let current = job.as_mut().unwrap();
+        assert_eq!(current.pass_id, 2);
+        let until = now + Duration::from_millis(250);
+        assert_eq!(current.phase, RunPhase::Waiting { until });
+        assert!(advance_wait(current, false, until - Duration::from_nanos(1)).is_none());
+        assert!(advance_wait(current, true, until).is_none());
+        assert!(matches!(
+            advance_wait(current, false, until),
+            Some(RunProgress::Acquiring)
+        ));
+        let events = events.borrow();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| (event.session_id, event.request_id) == (2, 7))
+        );
+        assert!(
+            matches!(&events[0].event, WorkerEvent::RunProgress(RunProgress::Saved { path: saved, pass_id: 1 }) if saved == &path)
+        );
+        assert!(
+            matches!(events[1].event, WorkerEvent::RunProgress(RunProgress::Waiting { until: deadline }) if deadline == until)
+        );
+    }
+
+    #[test]
+    fn stale_save_ack_only_releases_the_global_slot() {
+        for (session_id, request_id, pass_id) in [(3, 7, 1), (2, 8, 1), (2, 7, 2)] {
+            let old = RecordKey {
+                session_id: 2,
+                request_id: 7,
+                pass_id: 1,
+            };
+            let mut recording = RecordingState {
+                pending: Some(old),
+                ..Default::default()
+            };
+            let mut current = request(AcquisitionSettings::S11(s11()));
+            current.request_id = request_id;
+            current.pass_id = pass_id;
+            current.phase = RunPhase::Saving;
+            let mut job = Some(current);
+            assert!(advance_wait(job.as_mut().unwrap(), true, Instant::now()).is_none());
+            recording.accept_result(
+                RecordResult {
+                    key: old,
+                    result: Err("old disk failure".into()),
+                },
+                WorkerIdentity {
+                    session_id,
+                    request_id,
+                },
+                &mut job,
+                Instant::now(),
+                &|_| panic!("an old acknowledgement must not affect the new request"),
+            );
+            assert!(recording.pending.is_none());
+            let current = job.as_mut().unwrap();
+            assert_eq!(
+                (current.request_id, current.pass_id, current.next_group),
+                (request_id, pass_id, 0)
+            );
+            assert!(!current.cancel.is_cancelled());
+            assert!(matches!(
+                advance_wait(current, false, Instant::now()),
+                Some(RunProgress::Acquiring)
+            ));
         }
+    }
+
+    #[test]
+    fn stopped_and_failed_recordings_never_restart_acquisition() {
+        let key = RecordKey {
+            session_id: 2,
+            request_id: 7,
+            pass_id: 1,
+        };
+        for stopped in [false, true] {
+            let mut recording = RecordingState {
+                pending: Some(key),
+                ..Default::default()
+            };
+            let mut current = request(AcquisitionSettings::S11(s11()));
+            current.request_id = 7;
+            current.phase = RunPhase::Saving;
+            let token = current.cancel.clone();
+            let mut job = Some(current);
+            if stopped {
+                discard_job(&mut job);
+            }
+            let events = RefCell::new(Vec::new());
+            recording.accept_result(
+                RecordResult {
+                    key,
+                    result: Err("disk full".into()),
+                },
+                WorkerIdentity {
+                    session_id: 2,
+                    request_id: 7,
+                },
+                &mut job,
+                Instant::now(),
+                &|event| events.borrow_mut().push(event),
+            );
+            assert!(recording.pending.is_none());
+            assert!(job.is_none());
+            assert!(token.is_cancelled());
+            let events = events.borrow();
+            if stopped {
+                assert!(events.is_empty());
+            } else {
+                assert!(
+                    matches!(&events[0].event, WorkerEvent::Error(message) if message == "Recording failed: disk full")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_interval_waits_for_a_save_ack_and_pass_overflow_stops() {
+        let mut current = request(AcquisitionSettings::S11(s11()));
+        current.phase = RunPhase::Saving;
+        assert!(advance_wait(&mut current, true, Instant::now()).is_none());
+        assert_eq!(current.phase, RunPhase::Saving);
+        assert!(matches!(
+            current.finish_pass(Instant::now()).unwrap(),
+            RunProgress::Acquiring
+        ));
+        assert_eq!(current.pass_id, 2);
+        current.pass_id = u64::MAX;
+        assert!(current.finish_pass(Instant::now()).is_err());
+    }
+
+    #[test]
+    fn recording_progress_drops_on_stop_but_terminal_errors_remain_deliverable() {
+        for progress in [
+            RunProgress::Acquiring,
+            RunProgress::Saving,
+            RunProgress::Waiting {
+                until: Instant::now(),
+            },
+            RunProgress::Saved {
+                path: "pass.csv".into(),
+                pass_id: 1,
+            },
+        ] {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let source = WorkerIdentity {
+                session_id: 1,
+                request_id: 2,
+            };
+            sender
+                .send(source.event(WorkerEvent::SweepStopped))
+                .unwrap();
+            let cancel = CancellationToken::default();
+            let shutdown = CancellationToken::default();
+            let (done, wait) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    send_request_event(
+                        &sender,
+                        source.event(WorkerEvent::RunProgress(progress)),
+                        &shutdown,
+                        &cancel,
+                        &egui::Context::default(),
+                    );
+                    done.send(()).unwrap();
+                });
+                assert!(matches!(
+                    wait.recv_timeout(Duration::from_millis(30)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                cancel.cancel();
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                receiver.recv().unwrap();
+                assert!(receiver.try_recv().is_err());
+                worker.join().unwrap();
+            });
+            send_request_event(
+                &sender,
+                source.event(WorkerEvent::Error("Recording failed: disk full".into())),
+                &shutdown,
+                &cancel,
+                &egui::Context::default(),
+            );
+            assert!(matches!(
+                receiver.recv().unwrap().event,
+                WorkerEvent::Error(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn blocked_writer_allows_health_and_releases_the_device_before_joining() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        const WAIT: Duration = Duration::from_secs(5);
+        struct StopOnDrop(CancellationToken, CancellationToken);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+                self.1.cancel();
+            }
+        }
+        for explicit_disconnect in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut plan = plan(AcquisitionSettings::S11(s11()));
+            plan.run.recording.enabled = true;
+            plan.run.recording.directory = directory.path().to_path_buf();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (commands, command_rx) = mpsc::channel();
+            let (events, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+            let (writing, write_started) = mpsc::channel();
+            let (release, wait_release) = mpsc::channel();
+            let (closed, device_closed) = mpsc::channel();
+            let (done, worker_done) = mpsc::channel();
+            let writer = RecordWriter::with_test_save(move |key| {
+                writing.send(key).unwrap();
+                wait_release
+                    .recv_timeout(WAIT)
+                    .map_err(|error| error.to_string())?;
+                Ok(None)
+            })
+            .unwrap();
+            let shutdown = CancellationToken::default();
+            let cancel = CancellationToken::default();
+            std::thread::scope(|scope| {
+                let _cleanup = StopOnDrop(shutdown.clone(), cancel.clone());
+                let server = scope.spawn(move || {
+                    let started = Instant::now();
+                    let socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(started.elapsed() < WAIT);
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("accept failed: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket.set_read_timeout(Some(WAIT)).unwrap();
+                    socket.set_write_timeout(Some(WAIT)).unwrap();
+                    let mut peer = BufReader::new(socket);
+                    let mut byte = [0];
+                    peer.read_exact(&mut byte).unwrap();
+                    assert_eq!(byte, [b'C']);
+                    peer.get_mut().write_all(b"$start,id\n$000000000001\n$end\n").unwrap();
+                    for (command, response) in [
+                        ("$device\n", "$start,device\n$Synthetic peer\n$<-User @ :replay>\n$<-Software ver:test>\n$<-Hardware ver:test>\n$<-Serial num:000000000001>\n$<-Copyright:Test fixture>\n$end\n"),
+                        ("$s11,stop\n", ""), ("$s21,stop\n", ""), ("$spec,stop\n", ""),
+                        ("$s11,init\n", ""), ("$bw,10k\n", ""),
+                        ("$s11,run,caloff,z,2,ss,1000000,2000000\n", "$start,s11,z\n$1000000,50,50,0\n$1500000,50,50,0\n$2000000,50,50,0\n$end\n"),
+                        ("$temp\n", "$start,temp\n$42\n$end\n"),
+                        ("$voltage\n", "$start,voltage\n$12,8\n$end\n"),
+                        ("$s11,stop\n", ""), ("$local\n", ""),
+                    ] {
+                        let mut line = String::new();
+                        assert_ne!(peer.read_line(&mut line).unwrap(), 0);
+                        assert_eq!(line, command);
+                        peer.get_mut().write_all(response.as_bytes()).unwrap();
+                    }
+                    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+                    closed.send(()).unwrap();
+                });
+                let worker_shutdown = shutdown.clone();
+                let worker = scope.spawn(move || {
+                    run_worker(
+                        command_rx,
+                        events,
+                        egui::Context::default(),
+                        worker_shutdown,
+                        PreviewMailbox::default(),
+                        RecordingState {
+                            writer: Some(writer),
+                            pending: None,
+                        },
+                    );
+                    done.send(()).unwrap();
+                });
+                commands
+                    .send(CommandEnvelope {
+                        session_id: 1,
+                        request_id: 1,
+                        cancel: CancellationToken::default(),
+                        command: WorkerCommand::Connect {
+                            host: "127.0.0.1".into(),
+                            port,
+                        },
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::Connected(_)
+                ));
+                commands
+                    .send(CommandEnvelope {
+                        session_id: 1,
+                        request_id: 2,
+                        cancel: cancel.clone(),
+                        command: WorkerCommand::RunWorkspace(plan),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::RunProgress(RunProgress::Acquiring)
+                ));
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::SweepTrace(_)
+                ));
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::RunProgress(RunProgress::Saving)
+                ));
+                assert_eq!(
+                    write_started.recv_timeout(WAIT).unwrap(),
+                    RecordKey {
+                        session_id: 1,
+                        request_id: 2,
+                        pass_id: 1
+                    }
+                );
+                commands
+                    .send(CommandEnvelope {
+                        session_id: 1,
+                        request_id: 1,
+                        cancel: CancellationToken::default(),
+                        command: WorkerCommand::RefreshStatus,
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::Status(_)
+                ));
+                if explicit_disconnect {
+                    commands
+                        .send(CommandEnvelope {
+                            session_id: 1,
+                            request_id: 3,
+                            cancel: CancellationToken::default(),
+                            command: WorkerCommand::StopSweep,
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        event_rx.recv_timeout(WAIT).unwrap().event,
+                        WorkerEvent::SweepStopped
+                    ));
+                    commands
+                        .send(CommandEnvelope {
+                            session_id: 2,
+                            request_id: 4,
+                            cancel: CancellationToken::default(),
+                            command: WorkerCommand::Disconnect,
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        event_rx.recv_timeout(WAIT).unwrap().event,
+                        WorkerEvent::Disconnected
+                    ));
+                }
+                shutdown.cancel();
+                device_closed.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(cancel.is_cancelled());
+                assert!(matches!(
+                    worker_done.recv_timeout(Duration::from_millis(30)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                release.send(()).unwrap();
+                worker_done.recv_timeout(WAIT).unwrap();
+                worker.join().unwrap();
+                server.join().unwrap();
+            });
+        }
+    }
+
+    fn replay_recorded_passes(fail_second_group: bool) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        const WAIT: Duration = Duration::from_secs(5);
+        const IDENTITY: &[u8] = b"$start,device\n$Synthetic peer\n$<-User @ :replay>\n$<-Software ver:test>\n$<-Hardware ver:test>\n$<-Serial num:000000000001>\n$<-Copyright:Test fixture>\n$end\n";
+
+        fn expect(peer: &mut BufReader<TcpStream>, command: &str) {
+            let mut line = String::new();
+            assert_ne!(peer.read_line(&mut line).unwrap(), 0);
+            assert_eq!(line, command);
+        }
+
+        struct StopOnDrop {
+            shutdown: CancellationToken,
+            request: CancellationToken,
+        }
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.request.cancel();
+                self.shutdown.cancel();
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = SweepPlan::from_requests([
+            (TraceId(1), AcquisitionSettings::S11(s11())),
+            (TraceId(2), AcquisitionSettings::Spec(spec())),
+            (TraceId(3), AcquisitionSettings::S11(s11())),
+        ])
+        .unwrap();
+        plan.run.interval_ms = 400;
+        plan.run.recording.enabled = true;
+        plan.run.recording.directory = directory.path().to_path_buf();
+        plan.run.recording.format = crate::run_settings::RecordingFormat::Csv;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (commands, command_rx) = mpsc::channel();
+        // Rendezvous delivery lets the fixture queue health before accepting
+        // Waiting, without relying on the test thread beating the interval.
+        let (events, event_rx) = mpsc::sync_channel(0);
+        let (deadlines, next_deadline) = mpsc::channel();
+        let shutdown = CancellationToken::default();
+        let cancel = CancellationToken::default();
+        std::thread::scope(|scope| {
+            let cleanup = StopOnDrop {
+                shutdown: shutdown.clone(),
+                request: cancel.clone(),
+            };
+            let server = scope.spawn(move || {
+                let started = Instant::now();
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(started.elapsed() < WAIT);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("peer accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(WAIT)).unwrap();
+                socket.set_write_timeout(Some(WAIT)).unwrap();
+                socket.set_nodelay(true).unwrap();
+                let mut peer = BufReader::new(socket);
+                let mut first = [0];
+                peer.read_exact(&mut first).unwrap();
+                assert_eq!(first, [b'C']);
+                peer.get_mut().write_all(b"$start,id\n$000000000001\n$end\n").unwrap();
+                expect(&mut peer, "$device\n");
+                peer.get_mut().write_all(IDENTITY).unwrap();
+
+                let passes = if fail_second_group { 1 } else { 2 };
+                for pass in 1..=passes {
+                    if pass == 1 {
+                        for command in ["$s11,stop\n", "$s21,stop\n", "$spec,stop\n"] {
+                            expect(&mut peer, command);
+                        }
+                    } else {
+                        let until = next_deadline.recv_timeout(WAIT).unwrap();
+                        expect(&mut peer, "$spec,stop\n");
+                        assert!(Instant::now() >= until, "a new pass started before its post-save interval");
+                    }
+                    for command in ["$s11,init\n", "$bw,10k\n", "$s11,run,caloff,z,2,ss,1000000,2000000\n"] {
+                        expect(&mut peer, command);
+                    }
+                    let value = pass * 10;
+                    peer.get_mut().write_all(format!("$start,s11,z\n$1000000,{value},{value},0\n$1500000,{value},{value},0\n$2000000,{value},{value},0\n$end\n").as_bytes()).unwrap();
+                    for command in ["$s11,stop\n", "$spec,init\n", "$bw,10k\n", "$specref,-10\n", "$spec,run,caloff,highlo,2,ss,1000000,2000000\n"] {
+                        expect(&mut peer, command);
+                    }
+                    if fail_second_group {
+                        peer.get_mut().write_all(b"$start,err_par5\n$invalid setting\n$end\n").unwrap();
+                        expect(&mut peer, "$spec,stop\n");
+                    } else {
+                        peer.get_mut().write_all(format!("$start,spec\n$1000000,-{value}\n$1500000,-{value}\n$2000000,-{value}\n$end\n").as_bytes()).unwrap();
+                    }
+                    // Status queries are legal while waiting for the next pass
+                    // and remain available after a nonfatal acquisition error.
+                    expect(&mut peer, "$temp\n");
+                    peer.get_mut().write_all(b"$start,temp\n$42\n$end\n").unwrap();
+                    expect(&mut peer, "$voltage\n");
+                    peer.get_mut().write_all(b"$start,voltage\n$12,8\n$end\n").unwrap();
+                }
+                if !fail_second_group {
+                    expect(&mut peer, "$spec,stop\n");
+                }
+                expect(&mut peer, "$local\n");
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            });
+            let worker_shutdown = shutdown.clone();
+            let worker = scope.spawn(move || {
+                device_worker(
+                    command_rx,
+                    events,
+                    egui::Context::default(),
+                    worker_shutdown,
+                    PreviewMailbox::default(),
+                )
+            });
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 1,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::Connect {
+                        host: "127.0.0.1".into(),
+                        port,
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::Connected(_)
+            ));
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 2,
+                    cancel: cancel.clone(),
+                    command: WorkerCommand::RunWorkspace(plan),
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::RunProgress(RunProgress::Acquiring)
+            ));
+            let mut paths = Vec::new();
+            let passes = if fail_second_group { 1 } else { 2 };
+            for pass in 1..=passes {
+                for members in [vec![TraceId(1), TraceId(3)], vec![TraceId(2)]] {
+                    let event = event_rx.recv_timeout(WAIT).unwrap();
+                    assert_eq!((event.session_id, event.request_id), (1, 2));
+                    if fail_second_group && members == [TraceId(2)] {
+                        assert!(
+                            matches!(&event.event, WorkerEvent::Error(error) if error.contains("err_par5"))
+                        );
+                    } else {
+                        let WorkerEvent::SweepTrace(delivery) = event.event else {
+                            panic!("unexpected event: {:?}", event.event)
+                        };
+                        assert_eq!(delivery.members, members);
+                        assert_eq!(delivery.snapshot.data.points.len(), 3);
+                    }
+                }
+                if !fail_second_group {
+                    assert!(matches!(
+                        event_rx.recv_timeout(WAIT).unwrap().event,
+                        WorkerEvent::RunProgress(RunProgress::Saving)
+                    ));
+                    let saved = event_rx.recv_timeout(WAIT).unwrap();
+                    let WorkerEvent::RunProgress(RunProgress::Saved { path, pass_id }) =
+                        saved.event
+                    else {
+                        panic!("unexpected event: {:?}", saved.event)
+                    };
+                    assert_eq!(pass_id, pass);
+                    assert!(path.is_file());
+                    assert_ne!(path.parent().unwrap(), directory.path());
+                    assert!(path.starts_with(directory.path()));
+                    paths.push(path);
+                    commands
+                        .send(CommandEnvelope {
+                            session_id: 1,
+                            request_id: 1,
+                            cancel: CancellationToken::default(),
+                            command: WorkerCommand::RefreshStatus,
+                        })
+                        .unwrap();
+                    let waiting = event_rx.recv_timeout(WAIT).unwrap();
+                    let WorkerEvent::RunProgress(RunProgress::Waiting { until }) = waiting.event
+                    else {
+                        panic!("unexpected event: {:?}", waiting.event)
+                    };
+                    deadlines.send(until).unwrap();
+                }
+                if fail_second_group {
+                    commands
+                        .send(CommandEnvelope {
+                            session_id: 1,
+                            request_id: 1,
+                            cancel: CancellationToken::default(),
+                            command: WorkerCommand::RefreshStatus,
+                        })
+                        .unwrap();
+                }
+                assert!(matches!(
+                    event_rx.recv_timeout(WAIT).unwrap().event,
+                    WorkerEvent::Status(_)
+                ));
+                if pass < passes {
+                    assert!(matches!(
+                        event_rx.recv_timeout(WAIT).unwrap().event,
+                        WorkerEvent::RunProgress(RunProgress::Acquiring)
+                    ));
+                }
+            }
+            cancel.cancel();
+            commands
+                .send(CommandEnvelope {
+                    session_id: 1,
+                    request_id: 3,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::StopSweep,
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::SweepStopped
+            ));
+            assert!(cancel.is_cancelled());
+            commands
+                .send(CommandEnvelope {
+                    session_id: 2,
+                    request_id: 4,
+                    cancel: CancellationToken::default(),
+                    command: WorkerCommand::Disconnect,
+                })
+                .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::Disconnected
+            ));
+            drop(cleanup);
+            worker.join().unwrap();
+            server.join().unwrap();
+            if fail_second_group {
+                assert!(paths.is_empty());
+                assert!(
+                    std::fs::read_dir(directory.path())
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            } else {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0].parent(), paths[1].parent());
+                for (index, path) in paths.iter().enumerate() {
+                    let mut reader = csv::Reader::from_path(path).unwrap();
+                    let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+                    assert_eq!(rows.len(), 21);
+                    assert_eq!(
+                        rows.iter()
+                            .map(|row| row[0].to_owned())
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        ["1".into(), "2".into(), "3".into()].into()
+                    );
+                    let expected = ((index + 1) * 10).to_string();
+                    let resistance = rows
+                        .iter()
+                        .filter(|row| &row[3] == "resistance_ohm")
+                        .collect::<Vec<_>>();
+                    assert_eq!(resistance.len(), 6);
+                    assert!(resistance.iter().all(|row| row[4] == expected));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn recording_replays_full_passes_intervals_status_stop_and_disconnect() {
+        replay_recorded_passes(false);
+    }
+
+    #[test]
+    fn failed_incomplete_pass_never_creates_a_recording_directory() {
+        replay_recorded_passes(true);
     }
 
     struct ListTransport {
@@ -751,7 +1745,10 @@ mod tests {
         let mut invalid_params = spec();
         invalid_params.points = 0;
         let invalid_plans = [
-            SweepPlan { groups: Vec::new() },
+            SweepPlan {
+                groups: Vec::new(),
+                run: Default::default(),
+            },
             SweepPlan {
                 groups: vec![
                     valid.groups[0].clone(),
@@ -760,9 +1757,11 @@ mod tests {
                         members: vec![TraceId(2)],
                     },
                 ],
+                run: Default::default(),
             },
             SweepPlan {
                 groups: vec![valid.groups[0].clone(), valid.groups[0].clone()],
+                run: Default::default(),
             },
         ];
         for invalid in invalid_plans {
@@ -1009,6 +2008,10 @@ mod tests {
                     command: WorkerCommand::RunWorkspace(plan),
                 })
                 .unwrap();
+            assert!(matches!(
+                event_rx.recv_timeout(WAIT).unwrap().event,
+                WorkerEvent::RunProgress(RunProgress::Acquiring)
+            ));
             frame_ready.recv_timeout(WAIT).unwrap();
             // Both requests predate the active acquisition generation. They
             // still belong to this session and must coalesce at its boundary.
@@ -1395,6 +2398,9 @@ mod tests {
             ])
             .unwrap(),
             next_group: 1,
+            pass_id: 1,
+            pass: Vec::new(),
+            phase: RunPhase::Acquiring,
         });
         let events = RefCell::new(Vec::new());
         handle(
@@ -1450,6 +2456,7 @@ mod tests {
                 &mut identity,
                 &mut device,
                 &mut job,
+                false,
                 &emit,
             );
         }
@@ -1467,6 +2474,7 @@ mod tests {
             &mut identity,
             &mut device,
             &mut job,
+            false,
             &emit,
         );
         assert!(job.is_none());
@@ -1487,6 +2495,7 @@ mod tests {
             &mut identity,
             &mut device,
             &mut job,
+            false,
             &emit,
         );
         assert_eq!(pending.as_ref().unwrap().request_id, 4);
@@ -1501,6 +2510,7 @@ mod tests {
             &mut identity,
             &mut device,
             &mut job,
+            false,
             &emit,
         );
         assert!(pending.is_none());
@@ -1566,6 +2576,9 @@ mod tests {
                 ])
                 .unwrap(),
                 next_group: 1,
+                pass_id: 1,
+                pass: Vec::new(),
+                phase: RunPhase::Acquiring,
             });
             let events = RefCell::new(Vec::new());
             for attempt in 0..2 {

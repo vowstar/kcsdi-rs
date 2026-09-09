@@ -417,12 +417,13 @@ pub(super) fn run_button<P>(
     ui: &mut egui::Ui,
     params: kcsdi_core::Result<P>,
     language: Language,
+    caption: Text,
 ) -> Option<P> {
     let clicked = ui
         .add_enabled_ui(params.is_ok(), |ui| {
             ui.add_sized(
                 [ui.available_width(), BUTTON_HEIGHT],
-                egui::Button::new(egui::RichText::new(language.text(Text::Run)).strong())
+                egui::Button::new(egui::RichText::new(language.text(caption)).strong())
                     .fill(PRIMARY),
             )
             .clicked()
@@ -577,7 +578,7 @@ mod tests {
                         } else {
                             Err(kcsdi_core::Error::InvalidParameter("S11 start 0 Hz".into()))
                         };
-                        clicked |= run_button(ui, params, Language::English).is_some();
+                        clicked |= run_button(ui, params, Language::English, Text::Run).is_some();
                     },
                 )
             };

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::health::HealthState;
 use crate::i18n::{Language, StatusMessage, Text};
+use crate::run_settings::RunProgress;
 use crate::state::{AppState, ConnectionState, SweepState, WorkerCommand};
 
 /// Draw connection and health status. Return whether to open connection settings.
@@ -39,6 +40,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                 if state.sweep == SweepState::Stopping {
                     ui.spinner();
                     ui.label(language.text(Text::Stopping));
+                } else if state.any_running()
+                    && matches!(state.run_progress, Some(RunProgress::Saving))
+                {
+                    ui.spinner();
+                    ui.label(language.text(Text::RunSaving));
+                } else if state.any_running()
+                    && let Some(RunProgress::Waiting { until }) = state.run_progress.as_ref()
+                {
+                    ui.label(format!(
+                        "{} {:.1} s",
+                        language.text(Text::RunWaiting),
+                        until
+                            .saturating_duration_since(Instant::now())
+                            .as_secs_f64()
+                    ));
                 } else if let Some(preview) = state
                     .workspace
                     .traces
@@ -78,6 +94,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                     }
                 }
             }
+        }
+        if let Some((pass_id, path)) = &state.last_recording {
+            ui.label(format!("{} {pass_id}", language.text(Text::RunSaved)))
+                .on_hover_text(path.display().to_string());
         }
         if let Some(msg) = &state.status_message {
             let text = msg.text(language);

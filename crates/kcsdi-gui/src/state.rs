@@ -37,6 +37,7 @@ pub enum WorkerEvent {
     Error(String),
     SweepTrace(SweepDelivery),
     SweepStopped,
+    RunProgress(crate::run_settings::RunProgress),
     Status(HealthSnapshot),
     StatusFailed(String),
 }
@@ -209,6 +210,8 @@ pub struct AppState {
     pub health: HealthState,
     pub workspace: Workspace,
     pub active_plan: Option<SweepPlan>,
+    pub run_progress: Option<crate::run_settings::RunProgress>,
+    pub last_recording: Option<(u64, std::path::PathBuf)>,
     pub export: crate::export::ExportState,
     pub status_message: Option<StatusMessage>,
     pub session_id: u64,
@@ -235,6 +238,8 @@ impl Default for AppState {
             health: Default::default(),
             workspace: Default::default(),
             active_plan: None,
+            run_progress: None,
+            last_recording: None,
             export: Default::default(),
             status_message: None,
             session_id: 0,
@@ -255,7 +260,7 @@ impl AppState {
         self.language = preference.resolve();
     }
 
-    /// Replace the whole acquisition only when its wire settings or members change.
+    /// Replace acquisition when its conditions, members or run settings change.
     pub fn reconcile_plan(&mut self) {
         if !self.any_running() {
             return;
@@ -294,6 +299,7 @@ impl AppState {
         }
         if !matches!(command, WorkerCommand::RefreshStatus) {
             self.clear_preview();
+            self.run_progress = None;
             self.request_id = self
                 .request_id
                 .checked_add(1)
@@ -301,6 +307,8 @@ impl AppState {
         }
         let cancel = match &command {
             WorkerCommand::RunWorkspace(plan) => {
+                self.last_recording = None;
+                self.run_progress = Some(crate::run_settings::RunProgress::Acquiring);
                 self.acquisition_cancel.cancel();
                 self.acquisition_cancel = CancellationToken::default();
                 self.active_plan = Some(plan.clone());
@@ -368,6 +376,7 @@ impl AppState {
         self.worker_shutdown.cancel();
         self.sweep = SweepState::Idle;
         self.active_plan = None;
+        self.run_progress = None;
         self.clear_preview();
         self.device_info = None;
         self.health = HealthState::default();

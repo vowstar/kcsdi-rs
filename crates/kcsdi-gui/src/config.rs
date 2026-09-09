@@ -34,7 +34,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Work
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 5;
+pub const CONFIG_VERSION: u32 = 6;
 
 fn legacy_config_version() -> u32 {
     1
@@ -79,6 +79,7 @@ pub struct WorkspaceConfig {
     pub points: u32,
     pub list_mode: bool,
     pub frequencies_hz: Vec<u64>,
+    pub run: crate::run_settings::RunSettings,
     pub log_x: bool,
     pub selected: Option<TraceId>,
     pub next_id: u64,
@@ -384,6 +385,7 @@ impl WorkspaceConfig {
             points: workspace.range.points,
             list_mode: workspace.list_mode,
             frequencies_hz: workspace.frequencies_hz.clone(),
+            run: workspace.run.clone(),
             log_x: workspace.log_x,
             selected: workspace.selected,
             next_id: workspace.next_id,
@@ -407,6 +409,7 @@ impl WorkspaceConfig {
         workspace.log_x = self.log_x;
         workspace.list_mode = self.list_mode;
         workspace.frequencies_hz = self.frequencies_hz.clone();
+        workspace.run = self.run.clone();
         let x_view = self
             .x_view
             .filter(|view| view.valid(self.log_x))
@@ -627,6 +630,8 @@ impl AppConfig {
         };
         state.sweep = crate::state::SweepState::Idle;
         state.active_plan = None;
+        state.run_progress = None;
+        state.last_recording = None;
     }
 
     fn legacy_workspace(&self) -> Workspace {
@@ -1393,6 +1398,51 @@ rbw = "30k"
         assert!(!saved.contains("log_y"));
         let parsed: AppConfig = toml::from_str(&saved).unwrap();
         assert_eq!(upgraded, parsed);
+    }
+
+    #[test]
+    fn recording_settings_round_trip_without_resuming_the_run() {
+        use crate::run_settings::{IntervalUnit, RecordingFormat, Retention, RunProgress};
+        let mut state = AppState::default();
+        let directory = tempfile::tempdir().unwrap();
+        state.workspace.run.interval_ms = 120_000;
+        state.workspace.run.interval_unit = IntervalUnit::Minutes;
+        state.workspace.run.recording.enabled = true;
+        state.workspace.run.recording.directory = directory.path().to_path_buf();
+        state.workspace.run.recording.format = RecordingFormat::Csv;
+        state.workspace.run.recording.retention = Retention::KeepLast(3);
+        state.send(crate::state::WorkerCommand::RunWorkspace(
+            state.workspace.plan().unwrap(),
+        ));
+        state.run_progress = Some(RunProgress::Saving);
+        state.last_recording = Some((7, directory.path().join("old.csv")));
+        let text = toml::to_string_pretty(&AppConfig::from_state(&state)).unwrap();
+        let config: AppConfig = toml::from_str(&text).unwrap();
+        let mut restored = AppState::default();
+        config.apply_to(&mut restored);
+        assert_eq!(restored.workspace.run, state.workspace.run);
+        assert_eq!(
+            restored.connection,
+            crate::state::ConnectionState::Disconnected
+        );
+        assert_eq!(restored.sweep, crate::state::SweepState::Idle);
+        assert!(restored.active_plan.is_none());
+        assert!(restored.run_progress.is_none());
+        assert!(restored.last_recording.is_none());
+        assert!(!restored.workspace.run_editor.is_pending());
+        assert_eq!(directory.path().read_dir().unwrap().count(), 0);
+        assert!(!text.contains("old.csv"));
+        assert!(!text.contains("run_progress"));
+    }
+
+    #[test]
+    fn older_configs_default_to_continuous_acquisition_without_recording() {
+        let config: AppConfig = toml::from_str("version = 5\n[workspace]\npoints = 201\n").unwrap();
+        let mut state = AppState::default();
+        config.apply_to(&mut state);
+        assert_eq!(state.workspace.run, Default::default());
+        assert!(!state.workspace.run.recording.enabled);
+        assert_eq!(state.workspace.run.interval_ms, 0);
     }
 
     #[test]

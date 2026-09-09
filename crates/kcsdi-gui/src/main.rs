@@ -19,6 +19,8 @@ mod health;
 mod i18n;
 mod panels;
 mod preview;
+mod recording;
+mod run_settings;
 mod spreadsheet;
 mod state;
 mod theme;

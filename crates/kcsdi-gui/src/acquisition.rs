@@ -124,6 +124,7 @@ pub struct AcquisitionGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepPlan {
     pub groups: Vec<AcquisitionGroup>,
+    pub run: crate::run_settings::RunSettings,
 }
 
 impl SweepPlan {
@@ -154,13 +155,17 @@ impl SweepPlan {
                 });
             }
         }
-        let plan = Self { groups };
+        let plan = Self {
+            groups,
+            run: Default::default(),
+        };
         plan.validate()?;
         Ok(plan)
     }
 
     /// Recheck caller-built plans before the worker changes any instrument state.
     pub fn validate(&self) -> Result<()> {
+        self.run.validate().map_err(Error::InvalidParameter)?;
         if self.groups.is_empty() || self.groups.len() > MAX_TRACES {
             return Err(Error::InvalidParameter(
                 "select between 1 and 10 visible traces".into(),

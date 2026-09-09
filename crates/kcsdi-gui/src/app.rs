@@ -77,7 +77,10 @@ impl KcsdiApp {
         }
         if matches!(
             envelope.event,
-            WorkerEvent::SweepTrace(_) | WorkerEvent::SweepStopped | WorkerEvent::Error(_)
+            WorkerEvent::SweepTrace(_)
+                | WorkerEvent::SweepStopped
+                | WorkerEvent::RunProgress(_)
+                | WorkerEvent::Error(_)
         ) && envelope.request_id != self.state.request_id
         {
             return;
@@ -206,16 +209,35 @@ impl KcsdiApp {
                 }
                 self.state.sweep = SweepState::Idle;
                 self.state.active_plan = None;
+                self.state.run_progress = None;
                 self.state.clear_preview();
                 self.state.status_message = Some(message.into());
             }
             WorkerEvent::SweepStopped => {
                 if self.state.sweep == SweepState::Stopping {
                     self.state.sweep = SweepState::Idle;
+                    self.state.run_progress = None;
                     self.state.clear_preview();
                 }
             }
             WorkerEvent::SweepTrace(_) => {}
+            WorkerEvent::RunProgress(progress) => {
+                if self.state.connection == ConnectionState::Connected && self.state.any_running() {
+                    if let crate::run_settings::RunProgress::Saved { path, pass_id } = progress {
+                        if pass_id != 0
+                            && self
+                                .state
+                                .last_recording
+                                .as_ref()
+                                .is_none_or(|(last, _)| pass_id > *last)
+                        {
+                            self.state.last_recording = Some((pass_id, path));
+                        }
+                    } else {
+                        self.state.run_progress = Some(progress);
+                    }
+                }
+            }
             WorkerEvent::Status(snapshot) => {
                 if self.state.connection == ConnectionState::Connected {
                     self.state.health.succeed(snapshot, Instant::now());
@@ -235,6 +257,7 @@ impl KcsdiApp {
         self.state.health = Default::default();
         self.state.sweep = SweepState::Idle;
         self.state.active_plan = None;
+        self.state.run_progress = None;
         self.state.clear_preview();
         self.state.acquisition_cancel.cancel();
         self.state.session_cancel.cancel();
@@ -245,6 +268,7 @@ impl KcsdiApp {
             self.closing = true;
             self.state.export.cancel();
             self.state.workspace.frequency_editor.cancel();
+            self.state.workspace.run_editor.cancel();
             self.state.send(crate::state::WorkerCommand::Shutdown);
         }
         if !self.closing {
@@ -265,7 +289,10 @@ impl KcsdiApp {
             warn!("device worker panicked during shutdown");
         }
         self.state.cmd_tx = None;
-        if self.state.export.is_pending() || self.state.workspace.frequency_editor.is_pending() {
+        if self.state.export.is_pending()
+            || self.state.workspace.frequency_editor.is_pending()
+            || self.state.workspace.run_editor.is_pending()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -355,6 +382,7 @@ impl eframe::App for KcsdiApp {
         theme::apply(&ctx, self.state.desktop.settings.theme);
         self.state.export.poll();
         self.state.workspace.frequency_editor.poll();
+        self.state.workspace.run_editor.poll();
         self.poll_close(&ctx);
 
         // Drain all pending events from the device worker.
@@ -386,10 +414,12 @@ impl eframe::App for KcsdiApp {
                     ui.label(self.state.language.text(
                         if self.state.workspace.frequency_editor.is_pending() {
                             Text::FrequencyFilePending
+                        } else if self.state.workspace.run_editor.is_pending() {
+                            Text::RunFilePending
                         } else if self.state.export.is_pending() {
                             Text::ExportCancelHelp
                         } else {
-                            Text::Disconnecting
+                            Text::Closing
                         },
                     ));
                 });
@@ -423,6 +453,15 @@ impl eframe::App for KcsdiApp {
             self.state.workspace.frequencies_hz = list;
             self.state.workspace.list_mode = true;
             self.state.workspace.reset_frequency_view();
+        }
+        if let Some(run) = self
+            .state
+            .workspace
+            .run_editor
+            .show(&ctx, self.state.language)
+            && !self.closing
+        {
+            self.state.workspace.run = run;
         }
         self.state.reconcile_plan();
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1158,6 +1197,91 @@ mod tests {
             .selected()
             .and_then(|trace| trace.completed.as_ref())
             .map(|snapshot| snapshot.data.clone())
+    }
+
+    #[test]
+    fn recording_progress_is_request_scoped_and_cannot_restart_stopped_work() {
+        use crate::run_settings::RunProgress;
+        let mut app = active_impedance_app();
+        let event = |session_id, request_id, event| EventEnvelope {
+            session_id,
+            request_id,
+            cycle_id: None,
+            event: WorkerEvent::RunProgress(event),
+        };
+        let session = app.state.session_id;
+        let request = app.state.request_id;
+        app.apply_worker_event(event(session, request, RunProgress::Saving));
+        assert!(matches!(app.state.run_progress, Some(RunProgress::Saving)));
+        assert!(app.state.any_running());
+        let path = std::env::temp_dir().join("recording-test.csv");
+        app.apply_worker_event(event(
+            session,
+            request,
+            RunProgress::Saved {
+                path: path.clone(),
+                pass_id: 2,
+            },
+        ));
+        app.apply_worker_event(event(
+            session,
+            request,
+            RunProgress::Saved {
+                path: path.with_extension("old"),
+                pass_id: 1,
+            },
+        ));
+        assert_eq!(app.state.last_recording, Some((2, path.clone())));
+        app.state.workspace.run.interval_ms = 1000;
+        app.state.reconcile_plan();
+        assert!(app.state.request_id > request);
+        assert!(app.state.last_recording.is_none());
+        app.apply_worker_event(event(
+            session,
+            request,
+            RunProgress::Saved {
+                path: path.clone(),
+                pass_id: 3,
+            },
+        ));
+        assert!(app.state.last_recording.is_none());
+        app.apply_worker_event(event(
+            session + 1,
+            app.state.request_id,
+            RunProgress::Saving,
+        ));
+        assert!(matches!(
+            app.state.run_progress,
+            Some(RunProgress::Acquiring)
+        ));
+        app.state.send(WorkerCommand::StopSweep);
+        app.apply_worker_event(event(
+            session,
+            app.state.request_id,
+            RunProgress::Waiting {
+                until: Instant::now() + Duration::from_secs(60),
+            },
+        ));
+        assert_eq!(app.state.sweep, SweepState::Stopping);
+        assert!(app.state.run_progress.is_none());
+        assert!(complete_data(&app).is_some());
+    }
+
+    #[test]
+    fn recording_error_preserves_connection_and_complete_measurements() {
+        let mut app = active_impedance_app();
+        let data = complete_data(&app);
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::Error("Recording failed: disk full".into()),
+        });
+        assert_eq!(app.state.connection, ConnectionState::Connected);
+        assert_eq!(app.state.sweep, SweepState::Idle);
+        assert!(app.state.run_progress.is_none());
+        assert_eq!(complete_data(&app), data);
+        assert!(app.state.status_message.is_some());
     }
 
     #[test]
@@ -2431,13 +2555,15 @@ mod tests {
                             format!("T{} {}", trace.id.0, trace.settings.display.label(language));
                         app.state.workspace.selected = Some(trace.id);
                         for _ in 0..3 {
-                            let output = ctx.run_ui(
+                            let mut output = ctx.run_ui(
                                 egui::RawInput {
                                     screen_rect: Some(screen),
                                     ..Default::default()
                                 },
                                 |ui| app.instrument_ui(ui),
                             );
+                            let shapes = std::mem::take(&mut output.shapes);
+                            output.drop_without_applying_deltas();
                             let panel = egui::containers::panel::PanelState::load(
                                 &ctx,
                                 egui::Id::new("params_panel"),
@@ -2450,7 +2576,7 @@ mod tests {
                             );
                             assert!(panel.outer_rect.right() <= width + 1.0);
                             for label in [&title, language.text(Text::CalSys)] {
-                                let shape = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)).expect("parameter label must remain visible");
+                                let shape = shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)).expect("parameter label must remain visible");
                                 let egui::Shape::Text(text) = &shape.shape else {
                                     unreachable!()
                                 };
@@ -2461,7 +2587,6 @@ mod tests {
                                     shape.clip_rect
                                 );
                             }
-                            output.drop_without_applying_deltas();
                         }
                     }
                 }

@@ -317,6 +317,8 @@ pub struct Workspace {
     pub list_mode: bool,
     pub frequencies_hz: Vec<u64>,
     pub frequency_editor: crate::frequency_editor::FrequencyEditor,
+    pub run: crate::run_settings::RunSettings,
+    pub run_editor: crate::run_settings::RunSettingsEditor,
     pub traces: Vec<TraceState>,
     pub selected: Option<TraceId>,
     pub x_view: PlotView,
@@ -365,6 +367,8 @@ impl Workspace {
             list_mode: false,
             frequencies_hz: Vec::new(),
             frequency_editor: Default::default(),
+            run: Default::default(),
+            run_editor: Default::default(),
             traces: Vec::new(),
             selected: None,
             x_view: PlotView::new(range.start_hz, range.stop_hz, 0.0, 1.0),
@@ -428,7 +432,10 @@ impl Workspace {
                     .map(|settings| (trace.id, settings))
             })
             .collect();
-        SweepPlan::from_requests(requests?)
+        let mut plan = SweepPlan::from_requests(requests?)?;
+        plan.run = self.run.clone();
+        plan.validate()?;
+        Ok(plan)
     }
 
     pub fn requested_list(&self) -> Option<&[u64]> {
