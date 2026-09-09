@@ -56,6 +56,22 @@ pub enum WorkerEvent {
     Status { temperature: f64, voltage: Voltage },
 }
 
+/// Identity of the connection and measurement requested by a command.
+#[derive(Debug)]
+pub struct CommandEnvelope {
+    pub session_id: u64,
+    pub request_id: u64,
+    pub command: WorkerCommand,
+}
+
+/// Identity of the operation that produced a worker event.
+#[derive(Debug)]
+pub struct EventEnvelope {
+    pub session_id: u64,
+    pub request_id: u64,
+    pub event: WorkerEvent,
+}
+
 /// Connection lifecycle shown in the top bar.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ConnectionState {
@@ -330,8 +346,11 @@ pub struct AppState {
     pub export: crate::export::ExportState,
     /// Transient message for the status bar.
     pub status_message: Option<StatusMessage>,
+    /// Session-only identities. Settings never restore an active request.
+    pub session_id: u64,
+    pub request_id: u64,
     /// Command channel to the device worker thread.
-    pub cmd_tx: Option<mpsc::Sender<WorkerCommand>>,
+    pub cmd_tx: Option<mpsc::Sender<CommandEnvelope>>,
 }
 
 impl Default for AppState {
@@ -351,6 +370,8 @@ impl Default for AppState {
             s11: S11State::default(),
             export: crate::export::ExportState::default(),
             status_message: None,
+            session_id: 0,
+            request_id: 0,
             cmd_tx: None,
         }
     }
@@ -375,11 +396,29 @@ impl AppState {
         }
     }
 
-    /// Send a command to the device worker, dropping it silently when the
-    /// worker is gone (it outlives no panic).
-    pub fn send(&self, cmd: WorkerCommand) {
+    /// Invalidate prior results before a new operation enters the worker queue.
+    pub fn send(&mut self, command: WorkerCommand) {
+        if matches!(
+            command,
+            WorkerCommand::Connect { .. } | WorkerCommand::Disconnect
+        ) {
+            self.session_id = self
+                .session_id
+                .checked_add(1)
+                .expect("session ID exhausted");
+        }
+        if !matches!(command, WorkerCommand::RefreshStatus) {
+            self.request_id = self
+                .request_id
+                .checked_add(1)
+                .expect("request ID exhausted");
+        }
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(cmd);
+            let _ = tx.send(CommandEnvelope {
+                session_id: self.session_id,
+                request_id: self.request_id,
+                command,
+            });
         }
     }
 
@@ -394,6 +433,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_envelopes_advance_only_the_relevant_identity() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        for (command, expected) in [
+            (
+                WorkerCommand::Connect {
+                    host: "instrument.local".into(),
+                    port: 901,
+                },
+                (1, 1),
+            ),
+            (WorkerCommand::RefreshStatus, (1, 1)),
+            (
+                WorkerCommand::RunSpec(SpecState::default().spec_params().unwrap()),
+                (1, 2),
+            ),
+            (
+                WorkerCommand::RunS11(S11State::default().s11_params().unwrap()),
+                (1, 3),
+            ),
+            (WorkerCommand::RefreshStatus, (1, 3)),
+            (WorkerCommand::StopSweep, (1, 4)),
+            (WorkerCommand::Disconnect, (2, 5)),
+            (
+                WorkerCommand::Connect {
+                    host: "instrument.local".into(),
+                    port: 901,
+                },
+                (3, 6),
+            ),
+        ] {
+            state.send(command);
+            let envelope = rx.try_recv().unwrap();
+            assert_eq!((state.session_id, state.request_id), expected);
+            assert_eq!((envelope.session_id, envelope.request_id), expected);
+        }
+    }
+
+    #[test]
     fn changing_mode_stops_the_old_job_and_clears_both_run_indicators() {
         let (tx, rx) = mpsc::channel();
         let mut state = AppState {
@@ -404,13 +485,19 @@ mod tests {
         state.change_mode(AppMode::S11);
         assert_eq!(state.mode, AppMode::S11);
         assert!(!state.any_running());
-        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::StopSweep)));
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::StopSweep
+        ));
         state.change_mode(AppMode::S11);
         assert!(rx.try_recv().is_err());
         state.s11.running = true;
         state.change_mode(AppMode::Spec);
         assert!(!state.any_running());
-        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::StopSweep)));
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::StopSweep
+        ));
     }
 
     #[test]

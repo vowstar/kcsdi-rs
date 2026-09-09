@@ -196,3 +196,79 @@ fn run_button(ui: &mut egui::Ui, state: &mut AppState, running: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_impedance_views_preserve_the_request_but_phase_starts_a_new_one() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            connection: ConnectionState::Connected,
+            mode: crate::state::AppMode::S11,
+            s11: crate::state::S11State {
+                display: S11Display::Impedance,
+                running: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.send(WorkerCommand::RunS11(state.s11.s11_params().unwrap()));
+        let original = rx.try_recv().unwrap();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(650.0, 250.0));
+        for display in [S11Display::Smith, S11Display::Impedance, S11Display::Phase] {
+            let label = display.label(state.language);
+            let mut target = None;
+            for _ in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| show_trace_editor(ui, &mut state),
+                );
+                target = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    }
+                    _ => None,
+                });
+                output.drop_without_applying_deltas();
+            }
+            let pos = target.expect("display selector must be visible");
+            for pressed in [true, false] {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| show_trace_editor(ui, &mut state),
+                )
+                .drop_without_applying_deltas();
+            }
+            assert_eq!(state.s11.display, display);
+            assert_eq!(state.session_id, original.session_id);
+            if display == S11Display::Phase {
+                let next = rx.try_recv().unwrap();
+                assert_eq!(next.request_id, original.request_id + 1);
+                assert!(matches!(next.command, WorkerCommand::RunS11(params)
+                    if params.format == kcsdi_core::commands::Format::Ma));
+            } else {
+                assert_eq!(state.request_id, original.request_id);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+}

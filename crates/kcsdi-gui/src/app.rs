@@ -13,7 +13,7 @@ use crate::desktop::{self, Page};
 use crate::device_worker;
 use crate::i18n::{self, Language, StatusMessage, Text};
 use crate::panels;
-use crate::state::{AppMode, AppState, ConnectionState, S11Display, WorkerEvent};
+use crate::state::{AppMode, AppState, ConnectionState, EventEnvelope, S11Display, WorkerEvent};
 use crate::theme;
 use crate::widgets;
 
@@ -25,7 +25,7 @@ pub struct KcsdiApp {
     /// Application state shared across all panels.
     pub state: AppState,
     /// Receiver for events from the device worker thread.
-    evt_rx: mpsc::Receiver<WorkerEvent>,
+    evt_rx: mpsc::Receiver<EventEnvelope>,
     /// Last persisted config snapshot, for change detection.
     last_saved: AppConfig,
     /// When the first unsaved change happened (debounce start).
@@ -74,7 +74,22 @@ impl KcsdiApp {
         }
     }
 
-    /// Apply one worker event to the application state.
+    /// Results belong to a request, but loss of its socket affects the session.
+    fn apply_worker_event(&mut self, envelope: EventEnvelope) {
+        if envelope.session_id != self.state.session_id {
+            return;
+        }
+        if matches!(
+            envelope.event,
+            WorkerEvent::SweepTrace(_) | WorkerEvent::Error(_)
+        ) && envelope.request_id != self.state.request_id
+        {
+            return;
+        }
+        self.apply_event(envelope.event);
+    }
+
+    /// Apply an event after checking the identity of its source operation.
     fn apply_event(&mut self, evt: WorkerEvent) {
         match evt {
             WorkerEvent::Connected(info) => {
@@ -244,7 +259,7 @@ impl eframe::App for KcsdiApp {
 
         // Drain all pending events from the device worker.
         while let Ok(evt) = self.evt_rx.try_recv() {
-            self.apply_event(evt);
+            self.apply_worker_event(evt);
         }
 
         if ctx.input(|input| input.key_pressed(egui::Key::F11)) {
@@ -712,6 +727,145 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn active_impedance_app() -> KcsdiApp {
+        test_app(crate::state::AppState {
+            connection: ConnectionState::Connected,
+            mode: AppMode::S11,
+            session_id: 1,
+            request_id: 1,
+            temperature: Some(42.0),
+            s11: crate::state::S11State {
+                display: S11Display::Impedance,
+                points: 3,
+                running: true,
+                trace: Some(completed_impedance()),
+                needs_fit: false,
+                ..Default::default()
+            },
+            status_message: Some(StatusMessage::Text(Text::RunForDisplay)),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn late_same_format_results_and_errors_cannot_replace_a_new_request() {
+        let mut app = active_impedance_app();
+        let session_id = app.state.session_id;
+        let request_id = app.state.request_id;
+        app.state.send(crate::state::WorkerCommand::StopSweep);
+        app.state.s11.start_hz = 2_000_000.0;
+        let params = app.state.s11.s11_params().unwrap();
+        app.state.send(crate::state::WorkerCommand::RunS11(params));
+        let mut late = completed_impedance();
+        late.points[0].values = vec![75.0, 75.0, 0.0];
+        for event in [
+            WorkerEvent::SweepTrace(late.clone()),
+            WorkerEvent::Error("obsolete request failed".into()),
+        ] {
+            app.apply_worker_event(EventEnvelope {
+                session_id,
+                request_id,
+                event,
+            });
+            assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+            assert!(app.state.s11.running);
+            assert!(!app.state.s11.needs_fit);
+            assert!(matches!(
+                app.state.status_message,
+                Some(StatusMessage::Text(Text::RunForDisplay))
+            ));
+        }
+        app.apply_worker_event(EventEnvelope {
+            session_id,
+            request_id: app.state.request_id,
+            event: WorkerEvent::SweepTrace(late.clone()),
+        });
+        assert_eq!(app.state.s11.trace, Some(late));
+        assert!(app.state.status_message.is_none());
+    }
+
+    #[test]
+    fn connection_lifecycle_rejects_old_session_events_before_worker_acknowledgement() {
+        for reconnect in [false, true] {
+            let mut app = active_impedance_app();
+            let old_session = app.state.session_id;
+            app.state.send(crate::state::WorkerCommand::Disconnect);
+            if reconnect {
+                app.state.send(crate::state::WorkerCommand::Connect {
+                    host: "instrument.local".into(),
+                    port: 901,
+                });
+            }
+            for event in [
+                WorkerEvent::Connected(kcsdi_core::data::DeviceInfo {
+                    serial: "old-session".into(),
+                    username: String::new(),
+                    software: String::new(),
+                    hardware: String::new(),
+                    copyright: String::new(),
+                }),
+                WorkerEvent::Disconnected,
+                WorkerEvent::Status {
+                    temperature: 99.0,
+                    voltage: kcsdi_core::data::Voltage {
+                        external: 9.0,
+                        battery: 7.0,
+                    },
+                },
+                WorkerEvent::ConnectionLost("old socket closed".into()),
+            ] {
+                let request_id = app.state.request_id;
+                app.apply_worker_event(EventEnvelope {
+                    session_id: old_session,
+                    request_id,
+                    event,
+                });
+                assert_eq!(app.state.connection, ConnectionState::Connected);
+                assert!(app.state.device_info.is_none());
+                assert_eq!(app.state.temperature, Some(42.0));
+                assert!(app.state.voltage.is_none());
+                assert_eq!(app.state.request_id, request_id);
+                assert!(app.state.s11.running);
+                assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+            }
+        }
+    }
+
+    #[test]
+    fn connection_loss_from_an_old_request_still_invalidates_the_current_session() {
+        let mut app = active_impedance_app();
+        app.state.request_id = 3;
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: 1,
+            event: WorkerEvent::ConnectionLost("shared socket closed".into()),
+        });
+        assert!(matches!(app.state.connection, ConnectionState::Error(_)));
+        assert!(app.state.temperature.is_none());
+        assert!(!app.state.any_running());
+        assert_eq!(app.state.s11.trace, Some(completed_impedance()));
+    }
+
+    #[test]
+    fn health_events_follow_the_session_instead_of_the_measurement_request() {
+        let mut app = active_impedance_app();
+        app.state.request_id = 3;
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: 1,
+            event: WorkerEvent::Status {
+                temperature: 43.0,
+                voltage: kcsdi_core::data::Voltage {
+                    external: 12.0,
+                    battery: 8.0,
+                },
+            },
+        });
+        assert_eq!(app.state.temperature, Some(43.0));
+        assert!(app.state.s11.running);
+        assert_eq!(app.state.request_id, 3);
     }
 
     #[test]
