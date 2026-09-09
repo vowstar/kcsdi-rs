@@ -340,7 +340,8 @@ mod tests {
             },
             settings,
             session_id: u64::MAX - 9,
-            completed_at: UNIX_EPOCH + Duration::new(1_789_021_234, 987_654_321),
+            // Windows SystemTime represents whole 100 ns ticks.
+            completed_at: UNIX_EPOCH + Duration::new(1_789_021_234, 987_654_300),
         }
     }
 
@@ -401,7 +402,7 @@ mod tests {
                 for point in &mut snapshot.data.points {
                     point.freq_hz += index as f64 / 16.0;
                 }
-                snapshot.completed_at += Duration::from_nanos(index as u64);
+                snapshot.completed_at += Duration::from_nanos(index as u64 * 100);
                 (
                     TraceId(9_007_199_254_740_993 + index as u64),
                     Arc::new(snapshot),
@@ -465,7 +466,7 @@ mod tests {
                     assert_eq!(&record[15], "3");
                     assert_eq!(
                         &record[16],
-                        format!("1789021234.{:09}", 987_654_321 + trace_index)
+                        format!("1789021234.{:09}", 987_654_300 + trace_index * 100)
                     );
                     assert_eq!(&record[17], (u64::MAX - 9).to_string());
                     match snapshot.data.mode {
@@ -505,7 +506,7 @@ mod tests {
                 metadata.get_value((row, 11)),
                 Some(&Data::String(format!(
                     "1789021234.{:09}",
-                    987_654_321 + trace_index
+                    987_654_300 + trace_index * 100
                 )))
             );
             assert_eq!(
@@ -719,16 +720,16 @@ mod tests {
     fn timestamps_keep_subsecond_precision_on_both_sides_of_the_epoch() {
         assert_eq!(unix_timestamp(UNIX_EPOCH), "0.000000000");
         assert_eq!(
-            unix_timestamp(UNIX_EPOCH + Duration::new(2, 1)),
-            "2.000000001"
+            unix_timestamp(UNIX_EPOCH + Duration::new(2, 100)),
+            "2.000000100"
         );
         assert_eq!(
-            unix_timestamp(UNIX_EPOCH - Duration::new(0, 1)),
-            "-0.000000001"
+            unix_timestamp(UNIX_EPOCH - Duration::new(0, 100)),
+            "-0.000000100"
         );
         assert_eq!(
-            unix_timestamp(UNIX_EPOCH - Duration::new(2, 1)),
-            "-2.000000001"
+            unix_timestamp(UNIX_EPOCH - Duration::new(2, 100)),
+            "-2.000000100"
         );
     }
 }
