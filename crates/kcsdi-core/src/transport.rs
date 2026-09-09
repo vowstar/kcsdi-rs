@@ -8,12 +8,14 @@
 //! callers always get complete lines without the trailing `\n`.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-/// TCP connect timeout (protocol doc 1.2: 5 s suggested).
+/// Host budget for name resolution and TCP connection setup.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Generic command/response timeout (protocol doc 8.1: 10000 ms).
@@ -22,6 +24,74 @@ pub const GENERIC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Host safety limit for raw line bytes before LF, including an optional CR.
 /// This is not an instrument command or measurement limit.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
+
+static RESOLVER_BUSY: AtomicBool = AtomicBool::new(false);
+
+struct ResolverGuard;
+
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        RESOLVER_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// The OS resolver cannot be cancelled. Permit at most one outstanding lookup,
+/// even when its caller has timed out. This helper never opens a device socket.
+fn resolve_with_timeout(
+    lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>> {
+    remaining_timeout(started, timeout)?;
+    RESOLVER_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another host lookup is still running",
+            )
+        })?;
+    let guard = ResolverGuard;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("host-lookup".into())
+        .spawn(move || {
+            let resolver_guard = guard;
+            let result = lookup();
+            drop(resolver_guard);
+            let _ = sender.send(result);
+        })?;
+    let addresses = receiver
+        .recv_timeout(remaining_timeout(started, timeout)?)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => Error::Timeout,
+            mpsc::RecvTimeoutError::Disconnected => {
+                Error::Io(io::Error::other("host lookup terminated without a result"))
+            }
+        })?;
+    remaining_timeout(started, timeout)?;
+    Ok(addresses?)
+}
+
+fn connect_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    started: Instant,
+    timeout: Duration,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+) -> Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        let result = connect(&address, remaining_timeout(started, timeout)?);
+        remaining_timeout(started, timeout)?;
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(Error::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no address resolved")
+    })))
+}
 
 /// Byte transport for the KC901 text protocol.
 pub trait Transport {
@@ -42,25 +112,36 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    /// Connect to `host:port` with a 5 s connect timeout.
+    /// Resolve and connect to `host:port` within one 5 s budget.
+    /// Literal IP addresses bypass the OS resolver.
     pub fn connect(host: &str, port: u16) -> Result<Self> {
-        let mut last_err = None;
-        for addr in (host, port).to_socket_addrs()? {
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(stream) => {
-                    stream.set_nodelay(true)?;
-                    return Ok(Self {
-                        stream,
-                        buf: Vec::with_capacity(4096),
-                        failed: false,
-                    });
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(Error::Io(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no address resolved")
-        })))
+        Self::connect_with_timeout(host, port, CONNECT_TIMEOUT)
+    }
+
+    fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Self> {
+        let started = Instant::now();
+        let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+            vec![SocketAddr::new(address, port)]
+        } else {
+            let host = host.to_owned();
+            resolve_with_timeout(
+                move || {
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(Iterator::collect)
+                },
+                started,
+                timeout,
+            )?
+        };
+        let stream = connect_addresses(addresses, started, timeout, TcpStream::connect_timeout)?;
+        stream.set_nodelay(true)?;
+        remaining_timeout(started, timeout)?;
+        Ok(Self {
+            stream,
+            buf: Vec::with_capacity(4096),
+            failed: false,
+        })
     }
 
     fn invalidate(&mut self) {
@@ -160,7 +241,10 @@ fn write_with_deadline(
                     io::Error::new(io::ErrorKind::WriteZero, "command write stalled").into(),
                 );
             }
-            Ok(n) => data = &data[n..],
+            Ok(n) => {
+                remaining_timeout(started, timeout)?;
+                data = &data[n..];
+            }
             Err(e) if is_timeout(&e) => return Err(Error::Timeout),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
@@ -184,6 +268,161 @@ mod tests {
             f(sock);
         });
         (port, thread)
+    }
+
+    #[test]
+    fn stalled_lookup_is_bounded_and_does_not_block_literal_addresses() {
+        let (release, wait) = mpsc::channel();
+        let (ready, entered) = mpsc::channel();
+        let began = Instant::now();
+        let result = resolve_with_timeout(
+            move || {
+                ready.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+                Ok(Vec::new())
+            },
+            began,
+            Duration::from_millis(50),
+        );
+        assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..10 {
+            let result = resolve_with_timeout(
+                || panic!("a second lookup must not start"),
+                Instant::now(),
+                Duration::from_secs(2),
+            );
+            assert!(
+                matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        }
+
+        let (port, server) = spawn_server(|_| {});
+        let transport = TcpTransport::connect("127.0.0.1", port).unwrap();
+        drop(transport);
+        server.join().unwrap();
+
+        release.send(()).unwrap();
+        let released = Instant::now();
+        while RESOLVER_BUSY.load(Ordering::Acquire) {
+            assert!(released.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let address: SocketAddr = "127.0.0.1:901".parse().unwrap();
+        let result = resolve_with_timeout(
+            move || Ok(vec![address]),
+            Instant::now(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(result, vec![address]);
+        assert!(!RESOLVER_BUSY.load(Ordering::Acquire));
+        let result = resolve_with_timeout(
+            || Err(io::ErrorKind::NotFound.into()),
+            Instant::now(),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound));
+        assert!(!RESOLVER_BUSY.load(Ordering::Acquire));
+
+        let result = resolve_with_timeout(
+            || panic!("injected resolver failure"),
+            Instant::now(),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert!(!RESOLVER_BUSY.load(Ordering::Acquire));
+
+        let (port, server) = spawn_server(|_| {});
+        drop(TcpTransport::connect("localhost", port).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_connection_budget_does_not_start_a_lookup_or_socket() {
+        assert!(matches!(
+            resolve_with_timeout(
+                || panic!("an expired lookup must not start"),
+                Instant::now(),
+                Duration::ZERO,
+            ),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            TcpTransport::connect_with_timeout("127.0.0.1", 901, Duration::ZERO),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
+    fn address_attempts_share_the_original_connection_budget() {
+        let address: SocketAddr = "127.0.0.1:901".parse().unwrap();
+        let mut waits = Vec::new();
+        let result = connect_addresses(
+            [address; 100],
+            Instant::now(),
+            Duration::from_millis(50),
+            |_, remaining| {
+                waits.push(remaining);
+                std::thread::sleep(Duration::from_millis(20));
+                Err(io::ErrorKind::ConnectionRefused.into())
+            },
+        );
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(waits.len() < 100);
+        assert!(waits.windows(2).all(|pair| pair[1] < pair[0]));
+
+        let addresses = [
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let mut attempted = Vec::new();
+        let result = connect_addresses(
+            addresses,
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_secs(5),
+            |address, remaining| {
+                assert!(remaining < Duration::from_secs(4));
+                attempted.push(*address);
+                Err(io::ErrorKind::ConnectionRefused.into())
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused)
+        );
+        assert_eq!(attempted, addresses);
+
+        let result = connect_addresses([], Instant::now(), Duration::from_secs(2), |_, _| {
+            panic!("empty resolution must not attempt a connection")
+        });
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn late_connection_is_closed_before_a_handshake_can_be_sent() {
+        let (port, server) = spawn_server(|mut socket| {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).unwrap(), 0);
+        });
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut socket =
+            Some(TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap());
+        let result = connect_addresses(
+            [address],
+            Instant::now(),
+            Duration::from_millis(50),
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(socket.take().unwrap())
+            },
+        );
+        drop(socket);
+        assert!(matches!(result, Err(Error::Timeout)));
+        server.join().unwrap();
     }
 
     #[test]
@@ -389,6 +628,15 @@ mod tests {
     }
 
     #[test]
+    fn a_final_write_that_returns_after_the_deadline_is_not_success() {
+        let result = write_with_deadline(b"C", Duration::from_millis(5), |data, _| {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(data.len())
+        });
+        assert!(matches!(result, Err(Error::Timeout)));
+    }
+
+    #[test]
     fn command_write_stops_on_zero_progress_or_timeout() {
         let result = write_with_deadline(b"C", Duration::from_secs(2), |_, _| Ok(0));
         assert!(matches!(result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::WriteZero));
@@ -406,7 +654,7 @@ mod tests {
 
     #[test]
     fn stalled_command_write_invalidates_the_stream() {
-        let bytes = vec![b'x'; 1024 * 1024];
+        let bytes = vec![b'x'; 64 * 1024];
         let (release, wait) = std::sync::mpsc::channel();
         let (ready, started) = std::sync::mpsc::channel();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -427,15 +675,22 @@ mod tests {
         let send_buffer = socket.send_buffer_size().unwrap();
         let receive_buffer = started.recv_timeout(Duration::from_secs(2)).unwrap();
         let began = Instant::now();
-        let result = t.send_with_timeout(&bytes, Duration::from_millis(100));
+        let mut writes = 0;
+        let result = loop {
+            let result = t.send_with_timeout(&bytes, Duration::from_millis(100));
+            writes += 1;
+            if result.is_err() || writes == 1024 || began.elapsed() >= Duration::from_secs(2) {
+                break result;
+            }
+        };
         let elapsed = began.elapsed();
         let _ = release.send(());
         server.join().unwrap();
         assert!(
             matches!(result, Err(Error::Timeout)),
-            "{result:?}, send buffer {send_buffer}, receive buffer {receive_buffer}"
+            "{result:?}, elapsed {elapsed:?}, writes {writes}, send buffer {send_buffer}, receive buffer {receive_buffer}"
         );
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         assert!(matches!(t.send(b"C"), Err(Error::NotConnected)));
         assert!(matches!(
             t.recv_line(Duration::ZERO),
