@@ -194,7 +194,11 @@ pub fn show_layers(
 /// Draw all supplied complex traces on one grid and one Smith viewport.
 /// Scalar formats are rejected by the same conversion used by the single trace.
 /// Later layers win overlapping marker hits. Put the selected trace last.
-pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLayer<'_>]) {
+pub fn show_multi(
+    ui: &mut egui::Ui,
+    view: &mut SmithView,
+    layers: &mut [SmithLayer<'_>],
+) -> Option<u64> {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     ui.painter()
         .rect_filled(rect, 0.0, chart_color(ui.ctx(), BG_COLOR));
@@ -203,7 +207,7 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
         Pos2::new(rect.right(), rect.bottom() - FOOTER_HEIGHT),
     );
     if chart_rect.width() < 2.0 || chart_rect.height() < 2.0 {
-        return;
+        return None;
     }
 
     let points: Vec<_> = layers
@@ -222,19 +226,26 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
         &marker_points,
     );
     let mut marker_input = false;
+    let mut activated_trace = None;
     for (index, layer) in layers.iter_mut().enumerate() {
-        marker_input |= ui
-            .push_id(("smith_layer", layer.id), |ui| {
-                interact_markers(
-                    ui,
-                    &Mapping::new(chart_rect, view),
-                    chart_rect,
-                    &marker_points[index],
-                    layer.markers,
-                    &badges[index],
-                )
-            })
-            .inner;
+        // Marker hit regions share the chart, so their ID scope allocates no space.
+        let marker_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("smith_layer", layer.id))
+                .max_rect(chart_rect),
+        );
+        let input = interact_markers(
+            &marker_ui,
+            &Mapping::new(chart_rect, view),
+            chart_rect,
+            &marker_points[index],
+            layer.markers,
+            &badges[index],
+        );
+        marker_input |= input.busy;
+        if input.activated {
+            activated_trace = Some(layer.id);
+        }
     }
     if !marker_input {
         handle_input(ui, view, chart_rect, &response);
@@ -344,6 +355,7 @@ pub fn show_multi(ui: &mut egui::Ui, view: &mut SmithView, layers: &mut [SmithLa
             );
         }
     }
+    activated_trace
 }
 
 fn marker_point<'a>(points: &'a [SmithPoint], marker: &Marker) -> Option<&'a SmithPoint> {
@@ -449,9 +461,10 @@ fn interact_markers(
     points: &[SmithPoint],
     markers: &mut [Marker],
     badges: &[MarkerBadge],
-) -> bool {
+) -> super::plot::MarkerInput {
     let mut selected = None;
     let mut busy = false;
+    let mut activated = false;
     for marker in markers.iter_mut() {
         let Some(point) = marker_point(points, marker) else {
             continue;
@@ -480,6 +493,7 @@ fn interact_markers(
             );
         }
         busy |= response.hovered() || response.dragged();
+        activated |= response.clicked() || response.drag_started();
         if response.clicked() || response.dragged() {
             selected = Some(marker.id);
         }
@@ -507,7 +521,7 @@ fn interact_markers(
             marker.selected = marker.id == id;
         }
     }
-    busy
+    super::plot::MarkerInput { busy, activated }
 }
 
 fn draw_markers(
@@ -894,7 +908,9 @@ mod tests {
                 time: Some(time),
                 ..Default::default()
             },
-            |ui| show_multi(ui, view, layers),
+            |ui| {
+                show_multi(ui, view, layers);
+            },
         )
     }
 

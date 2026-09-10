@@ -297,6 +297,7 @@ impl KcsdiApp {
             self.state.workspace.frequency_editor.cancel();
             self.state.workspace.run_editor.cancel();
             self.state.desktop.lookup.cancel();
+            self.state.folder_opener.cancel();
             self.state.send(crate::state::WorkerCommand::Shutdown);
         }
         if !self.closing {
@@ -321,6 +322,7 @@ impl KcsdiApp {
             || self.state.workspace.frequency_editor.is_pending()
             || self.state.workspace.run_editor.is_pending()
             || self.state.desktop.lookup.is_pending()
+            || self.state.folder_opener.is_pending()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -413,7 +415,10 @@ impl eframe::App for KcsdiApp {
         self.state.workspace.frequency_editor.poll();
         self.state.workspace.run_editor.poll();
         self.state.desktop.lookup.poll();
-        if self.state.desktop.lookup.is_pending() {
+        if let Some(Err(error)) = self.state.folder_opener.poll() {
+            self.state.status_message = Some(error.into());
+        }
+        if self.state.desktop.lookup.is_pending() || self.state.folder_opener.is_pending() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         self.poll_close(&ctx);
@@ -500,6 +505,11 @@ impl eframe::App for KcsdiApp {
         {
             self.state.workspace.run = run;
         }
+        if let Some(path) = self.state.workspace.run_editor.take_open_directory()
+            && !self.closing
+        {
+            self.state.folder_opener.request(path, &ctx);
+        }
         self.state.reconcile_plan();
         if !self.closing {
             crate::calibration_panel::show(&ctx, &mut self.state);
@@ -511,6 +521,7 @@ impl eframe::App for KcsdiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_config();
         self.state.desktop.lookup.cancel();
+        self.state.folder_opener.cancel();
         self.state.send(crate::state::WorkerCommand::Shutdown);
         self.state.cmd_tx = None;
         if let Some(worker) = self.worker.take()
@@ -524,6 +535,7 @@ impl eframe::App for KcsdiApp {
 impl Drop for KcsdiApp {
     fn drop(&mut self) {
         self.state.desktop.lookup.cancel();
+        self.state.folder_opener.cancel();
         self.state.worker_shutdown.cancel();
         self.state.session_cancel.cancel();
         self.state.acquisition_cancel.cancel();
@@ -661,7 +673,8 @@ impl KcsdiApp {
         if cartesian && smith {
             let height = ui.available_height();
             egui::Panel::top("cartesian_region")
-                .exact_size(height * 0.5)
+                .default_size(height * 0.5)
+                .size_range(height * 0.25..=height * 0.75)
                 .resizable(true)
                 .show(ui, |ui| self.cartesian_ui(ui));
             egui::CentralPanel::default().show(ui, |ui| self.smith_ui(ui));
@@ -692,6 +705,14 @@ impl KcsdiApp {
                 trace
                     .analysis
                     .overlay_series(trace.settings.display.columns())
+            } else {
+                Vec::new()
+            };
+            let marker_frequencies = if trace.overlays_compatible() {
+                complete
+                    .as_ref()
+                    .map(|complete| trace.analysis.marker_frequencies(&complete.data))
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -727,13 +748,9 @@ impl KcsdiApp {
             );
             let base_count = series.len();
             series.extend(overlays);
-            let partial = trace
-                .preview
-                .as_ref()
-                .is_some_and(|preview| !preview.data.points.is_empty());
             prepared.push((
                 base_count,
-                partial,
+                marker_frequencies,
                 widgets::plot::PlotOptions {
                     y_label: trace.settings.display.unit(),
                     log_x: workspace.log_x,
@@ -748,17 +765,14 @@ impl KcsdiApp {
             .filter(|trace| trace.settings.visible && !trace.settings.display.is_smith())
             .zip(prepared.iter_mut())
             .map(
-                |(trace, (_, partial, options, _))| widgets::plot::CartesianLayer {
+                |(trace, (_, marker_frequencies, options, _))| widgets::plot::CartesianLayer {
                     id: trace.id.0,
                     label: format!("T{} {}", trace.id.0, trace.settings.display.label(language)),
                     view: &mut trace.view,
                     options: options.clone(),
                     line_width: trace.settings.line_width,
-                    markers: if *partial {
-                        &mut []
-                    } else {
-                        trace.analysis.markers_mut()
-                    },
+                    markers: trace.analysis.markers_mut(),
+                    marker_frequencies,
                 },
             )
             .collect();
@@ -769,6 +783,9 @@ impl KcsdiApp {
         }
         let options: Vec<_> = layers.iter().map(|layer| layer.options.clone()).collect();
         drop(layers);
+        if let Some(id) = changes.activated_trace {
+            workspace.selected = Some(crate::acquisition::TraceId(id));
+        }
         let mut reset_x = None;
         let bounds = workspace.frequency_bounds();
         for ((trace, (base_count, _, _, completed_options)), options) in workspace
@@ -778,7 +795,7 @@ impl KcsdiApp {
             .zip(prepared)
             .zip(options)
         {
-            if let Some((_, lock)) = changes.iter().find(|(id, _)| *id == trace.id.0) {
+            if let Some((_, lock)) = changes.view_locks.iter().find(|(id, _)| *id == trace.id.0) {
                 match lock {
                     widgets::plot::ViewLock::Locked => trace.view_locked = true,
                     widgets::plot::ViewLock::Unlocked => {
@@ -853,21 +870,17 @@ impl KcsdiApp {
                     marker_trace: marker_data.as_ref(),
                     color: displayed_color(trace.settings.color, ui.visuals().dark_mode),
                     line_width: trace.settings.line_width,
-                    markers: if trace
-                        .preview
-                        .as_ref()
-                        .is_some_and(|preview| !preview.data.points.is_empty())
-                    {
-                        &mut []
-                    } else {
-                        trace.analysis.markers_mut()
-                    },
+                    markers: trace.analysis.markers_mut(),
                 },
             )
             .collect();
         layers
             .sort_by_key(|layer| Some(crate::acquisition::TraceId(layer.id)) == workspace.selected);
-        widgets::smith::show_multi(ui, &mut workspace.smith, &mut layers);
+        let activated = widgets::smith::show_multi(ui, &mut workspace.smith, &mut layers);
+        drop(layers);
+        if let Some(id) = activated {
+            workspace.selected = Some(crate::acquisition::TraceId(id));
+        }
     }
 }
 
@@ -1052,53 +1065,63 @@ fn trace_list(ui: &mut egui::Ui, state: &mut AppState) {
         };
         let card = ui
             .push_id(("trace_card", trace.id.0), |ui| {
-                egui::Frame::new()
-                    .inner_margin(8)
-                    .fill(fill)
-                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                    .corner_radius(4)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    egui::Frame::new()
+                        .inner_margin(8)
+                        .fill(fill)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .corner_radius(4)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(format!("T{}", trace.id.0))
+                                                .strong(),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    state.workspace.selected = Some(trace.id);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.menu_button("...", |ui| {
+                                            if ui.button(language.text(Text::Edit)).clicked() {
+                                                edit = Some(trace.id);
+                                                ui.close();
+                                            }
+                                            if ui.button(language.text(Text::Delete)).clicked() {
+                                                delete = Some(trace.id);
+                                                ui.close();
+                                            }
+                                        });
+                                        visibility_control(
+                                            ui,
+                                            &mut trace.settings.visible,
+                                            language,
+                                        );
+                                    },
+                                );
+                            });
                             if ui
                                 .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(format!("T{}", trace.id.0)).strong(),
-                                    )
-                                    .frame(false),
+                                    egui::Button::new(trace.settings.display.label(language))
+                                        .frame(false),
                                 )
                                 .clicked()
                             {
                                 state.workspace.selected = Some(trace.id);
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.menu_button("...", |ui| {
-                                        if ui.button(language.text(Text::Edit)).clicked() {
-                                            edit = Some(trace.id);
-                                            ui.close();
-                                        }
-                                        if ui.button(language.text(Text::Delete)).clicked() {
-                                            delete = Some(trace.id);
-                                            ui.close();
-                                        }
-                                    });
-                                    visibility_control(ui, &mut trace.settings.visible, language);
-                                },
-                            );
                         });
-                        if ui
-                            .add(
-                                egui::Button::new(trace.settings.display.label(language))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
-                            state.workspace.selected = Some(trace.id);
-                        }
-                    })
+                })
             })
             .inner;
+        if card.response.clicked() {
+            state.workspace.selected = Some(trace.id);
+        }
         if selected {
             ui.painter().line_segment(
                 [
@@ -1884,6 +1907,358 @@ mod tests {
                 |ui| app.plot_ui(ui),
             )
             .drop_without_applying_deltas();
+    }
+
+    fn interaction_frame(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        time: f64,
+        contents: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            contents,
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn text_bounds(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing text {label}"))
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn trace_card_background_selects_without_stealing_child_controls() {
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            theme::setup(&ctx);
+            let mut app = active_impedance_app();
+            app.state.language = language;
+            let second = app
+                .state
+                .workspace
+                .add_trace(TraceSettings::default())
+                .unwrap();
+            app.state.workspace.selected = Some(TraceId(1));
+            let request = app.state.request_id;
+            let size = egui::vec2(400.0, 400.0);
+            let mut time = 0.0;
+            let mut frame = |state: &mut AppState, events| {
+                time += 0.02;
+                interaction_frame(&ctx, size, events, time, |ui| {
+                    ui.set_max_width(256.0);
+                    trace_list(ui, state);
+                })
+            };
+            let output = frame(&mut app.state, vec![]);
+            let heading = text_bounds(&output, "T2").center();
+            let card = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(shape)
+                        if shape.rect.contains(heading)
+                            && shape.rect.width() > 200.0
+                            && shape.rect.height() < 110.0 =>
+                    {
+                        Some(shape.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let body = card.right_bottom() - egui::vec2(12.0, 10.0);
+            for events in [
+                vec![egui::Event::PointerMoved(body)],
+                vec![pointer_button(body, true)],
+                vec![pointer_button(body, false)],
+            ] {
+                frame(&mut app.state, events).drop_without_applying_deltas();
+            }
+            assert_eq!(app.state.workspace.selected, Some(second));
+            assert_eq!(app.state.request_id, request);
+            app.state.workspace.selected = Some(TraceId(1));
+            let eye = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Ellipse(shape) if card.contains(shape.center) => {
+                        Some(shape.center)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let menu = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text() == "..." && card.contains(text.pos) =>
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for position in [eye, menu] {
+                for events in [
+                    vec![egui::Event::PointerMoved(position)],
+                    vec![pointer_button(position, true)],
+                    vec![pointer_button(position, false)],
+                ] {
+                    frame(&mut app.state, events).drop_without_applying_deltas();
+                }
+                assert_eq!(app.state.workspace.selected, Some(TraceId(1)));
+            }
+            assert!(!app.state.workspace.traces[1].settings.visible);
+            assert_eq!(app.state.request_id, request);
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    fn two_marker_traces(display: S11Display) -> KcsdiApp {
+        use crate::analysis_tools::{AnalysisConfig, MarkerTarget};
+        let mut app = active_impedance_app();
+        let settings = TraceSettings {
+            display: TraceDisplay::S11(display),
+            ..Default::default()
+        };
+        app.state.workspace.traces[0].update_settings(settings.clone());
+        app.state.workspace.add_trace(settings).unwrap();
+        app.state.reconcile_plan();
+        let mut delivery = completion(&app, 0, 1);
+        if let WorkerEvent::SweepTrace(delivery) = &mut delivery.event {
+            for (point, resistance) in Arc::make_mut(&mut delivery.snapshot)
+                .data
+                .points
+                .iter_mut()
+                .zip([10.0, 50.0, 200.0])
+            {
+                point.values = vec![resistance, resistance, 0.0];
+            }
+        }
+        app.apply_worker_event(delivery);
+        for trace in &mut app.state.workspace.traces {
+            trace.analysis.restore_config(&AnalysisConfig {
+                markers: vec![widgets::plot::Marker {
+                    id: 1,
+                    frequency_hz: 1e6,
+                    selected: true,
+                    ..Default::default()
+                }],
+                hold: true,
+                column: 1,
+                target: if display == S11Display::Smith {
+                    MarkerTarget::Hold
+                } else {
+                    MarkerTarget::Current
+                },
+                ..Default::default()
+            });
+            trace.analysis.observe(trace.completed.as_ref().unwrap());
+        }
+        app.state.workspace.selected = Some(TraceId(1));
+        app.apply_preview(prefix(&app, 0, 2, 1));
+        app
+    }
+
+    #[test]
+    fn compatible_preview_markers_drag_on_complete_targets_and_select_their_trace() {
+        for display in [S11Display::Resistance, S11Display::Smith] {
+            let mut app = two_marker_traces(display);
+            let ctx = egui::Context::default();
+            let size = egui::vec2(800.0, 600.0);
+            let request = app.state.request_id;
+            let original = app.state.workspace.traces[1].completed.clone().unwrap();
+            let output = interaction_frame(&ctx, size, vec![], 0.0, |ui| app.plot_ui(ui));
+            let from = text_bounds(&output, "T2 M1").center();
+            output.drop_without_applying_deltas();
+            let to = if display == S11Display::Smith {
+                egui::pos2(700.0, 315.0)
+            } else {
+                egui::pos2(795.0, from.y + 12.0)
+            };
+            for (index, events) in [
+                vec![egui::Event::PointerMoved(from)],
+                vec![pointer_button(from, true)],
+                vec![egui::Event::PointerMoved(to)],
+                vec![pointer_button(to, false)],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                interaction_frame(&ctx, size, events, (index + 1) as f64 * 0.02, |ui| {
+                    app.plot_ui(ui)
+                })
+                .drop_without_applying_deltas();
+                if index == 0 {
+                    assert_eq!(app.state.workspace.selected, Some(TraceId(1)));
+                }
+            }
+            assert_eq!(app.state.workspace.selected, Some(TraceId(2)));
+            assert_eq!(
+                app.state.workspace.traces[1].analysis.markers()[0].frequency_hz,
+                2e6
+            );
+            assert_eq!(
+                app.state.workspace.traces[0].analysis.markers()[0].frequency_hz,
+                1e6
+            );
+            assert_eq!(app.state.request_id, request);
+            assert!(Arc::ptr_eq(
+                app.state.workspace.traces[1].completed.as_ref().unwrap(),
+                &original
+            ));
+            assert_eq!(
+                app.state.workspace.traces[1]
+                    .preview
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .points
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_preview_or_missing_hold_hides_markers_without_blocking_pan() {
+        use crate::analysis_tools::{AnalysisConfig, MarkerTarget};
+        for display in [S11Display::Resistance, S11Display::Smith] {
+            for missing_hold in [false, true] {
+                let mut app = two_marker_traces(display);
+                for trace in &mut app.state.workspace.traces {
+                    if missing_hold {
+                        let markers = trace.analysis.markers().to_vec();
+                        trace.analysis.restore_config(&AnalysisConfig {
+                            markers,
+                            target: MarkerTarget::Hold,
+                            ..Default::default()
+                        });
+                    } else {
+                        let old = trace.preview.take().unwrap();
+                        trace.preview = Some(Arc::new(crate::preview::PreviewEnvelope {
+                            session_id: old.session_id + 1,
+                            request_id: old.request_id,
+                            cycle_id: old.cycle_id,
+                            data: old.data.clone(),
+                            group: old.group.clone(),
+                        }));
+                    }
+                }
+                let ctx = egui::Context::default();
+                let size = egui::vec2(800.0, 600.0);
+                let output = interaction_frame(&ctx, size, vec![], 0.0, |ui| app.plot_ui(ui));
+                assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains(" M1"))));
+                output.drop_without_applying_deltas();
+                let before_x = app.state.workspace.x_view.x_min;
+                let before_smith = app.state.workspace.smith;
+                let from = egui::pos2(300.0, 350.0);
+                let to = from + egui::vec2(40.0, 30.0);
+                for (index, events) in [
+                    vec![egui::Event::PointerMoved(from)],
+                    vec![pointer_button(from, true)],
+                    vec![egui::Event::PointerMoved(to)],
+                    vec![pointer_button(to, false)],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    interaction_frame(&ctx, size, events, (index + 1) as f64 * 0.02, |ui| {
+                        app.plot_ui(ui)
+                    })
+                    .drop_without_applying_deltas();
+                }
+                if display == S11Display::Smith {
+                    assert_ne!(app.state.workspace.smith, before_smith);
+                } else {
+                    assert_ne!(app.state.workspace.x_view.x_min, before_x);
+                }
+                assert_eq!(app.state.workspace.selected, Some(TraceId(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_chart_divider_drag_and_window_resize_obey_responsive_bounds() {
+        let mut app = active_impedance_app();
+        app.state
+            .workspace
+            .add_trace(TraceSettings {
+                display: TraceDisplay::S11(S11Display::Smith),
+                ..Default::default()
+            })
+            .unwrap();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(800.0, 600.0);
+        let mut chart_top = |events, time, size| {
+            let output = interaction_frame(&ctx, size, events, time, |ui| app.plot_ui(ui));
+            let top = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, .. }
+                        if points[0].y == points[1].y
+                            && (points[1].x - points[0].x).abs() > size.x * 0.95 =>
+                    {
+                        Some(points[0].y)
+                    }
+                    _ => None,
+                })
+                .expect("mixed chart divider");
+            output.drop_without_applying_deltas();
+            top
+        };
+        let before = chart_top(vec![], 0.0, size);
+        assert_eq!(chart_top(vec![], 0.01, size), before);
+        let from = egui::pos2(400.0, 300.0);
+        let to = egui::pos2(400.0, 420.0);
+        for (index, events) in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![pointer_button(from, true)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![pointer_button(to, false)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            chart_top(events, (index + 1) as f64 * 0.02, size);
+        }
+        let after = chart_top(vec![], 0.2, size);
+        assert!(
+            after > before + 60.0,
+            "divider did not move: {before} {after}"
+        );
+        assert!(after < 470.0);
+        let shrunk = chart_top(vec![], 0.3, egui::vec2(800.0, 300.0));
+        assert!(
+            (75.0..250.0).contains(&shrunk),
+            "unbounded split after window resize: {shrunk}"
+        );
     }
 
     #[test]
@@ -2756,6 +3131,55 @@ mod tests {
                 .contains(&egui::ViewportCommand::Close)
         );
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn pending_folder_launch_never_delays_device_shutdown_or_host_close() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = test_app(AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        });
+        let (release, ready) = app.state.folder_opener.start_test_blocked();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let started = Instant::now();
+        let mut output = ctx.run_ui(input, |ui| app.poll_close(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::Shutdown
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        output.drop_without_applying_deltas();
+        // Host cancellation completes even while the native manager stays blocked.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.state.folder_opener.is_pending() {
+            assert!(Instant::now() < deadline);
+            assert!(app.state.folder_opener.poll().is_none());
+            std::thread::yield_now();
+        }
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.poll_close(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        output.drop_without_applying_deltas();
+        release.send(()).unwrap();
     }
 
     #[test]

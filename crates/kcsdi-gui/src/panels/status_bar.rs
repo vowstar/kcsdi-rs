@@ -104,8 +104,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
             }
         }
         if let Some((pass_id, path)) = &state.last_recording {
-            ui.label(format!("{} {pass_id}", language.text(Text::RunSaved)))
-                .on_hover_text(path.display().to_string());
+            let folder = path.parent().filter(|path| path.is_absolute());
+            if ui
+                .add_enabled(
+                    folder.is_some() && !state.folder_opener.is_pending(),
+                    egui::Button::new(format!("{} {pass_id}", language.text(Text::RunSaved))),
+                )
+                .on_hover_text(format!(
+                    "{}\n{}",
+                    language.text(Text::OpenFolder),
+                    path.display()
+                ))
+                .clicked()
+                && let Some(folder) = folder
+            {
+                state.folder_opener.request(folder.to_owned(), ui.ctx());
+            }
         }
         if let Some(msg) = &state.status_message {
             let text = msg.text(language);

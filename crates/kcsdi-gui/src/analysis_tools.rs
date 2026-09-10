@@ -292,6 +292,19 @@ impl AnalysisTools {
         &mut self.markers
     }
 
+    /// Scalar marker interaction uses the completed target, never a preview.
+    pub fn marker_frequencies(&self, trace: &SweepData) -> Vec<f64> {
+        trace
+            .points
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                let value = self.target_row(trace, index)?.get(self.column)?;
+                (point.freq_hz.is_finite() && value.is_finite()).then_some(point.freq_hz)
+            })
+            .collect()
+    }
+
     /// Frozen measured rows remain valid complex data. Scalar envelopes
     /// are deliberately excluded from this Smith-chart snapshot.
     pub fn held_trace(&self) -> Option<SweepData> {
@@ -1874,6 +1887,50 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    #[test]
+    fn marker_frequency_grid_uses_the_chosen_completed_target_and_column() {
+        let first = trace(&[10.0, f64::NAN, 30.0]);
+        let second = trace(&[f64::NAN, 20.0, 40.0]);
+        let mut tools = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            ..Default::default()
+        };
+        tools.observe(&snapshot(&first));
+        tools.observe(&snapshot(&second));
+        for (target, expected) in [
+            (MarkerTarget::Current, vec![2e6, 3e6]),
+            (MarkerTarget::Hold, vec![1e6, 3e6]),
+            (MarkerTarget::Maximum, vec![1e6, 2e6, 3e6]),
+            (MarkerTarget::Minimum, vec![1e6, 2e6, 3e6]),
+        ] {
+            tools.target = target;
+            assert_eq!(tools.marker_frequencies(&second), expected);
+        }
+        tools.target = MarkerTarget::Hold;
+        let mut different = second.clone();
+        different.points[0].freq_hz += 1.0;
+        assert!(tools.marker_frequencies(&different).is_empty());
+        tools.hold = false;
+        assert!(tools.marker_frequencies(&second).is_empty());
+        tools.target = MarkerTarget::Current;
+        tools.column = 1;
+        assert!(tools.marker_frequencies(&second).is_empty());
+    }
+
+    #[test]
+    fn marker_frequency_grid_preserves_reported_order_and_duplicates() {
+        let mut data = trace(&[1.0, 2.0, 3.0, 4.0]);
+        for (point, frequency) in data.points.iter_mut().zip([3e6, 2e6, 2e6, f64::INFINITY]) {
+            point.freq_hz = frequency;
+        }
+        assert_eq!(
+            AnalysisTools::default().marker_frequencies(&data),
+            [3e6, 2e6, 2e6]
+        );
     }
 
     #[test]

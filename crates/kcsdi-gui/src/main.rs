@@ -16,6 +16,7 @@ mod desktop;
 mod device_lookup;
 mod device_worker;
 mod export;
+mod folder_opener;
 mod frequency_editor;
 mod frequency_list;
 mod health;

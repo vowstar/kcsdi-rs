@@ -128,7 +128,20 @@ pub struct CartesianLayer<'a> {
     pub view: &'a mut PlotView,
     pub options: PlotOptions<'static>,
     pub markers: &'a mut [Marker],
+    pub marker_frequencies: &'a [f64],
     pub line_width: f32,
+}
+
+#[derive(Debug, Default)]
+pub struct MultiPlotResponse {
+    pub view_locks: Vec<(u64, ViewLock)>,
+    pub activated_trace: Option<u64>,
+}
+
+#[derive(Default)]
+pub(super) struct MarkerInput {
+    pub busy: bool,
+    pub activated: bool,
 }
 
 impl<'a> PlotOptions<'a> {
@@ -577,7 +590,7 @@ pub fn show_multi(
     ui: &mut egui::Ui,
     layers: &mut [CartesianLayer<'_>],
     selected: Option<u64>,
-) -> Vec<(u64, ViewLock)> {
+) -> MultiPlotResponse {
     let (rect, response) = ui.allocate_at_least(ui.available_size(), Sense::click_and_drag());
     let plot_rect = Rect::from_min_max(
         rect.left_top() + egui::vec2(MARGIN_LEFT, MARGIN_TOP),
@@ -591,8 +604,12 @@ pub fn show_multi(
         .iter()
         .map(|layer| (layer.id, ViewLock::Unchanged))
         .collect();
+    let mut activated_trace = None;
     if !plot_rect.is_positive() {
-        return locks;
+        return MultiPlotResponse {
+            view_locks: locks,
+            activated_trace,
+        };
     }
     let Some(active) = active_layer(layers, selected) else {
         ui.painter().text(
@@ -602,7 +619,10 @@ pub fn show_multi(
             FontId::monospace(14.0),
             chart_color(ui.ctx(), TEXT_COLOR),
         );
-        return locks;
+        return MultiPlotResponse {
+            view_locks: locks,
+            activated_trace,
+        };
     };
     let layer = &mut layers[active];
     ensure_x_view(layer.view, &layer.options);
@@ -617,17 +637,26 @@ pub fn show_multi(
         .chain(std::iter::once(active))
     {
         let layer = &mut layers[index];
-        marker_input |= ui
-            .push_id(("cartesian_layer", layer.id), |ui| {
-                interact_markers(
-                    ui,
-                    &Mapping::new(layer.view, layer.options.log_x, plot_rect),
-                    &layer.options,
-                    layer.markers,
-                    &badges[index],
-                )
-            })
-            .inner;
+        if layer.options.visible_series().next().is_none() {
+            continue;
+        }
+        // Marker hit regions share the plot, so their ID scope allocates no space.
+        let marker_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("cartesian_layer", layer.id))
+                .max_rect(plot_rect),
+        );
+        let input = interact_markers(
+            &marker_ui,
+            &Mapping::new(layer.view, layer.options.log_x, plot_rect),
+            layer.marker_frequencies,
+            layer.markers,
+            &badges[index],
+        );
+        marker_input |= input.busy;
+        if input.activated {
+            activated_trace = Some(layer.id);
+        }
     }
     if !over_legend && !marker_input {
         let layer = &mut layers[active];
@@ -665,7 +694,12 @@ pub fn show_multi(
         }
     }
     for layer in layers.iter() {
-        if layer.options.visible_series().any(|s| !s.points.is_empty()) {
+        if layer.options.visible_series().next().is_some()
+            && layer
+                .marker_frequencies
+                .iter()
+                .any(|&frequency| usable_x(layer.options.log_x, frequency))
+        {
             let mapping = Mapping::new(layer.view, layer.options.log_x, plot_rect);
             draw_markers(&clipped, &mapping, layer.markers, &[]);
         }
@@ -706,7 +740,10 @@ pub fn show_multi(
         draw_cursor(ui.painter(), &layers[active].options, &mapping, &response);
     }
     draw_multi_legend(ui, layers, legend);
-    locks
+    MultiPlotResponse {
+        view_locks: locks,
+        activated_trace,
+    }
 }
 
 fn active_layer(layers: &[CartesianLayer<'_>], selected: Option<u64>) -> Option<usize> {
@@ -754,12 +791,12 @@ fn multi_marker_badges(
     // Allocate readable captions to the selected trace first, then the others.
     for index in std::iter::once(active).chain((0..layers.len()).filter(|&i| i != active)) {
         let layer = &layers[index];
-        if layer.options.visible_series().any(|series| {
-            series
-                .points
+        if layer.options.visible_series().next().is_some()
+            && layer
+                .marker_frequencies
                 .iter()
-                .any(|&(x, y)| usable_x(layer.options.log_x, x) && y.is_finite())
-        }) {
+                .any(|&frequency| usable_x(layer.options.log_x, frequency))
+        {
             badges[index] = cartesian_marker_badges(
                 painter,
                 &Mapping::new(layer.view, layer.options.log_x, rect),
@@ -856,14 +893,19 @@ pub fn show_with_markers(
         None,
         &mut MarkerLabelLayout::new(plot_rect, vec![legend]),
     );
+    let frequencies: Vec<_> = opts
+        .visible_series()
+        .flat_map(|series| &series.points)
+        .filter_map(|&(frequency, value)| value.is_finite().then_some(frequency))
+        .collect();
     let marker_input = interact_markers(
         ui,
         &Mapping::new(view, opts.log_x, plot_rect),
-        opts,
+        &frequencies,
         markers,
         &badges,
     );
-    let lock = if over_legend || marker_input {
+    let lock = if over_legend || marker_input.busy {
         ViewLock::Unchanged
     } else {
         handle_input(ui, view, opts, plot_rect, &response)
@@ -920,20 +962,21 @@ pub fn show_with_markers(
 fn interact_markers(
     ui: &egui::Ui,
     mapping: &Mapping,
-    opts: &PlotOptions,
+    frequencies: &[f64],
     markers: &mut [Marker],
     badges: &[MarkerBadge],
-) -> bool {
-    if !opts
-        .visible_series()
-        .any(|series| !series.points.is_empty())
+) -> MarkerInput {
+    if !frequencies
+        .iter()
+        .any(|&frequency| usable_x(mapping.log_x, frequency))
     {
-        return false;
+        return MarkerInput::default();
     }
     let mut selected = None;
     let mut busy = false;
+    let mut activated = false;
     for marker in markers.iter_mut() {
-        if !usable_x(opts.log_x, marker.frequency_hz) {
+        if !usable_x(mapping.log_x, marker.frequency_hz) {
             continue;
         }
         let x = mapping.to_screen(marker.frequency_hz, mapping.y_min).x;
@@ -952,6 +995,7 @@ fn interact_markers(
             )
             .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
         busy |= response.hovered() || response.dragged();
+        activated |= response.clicked() || response.drag_started();
         if response.clicked() || response.dragged() {
             selected = Some(marker.id);
         }
@@ -963,11 +1007,10 @@ fn interact_markers(
         {
             let frequency =
                 mapping.frequency_at(pos.x.clamp(mapping.rect.left(), mapping.rect.right()));
-            if let Some((x, _)) = opts
-                .visible_series()
-                .flat_map(|s| &s.points)
-                .filter(|(x, y)| usable_x(opts.log_x, *x) && y.is_finite())
-                .min_by(|a, b| (a.0 - frequency).abs().total_cmp(&(b.0 - frequency).abs()))
+            if let Some(x) = frequencies
+                .iter()
+                .filter(|&&x| usable_x(mapping.log_x, x))
+                .min_by(|a, b| (**a - frequency).abs().total_cmp(&(**b - frequency).abs()))
             {
                 marker.frequency_hz = *x;
             }
@@ -978,7 +1021,7 @@ fn interact_markers(
             marker.selected = marker.id == id;
         }
     }
-    busy
+    MarkerInput { busy, activated }
 }
 
 fn draw_markers(
@@ -1560,7 +1603,7 @@ mod tests {
                 time: Some(time),
                 ..Default::default()
             },
-            |ui| locks = show_multi(ui, layers, selected),
+            |ui| locks = show_multi(ui, layers, selected).view_locks,
         );
         (locks, output)
     }
@@ -1576,6 +1619,7 @@ mod tests {
             view,
             options: options(points, false),
             markers: &mut [],
+            marker_frequencies: &[1e6, 2e6, 3e6],
             line_width: id as f32,
         }
     }

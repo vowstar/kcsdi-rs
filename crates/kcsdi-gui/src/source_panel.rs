@@ -265,34 +265,65 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     columns[0].heading(language.text(Text::SourceFrequency));
                     columns[0].scope(|ui| {
                         ui.style_mut().override_font_id = Some(egui::FontId::monospace(32.0));
-                        ui.add(
+                        let before = draft.frequency_hz;
+                        let response = ui.add(
                             egui::DragValue::new(&mut draft.frequency_hz)
                                 .range(0..=kind.max_frequency_hz())
                                 .clamp_existing_to_range(false)
                                 .speed(1)
-                                .custom_formatter(|value, _| scaled_readout(value, 1_000_000.0, 6))
+                                .custom_formatter(|value, _| format!("{:.6}", value / 1_000_000.0))
                                 .custom_parser(|text| parse_scaled_hz(text, 1_000_000.0))
                                 .suffix(" MHz"),
                         );
+                        let delta = digit_wheel_delta(
+                            ui,
+                            &response,
+                            &format!("{:.6}", before as f64 / 1_000_000.0),
+                            " MHz",
+                        );
+                        if delta != 0 {
+                            draft.frequency_hz = draft
+                                .frequency_hz
+                                .saturating_add_signed(delta)
+                                .min(kind.max_frequency_hz());
+                        }
                     });
                     columns[1].heading(language.text(Text::SourceAmplitude));
                     columns[1].scope(|ui| {
                         ui.style_mut().override_font_id = Some(egui::FontId::monospace(32.0));
                         if draft.port == "afout" {
-                            ui.add(
+                            let before = draft.amplitude_mv;
+                            let response = ui.add(
                                 egui::DragValue::new(&mut draft.amplitude_mv)
                                     .range(0..=AFOUT_MAX_MV)
                                     .clamp_existing_to_range(false)
+                                    .custom_formatter(|value, _| format!("{value:.0}"))
                                     .suffix(" mV VPP"),
                             );
+                            let delta =
+                                digit_wheel_delta(ui, &response, &before.to_string(), " mV VPP");
+                            if delta != 0 {
+                                draft.amplitude_mv = (i64::from(draft.amplitude_mv) + delta)
+                                    .clamp(0, i64::from(AFOUT_MAX_MV))
+                                    as u32;
+                            }
                         } else {
                             let (min, max) = kind.amplitude_dbm_range();
-                            ui.add(
+                            let before = draft.amplitude_dbm;
+                            let response = ui.add(
                                 egui::DragValue::new(&mut draft.amplitude_dbm)
                                     .range(min..=max)
                                     .clamp_existing_to_range(false)
+                                    .custom_formatter(|value, _| format!("{value:.0}"))
                                     .suffix(" dBm"),
                             );
+                            let delta =
+                                digit_wheel_delta(ui, &response, &before.to_string(), " dBm");
+                            if delta != 0 {
+                                draft.amplitude_dbm = (i64::from(draft.amplitude_dbm) + delta)
+                                    .clamp(i64::from(min), i64::from(max))
+                                    as i32;
+                            }
                         }
                     });
                     columns[1].add_space(12.0);
@@ -367,6 +398,119 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.small(language.text(Text::SourceApplyHelp));
             });
         });
+}
+
+#[derive(Clone, Copy, Default)]
+struct WheelRemainder {
+    step: i64,
+    value: f64,
+}
+
+fn digit_step(number: &str, index: usize) -> Option<i64> {
+    number
+        .as_bytes()
+        .get(index)
+        .filter(|byte| byte.is_ascii_digit())?;
+    let right = number[index + 1..]
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .count();
+    10_i64.checked_pow(u32::try_from(right).ok()?)
+}
+
+/// Consume original wheel events once. Smoothing frames cannot replay an edit.
+fn digit_wheel_delta(ui: &egui::Ui, response: &egui::Response, number: &str, suffix: &str) -> i64 {
+    let id = response.id.with("digit_wheel");
+    if !response.hovered() || !response.enabled() || response.has_focus() || response.dragged() {
+        ui.data_mut(|data| data.remove::<WheelRemainder>(id));
+        return 0;
+    }
+    let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+        return 0;
+    };
+    let font = ui
+        .style()
+        .override_font_id
+        .clone()
+        .unwrap_or_else(|| ui.style().drag_value_text_style.resolve(ui.style()));
+    let galley =
+        ui.painter()
+            .layout_no_wrap(format!("{number}{suffix}"), font, ui.visuals().text_color());
+    let inner = response.rect.shrink2(ui.spacing().button_padding);
+    let origin = egui::Align2([ui.layout().horizontal_align(), ui.layout().vertical_align()])
+        .align_size_within_rect(galley.size(), inner)
+        .min;
+    let Some(row) = galley.rows.first() else {
+        return 0;
+    };
+    let Some((index, glyph)) = row.glyphs.iter().enumerate().find(|(_, glyph)| {
+        let left = origin.x + glyph.pos.x;
+        pointer.x >= left && pointer.x < left + glyph.advance_width
+    }) else {
+        return 0;
+    };
+    let Some(step) = digit_step(number, index) else {
+        ui.data_mut(|data| data.remove::<WheelRemainder>(id));
+        return 0;
+    };
+    let left = origin.x + glyph.pos.x;
+    let bottom = (origin.y + galley.size().y).min(response.rect.bottom() - 1.0);
+    ui.painter().line_segment(
+        [
+            egui::pos2(left, bottom),
+            egui::pos2(left + glyph.advance_width, bottom),
+        ],
+        egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+    );
+    response
+        .clone()
+        .on_hover_text(crate::i18n::language(ui.ctx()).text(Text::SourceWheelHelp));
+    let scroll = ui.input_mut(|input| {
+        let mut scroll = 0.0;
+        let mut consumed = false;
+        input.events.retain(|event| {
+            if let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } = event
+                && modifiers.is_none()
+                && delta.y.is_finite()
+                && delta.y != 0.0
+                && delta.x == 0.0
+            {
+                consumed = true;
+                scroll += f64::from(delta.y)
+                    / if *unit == egui::MouseWheelUnit::Point {
+                        40.0
+                    } else {
+                        1.0
+                    };
+                false
+            } else {
+                true
+            }
+        });
+        if consumed {
+            input.smooth_scroll_delta.y = 0.0;
+        }
+        scroll
+    });
+    if scroll == 0.0 {
+        return 0;
+    }
+    let count = ui.data_mut(|data| {
+        let remainder = data.get_temp_mut_or_default::<WheelRemainder>(id);
+        if remainder.step != step {
+            *remainder = WheelRemainder { step, value: 0.0 };
+        }
+        remainder.value = (remainder.value + scroll).clamp(-100.0, 100.0);
+        let count = remainder.value.trunc() as i64;
+        remainder.value -= count as f64;
+        count
+    });
+    step.saturating_mul(count)
 }
 
 fn modulation_fields(
@@ -465,6 +609,222 @@ fn parse_scaled_hz(text: &str, multiplier: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_frame(
+        ctx: &egui::Context,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+        time: &mut f64,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        *time += 1.0 / 60.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 600.0),
+                )),
+                time: Some(*time),
+                events,
+                ..Default::default()
+            },
+            |ui| show(ui, state),
+        );
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        shapes
+    }
+
+    fn painted_digit(
+        shapes: &[egui::epaint::ClippedShape],
+        number: &str,
+        index: usize,
+    ) -> egui::Pos2 {
+        shapes
+            .iter()
+            .find_map(|shape| {
+                let egui::Shape::Text(text) = &shape.shape else {
+                    return None;
+                };
+                if text.galley.job.text != number {
+                    return None;
+                }
+                let row = &text.galley.rows[0];
+                let glyph = &row.glyphs[index];
+                Some(
+                    text.pos
+                        + row.pos.to_vec2()
+                        + egui::vec2(glyph.pos.x + glyph.advance_width * 0.5, row.size.y * 0.5),
+                )
+            })
+            .unwrap_or_else(|| panic!("missing painted number {number}"))
+    }
+
+    fn wheel(
+        pointer: egui::Pos2,
+        delta: f32,
+        unit: egui::MouseWheelUnit,
+        modifiers: egui::Modifiers,
+    ) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit,
+                delta: egui::vec2(0.0, delta),
+                phase: egui::TouchPhase::Move,
+                modifiers,
+            },
+        ]
+    }
+
+    #[test]
+    fn painted_frequency_digits_edit_only_drafts_and_accumulate_original_trackpad_events() {
+        let ctx = egui::Context::default();
+        crate::theme::setup(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = AppState {
+            function: InstrumentFunction::RfSource,
+            connection: ConnectionState::Connected,
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.source.config.rf.frequency_hz = 1_234_567;
+        state.source.report.state = SourceOutputState::Requested(SourceKind::Rf);
+        let mut time = 0.0;
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = source_frame(&ctx, &mut state, Vec::new(), &mut time);
+        }
+        let pointer = painted_digit(&shapes, "1.234567", 4);
+        source_frame(
+            &ctx,
+            &mut state,
+            wheel(pointer, 1.0, egui::MouseWheelUnit::Line, Default::default()),
+            &mut time,
+        );
+        assert_eq!(state.source.config.rf.frequency_hz, 1_235_567);
+        assert!(rx.try_recv().is_err());
+        shapes = source_frame(&ctx, &mut state, Vec::new(), &mut time);
+        let pointer = painted_digit(&shapes, "1.235567", 7);
+        for _ in 0..3 {
+            source_frame(
+                &ctx,
+                &mut state,
+                wheel(
+                    pointer,
+                    10.0,
+                    egui::MouseWheelUnit::Point,
+                    Default::default(),
+                ),
+                &mut time,
+            );
+        }
+        assert_eq!(state.source.config.rf.frequency_hz, 1_235_567);
+        source_frame(
+            &ctx,
+            &mut state,
+            wheel(
+                pointer,
+                10.0,
+                egui::MouseWheelUnit::Point,
+                Default::default(),
+            ),
+            &mut time,
+        );
+        assert_eq!(state.source.config.rf.frequency_hz, 1_235_568);
+        for _ in 0..10 {
+            source_frame(&ctx, &mut state, Vec::new(), &mut time);
+        }
+        assert_eq!(state.source.config.rf.frequency_hz, 1_235_568);
+        source_frame(
+            &ctx,
+            &mut state,
+            wheel(
+                pointer,
+                1.0,
+                egui::MouseWheelUnit::Line,
+                egui::Modifiers::CTRL,
+            ),
+            &mut time,
+        );
+        assert_eq!(state.source.config.rf.frequency_hz, 1_235_568);
+        assert!(ctx.input(|input| input.events.iter().any(
+            |event| matches!(event, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
+        )));
+        assert!(rx.try_recv().is_err());
+        click_control(
+            &ctx,
+            &mut state,
+            Language::English.text(Text::Apply),
+            &mut time,
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap().command, WorkerCommand::StartSource(params) if params.frequency_hz == 1_235_568)
+        );
+    }
+
+    #[test]
+    fn painted_amplitude_digits_and_carrier_limits_preserve_signed_units() {
+        for (initial, index, delta, expected) in [
+            (-23, 1, 1.0, -13),
+            (-23, 2, -1.0, -24),
+            (9, 0, 1.0, 10),
+            (10, 0, 1.0, 10),
+            (-30, 2, -1.0, -30),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::setup(&ctx);
+            let mut state = AppState {
+                function: InstrumentFunction::RfSource,
+                ..Default::default()
+            };
+            state.source.config.rf.amplitude_dbm = initial;
+            let mut time = 0.0;
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = source_frame(&ctx, &mut state, Vec::new(), &mut time);
+            }
+            let pointer = painted_digit(&shapes, &initial.to_string(), index);
+            source_frame(
+                &ctx,
+                &mut state,
+                wheel(
+                    pointer,
+                    delta,
+                    egui::MouseWheelUnit::Line,
+                    Default::default(),
+                ),
+                &mut time,
+            );
+            assert_eq!(state.source.config.rf.amplitude_dbm, expected);
+        }
+        for (hz, delta) in [(0, -1.0), (7_000_000_000, 1.0)] {
+            let ctx = egui::Context::default();
+            crate::theme::setup(&ctx);
+            let mut state = AppState {
+                function: InstrumentFunction::RfSource,
+                ..Default::default()
+            };
+            state.source.config.rf.frequency_hz = hz;
+            let mut time = 0.0;
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = source_frame(&ctx, &mut state, Vec::new(), &mut time);
+            }
+            let pointer = painted_digit(&shapes, &format!("{:.6}", hz as f64 / 1_000_000.0), 0);
+            source_frame(
+                &ctx,
+                &mut state,
+                wheel(
+                    pointer,
+                    delta,
+                    egui::MouseWheelUnit::Line,
+                    Default::default(),
+                ),
+                &mut time,
+            );
+            assert_eq!(state.source.config.rf.frequency_hz, hz);
+        }
+    }
 
     #[test]
     fn scaled_frequency_controls_preserve_whole_hz() {

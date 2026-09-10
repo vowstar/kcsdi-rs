@@ -168,7 +168,7 @@ impl FrequencyEditor {
             return None;
         }
         let mut applied = None;
-        egui::Modal::new(egui::Id::new("frequency_editor")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::new("frequency_editor")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(language.text(Text::FrequencyList));
             ui.label(language.text(Text::FrequencyListHelp));
@@ -240,6 +240,9 @@ impl FrequencyEditor {
                 ui.label(language.text(Text::FrequencyFilePending));
             }
         });
+        if applied.is_none() && response.should_close() {
+            self.cancel();
+        }
         applied
     }
 }
@@ -270,6 +273,64 @@ impl Drop for FrequencyEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_cancels_draft_and_ignores_late_import() {
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            crate::theme::setup(&ctx);
+            let mut editor = FrequencyEditor::default();
+            editor.open(&[5_000, 6_000, 7_000]);
+            let original = editor.text.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            editor.worker = Some(std::thread::spawn(move || {
+                rx.recv().unwrap();
+                Ok(Some(FileResult::Imported(vec![8_000; 3])))
+            }));
+            for frame in 0..4 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(960.0, 600.0),
+                        )),
+                        events: if frame == 3 {
+                            vec![egui::Event::Key {
+                                key: egui::Key::Escape,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: Default::default(),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(
+                            editor
+                                .show(
+                                    ui.ctx(),
+                                    language,
+                                    FreqRange::new(5_000, 7_000_000_000, 1_000)
+                                )
+                                .is_none()
+                        );
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            tx.send(()).unwrap();
+            assert!(!editor.open);
+            assert!(editor.cancel.is_cancelled());
+            while !editor.worker.as_ref().unwrap().is_finished() {
+                std::thread::yield_now();
+            }
+            editor.poll();
+            assert_eq!(editor.text, original);
+        }
+    }
 
     #[test]
     fn failed_or_cancelled_import_preserves_the_draft() {

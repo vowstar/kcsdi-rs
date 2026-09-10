@@ -151,6 +151,7 @@ pub struct RunSettingsEditor {
     error: Option<String>,
     worker: Option<DirectoryTask>,
     cancel: CancellationToken,
+    open_directory: Option<PathBuf>,
 }
 
 impl Default for RunSettingsEditor {
@@ -162,6 +163,7 @@ impl Default for RunSettingsEditor {
             error: None,
             worker: None,
             cancel: CancellationToken::default(),
+            open_directory: None,
         }
     }
 }
@@ -175,6 +177,7 @@ impl RunSettingsEditor {
         self.draft = settings.clone();
         self.interval_text = settings.interval_unit.readout(settings.interval_ms);
         self.error = None;
+        self.open_directory = None;
     }
 
     pub fn is_pending(&self) -> bool {
@@ -184,6 +187,11 @@ impl RunSettingsEditor {
     pub fn cancel(&mut self) {
         self.cancel.cancel();
         self.open = false;
+        self.open_directory = None;
+    }
+
+    pub fn take_open_directory(&mut self) -> Option<PathBuf> {
+        self.open_directory.take()
     }
 
     pub fn poll(&mut self) {
@@ -286,6 +294,15 @@ impl RunSettingsEditor {
                 if ui.button(language.text(Text::RunChooseDirectory)).clicked() {
                     self.pick_directory(ui.ctx(), language);
                 }
+                if ui
+                    .add_enabled(
+                        self.draft.recording.directory.is_absolute(),
+                        egui::Button::new(language.text(Text::OpenFolder)),
+                    )
+                    .clicked()
+                {
+                    self.open_directory = Some(self.draft.recording.directory.clone());
+                }
                 let path = if self.draft.recording.directory.as_os_str().is_empty() {
                     language.text(Text::RunNoDirectory).to_owned()
                 } else {
@@ -330,7 +347,7 @@ impl RunSettingsEditor {
             return None;
         }
         let mut applied = None;
-        egui::Modal::new(egui::Id::new("run_settings_editor")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::new("run_settings_editor")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(language.text(Text::RunSettings));
             let pending = self.is_pending();
@@ -375,6 +392,9 @@ impl RunSettingsEditor {
                 }
             });
         });
+        if applied.is_none() && response.should_close() {
+            self.cancel();
+        }
         applied
     }
 }
@@ -403,6 +423,96 @@ impl Drop for RunSettingsEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_cancels_draft_and_ignores_a_late_directory_result() {
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            crate::theme::setup(&ctx);
+            let source = RunSettings::default();
+            let mut editor = RunSettingsEditor::default();
+            editor.open(&source);
+            editor.interval_text = "23".into();
+            let (tx, rx) = std::sync::mpsc::channel();
+            editor.worker = Some(std::thread::spawn(move || {
+                rx.recv().unwrap();
+                Ok(Some(std::env::temp_dir()))
+            }));
+            for frame in 0..4 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(960.0, 600.0),
+                        )),
+                        events: if frame == 3 {
+                            vec![egui::Event::Key {
+                                key: egui::Key::Escape,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: Default::default(),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(editor.show(ui.ctx(), language).is_none());
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            tx.send(()).unwrap();
+            assert!(!editor.open);
+            assert!(editor.cancel.is_cancelled());
+            while !editor.worker.as_ref().unwrap().is_finished() {
+                std::thread::yield_now();
+            }
+            editor.poll();
+            assert_eq!(editor.draft.recording.directory, source.recording.directory);
+            editor.open(&source);
+            assert_eq!(editor.checked_draft().unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn opening_configured_folder_is_an_explicit_one_shot_without_applying_draft() {
+        for language in Language::ALL {
+            let ctx = egui::Context::default();
+            crate::theme::setup(&ctx);
+            let source = RunSettings {
+                recording: RecordingSettings {
+                    enabled: true,
+                    directory: std::env::temp_dir(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = RunSettingsEditor::default();
+            editor.open(&source);
+            editor.interval_text = "27".into();
+            let mut time = 0.0;
+            assert!(
+                click_choice(
+                    &ctx,
+                    &mut editor,
+                    language,
+                    language.text(Text::OpenFolder),
+                    &mut time
+                )
+                .is_none()
+            );
+            assert_eq!(
+                editor.take_open_directory(),
+                Some(source.recording.directory.clone())
+            );
+            assert_eq!(editor.take_open_directory(), None);
+            assert_eq!(source.interval_ms, 0);
+            assert!(editor.open);
+        }
+    }
 
     #[test]
     fn defaults_and_partial_config_do_not_start_recording() {
