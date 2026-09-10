@@ -12,6 +12,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use kcsdi_core::Device;
+use kcsdi_core::calibration::{CalibrationPhase, CalibrationReport};
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
 use kcsdi_core::source::{SourceOutputState, SourceReport};
@@ -31,6 +32,11 @@ const WORKER_POLL: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 mod source_tests;
+
+mod calibration_control;
+
+#[cfg(test)]
+mod calibration_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunPhase {
@@ -253,6 +259,7 @@ fn run_worker(
     let mut cycle_id = 0_u64;
     let mut pending_status = None;
     let mut source_request = None;
+    let mut calibration_request = None;
 
     let emit = |evt: EventEnvelope| {
         send_event(&evt_tx, evt, &shutdown, None, &ctx);
@@ -275,7 +282,20 @@ fn run_worker(
                     }
                     let cancel = cmd.cancel.clone();
                     track_source_request(&cmd, identity, &mut source_request);
-                    let guard = source_rejection_guard(&cmd, &device, &source_request);
+                    calibration_control::track_request(
+                        &cmd,
+                        identity,
+                        &device,
+                        &mut calibration_request,
+                    );
+                    let guard =
+                        source_rejection_guard(&cmd, &device, &source_request).or_else(|| {
+                            calibration_control::rejection_guard(
+                                &cmd,
+                                &device,
+                                &calibration_request,
+                            )
+                        });
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
@@ -311,7 +331,20 @@ fn run_worker(
                     }
                     let cancel = cmd.cancel.clone();
                     track_source_request(&cmd, identity, &mut source_request);
-                    let guard = source_rejection_guard(&cmd, &device, &source_request);
+                    calibration_control::track_request(
+                        &cmd,
+                        identity,
+                        &device,
+                        &mut calibration_request,
+                    );
+                    let guard =
+                        source_rejection_guard(&cmd, &device, &source_request).or_else(|| {
+                            calibration_control::rejection_guard(
+                                &cmd,
+                                &device,
+                                &calibration_request,
+                            )
+                        });
                     handle_or_defer(
                         cmd,
                         &mut pending_status,
@@ -337,13 +370,61 @@ fn run_worker(
         }
         if let Some(status) = pending_status.take() {
             let cancel = status.cancel.clone();
-            let guard = source_rejection_guard(&status, &device, &source_request);
+            let guard = source_rejection_guard(&status, &device, &source_request).or_else(|| {
+                calibration_control::rejection_guard(&status, &device, &calibration_request)
+            });
             handle(status, &mut identity, &mut device, &mut job, &|event| {
                 send_request_event(&evt_tx, event, &shutdown, &cancel, guard.as_ref(), &ctx);
             });
         }
         if shutdown.is_cancelled() {
             break;
+        }
+        if let Some(dev) = device.as_mut()
+            && dev.calibration_report().is_active()
+        {
+            let (owner, cancel) = calibration_request
+                .as_ref()
+                .expect("calibration start has an owner");
+            let before = dev.calibration_report();
+            // Next replaces the request token at a human prompt. Polling that
+            // prompt must not treat the replacement itself as an abort.
+            let poll_cancel = if matches!(before.phase, CalibrationPhase::Prompt(_)) {
+                &shutdown
+            } else {
+                cancel
+            };
+            match dev.poll_calibration_controlled(poll_cancel) {
+                Ok(report) if report != before => {
+                    send_event(
+                        &evt_tx,
+                        owner.event(WorkerEvent::CalibrationReport(report)),
+                        &shutdown,
+                        Some(cancel),
+                        &ctx,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let report = dev.calibration_report();
+                    // Release the procedure before waiting for UI capacity.
+                    if let Some(mut dev) = device.take() {
+                        dev.close();
+                    }
+                    discard_job(&mut job);
+                    send_event(
+                        &evt_tx,
+                        owner.event(WorkerEvent::CalibrationReport(report)),
+                        &shutdown,
+                        Some(cancel),
+                        &ctx,
+                    );
+                    emit(owner.event(WorkerEvent::ConnectionLost(format!(
+                        "Calibration failed: {error}"
+                    ))));
+                }
+            }
+            continue;
         }
         if let Some(dev) = device.as_mut()
             && matches!(dev.source_report().state, SourceOutputState::Requested(_))
@@ -565,7 +646,11 @@ fn source_rejection_guard(
     owner: &Option<(WorkerIdentity, CancellationToken)>,
 ) -> Option<CancellationToken> {
     let rejects_without_stopping = match &command.command {
-        WorkerCommand::RefreshStatus | WorkerCommand::RunWorkspace(_) => true,
+        WorkerCommand::RefreshStatus
+        | WorkerCommand::RunWorkspace(_)
+        | WorkerCommand::StartCalibration(_)
+        | WorkerCommand::AdvanceCalibration(_)
+        | WorkerCommand::CancelCalibration => true,
         WorkerCommand::StartSource(params) => {
             params.validate(&DEVICE_MODEL.capabilities()).is_err()
         }
@@ -690,6 +775,7 @@ fn send_request_event(
 ) {
     let obsolete = match &event.event {
         WorkerEvent::RunProgress(_) | WorkerEvent::SourceReport(_) => Some(cancel),
+        WorkerEvent::CalibrationReport(_) => source_rejection.or(Some(cancel)),
         WorkerEvent::Status(_) | WorkerEvent::StatusFailed(_) => source_rejection.or(Some(cancel)),
         WorkerEvent::Error(_) => source_rejection,
         _ => None,
@@ -751,6 +837,9 @@ fn handle_with_recording(
         request_id,
     };
     let emit = |event| emit_event(source.event(event));
+    if calibration_control::reject_while_active(&command, device, &emit) {
+        return;
+    }
     match command {
         WorkerCommand::Connect { host, port } => {
             discard_job(job);
@@ -830,8 +919,71 @@ fn handle_with_recording(
                 .and_then(|dev| dev.stop_source_controlled(&cancel));
             source_result(result, device, job, &emit);
         }
+        WorkerCommand::StartCalibration(params) => {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let result = device
+                .as_mut()
+                .ok_or(kcsdi_core::Error::NotConnected)
+                .and_then(|dev| {
+                    params.validate(&DEVICE_MODEL.capabilities())?;
+                    discard_job(job);
+                    dev.start_calibration_controlled(&params, &cancel)
+                });
+            calibration_result(result, device, job, &emit);
+        }
+        WorkerCommand::AdvanceCalibration(prompt) => {
+            let result = device
+                .as_mut()
+                .ok_or(kcsdi_core::Error::NotConnected)
+                .and_then(|dev| dev.advance_calibration_controlled(prompt, &cancel));
+            calibration_result(result, device, job, &emit);
+        }
+        WorkerCommand::CancelCalibration => {
+            let result = device
+                .as_mut()
+                .ok_or(kcsdi_core::Error::NotConnected)
+                .and_then(|dev| dev.cancel_calibration_controlled(&cancel));
+            calibration_result(result, device, job, &emit);
+        }
         WorkerCommand::RefreshStatus => {
             refresh_status(&cancel, device, job, &emit);
+        }
+    }
+}
+
+fn calibration_result(
+    result: kcsdi_core::Result<CalibrationReport>,
+    device: &mut Option<Device<TcpTransport>>,
+    job: &mut Option<SweepRequest>,
+    emit: &dyn Fn(WorkerEvent),
+) {
+    match result {
+        Ok(report) => emit(WorkerEvent::CalibrationReport(report)),
+        Err(error) => {
+            let report = device.as_ref().map_or(
+                CalibrationReport {
+                    kind: None,
+                    phase: CalibrationPhase::Unknown,
+                },
+                Device::calibration_report,
+            );
+            // Core cleanup normally retires a failed calibration. Close here
+            // too before a terminal report can wait behind a full UI queue.
+            let retired = device.as_ref().is_some_and(Device::requires_reconnect);
+            if retired && let Some(mut dev) = device.take() {
+                dev.close();
+            }
+            emit(WorkerEvent::CalibrationReport(report));
+            if retired {
+                discard_job(job);
+                emit(WorkerEvent::ConnectionLost(format!(
+                    "Calibration failed: {error}"
+                )));
+            } else {
+                fail(error, "Calibration failed", device, job, emit);
+            }
         }
     }
 }

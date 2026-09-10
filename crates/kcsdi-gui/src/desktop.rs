@@ -357,10 +357,13 @@ fn show_about(ui: &mut egui::Ui, state: &mut AppState) {
             .add_enabled(
                 state.connection == ConnectionState::Connected
                     && !state.health.pending
+                    && !state.calibration.busy()
                     && !state.source.busy(),
                 egui::Button::new(language.text(Text::Refresh)),
             )
-            .on_disabled_hover_text(language.text(if state.source.busy() {
+            .on_disabled_hover_text(language.text(if state.calibration.busy() {
+                Text::CalibrationBusy
+            } else if state.source.busy() {
                 Text::SourceStopForHealth
             } else if state.health.pending {
                 Text::HealthUpdating

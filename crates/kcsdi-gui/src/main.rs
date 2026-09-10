@@ -9,6 +9,7 @@
 mod acquisition;
 mod analysis_tools;
 mod app;
+mod calibration_panel;
 mod config;
 mod desktop;
 mod device_worker;

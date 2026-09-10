@@ -15,6 +15,7 @@
 //! - [`error`]: shared error type.
 
 pub mod atomic_file;
+pub mod calibration;
 pub mod commands;
 pub mod control;
 pub mod data;

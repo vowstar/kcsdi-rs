@@ -256,6 +256,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ui.add_space(16.0);
             let editable = state.source.pending.is_none()
+                && !state.calibration.busy()
                 && state.sweep != SweepState::Stopping
                 && state.connection != ConnectionState::Disconnecting;
             ui.add_enabled_ui(editable, |ui| {

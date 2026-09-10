@@ -86,6 +86,7 @@ impl<T: Transport> Device<T> {
     /// no I/O. Late device errors remain errors and change the report to Unknown.
     pub fn poll_source_controlled(&mut self, cancel: &CancellationToken) -> Result<SourceReport> {
         cancel.check()?;
+        self.check_calibration_idle()?;
         if self.source_kind.is_none() {
             return Ok(self.source);
         }
@@ -103,6 +104,7 @@ impl<T: Transport> Device<T> {
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
+        self.check_calibration_idle()?;
         if self.active_mode.is_some() {
             return Err(Error::InvalidParameter(
                 "stop the acquisition mode before controlling a signal source".into(),

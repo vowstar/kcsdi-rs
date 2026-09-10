@@ -81,6 +81,7 @@ impl KcsdiApp {
                 | WorkerEvent::SweepStopped
                 | WorkerEvent::RunProgress(_)
                 | WorkerEvent::SourceReport(_)
+                | WorkerEvent::CalibrationReport(_)
                 | WorkerEvent::Error(_)
         ) && envelope.request_id != self.state.request_id
         {
@@ -202,12 +203,21 @@ impl KcsdiApp {
                 self.state.status_message = Some(StatusMessage::Text(Text::Disconnected));
             }
             WorkerEvent::ConnectionLost(message) => {
+                if self.state.calibration.busy() {
+                    self.state.calibration.error = Some(message.clone());
+                }
                 self.clear_connection();
                 self.state.connection = ConnectionState::Error(message.clone());
                 self.state.status_message = Some(message.into());
             }
             WorkerEvent::Error(message) => {
                 self.state.source.lost();
+                if self.state.calibration.open && self.state.calibration.frozen.is_some() {
+                    self.state.calibration.error = Some(message.clone());
+                }
+                if self.state.calibration.pending.is_some() {
+                    self.state.calibration.lost();
+                }
                 if self.state.connection == ConnectionState::Connecting {
                     self.state.connection = ConnectionState::Error(message.clone());
                 }
@@ -228,6 +238,11 @@ impl KcsdiApp {
             WorkerEvent::SourceReport(report) => {
                 if self.state.connection == ConnectionState::Connected {
                     self.state.source.accept(report, self.state.function);
+                }
+            }
+            WorkerEvent::CalibrationReport(report) => {
+                if self.state.connection == ConnectionState::Connected {
+                    self.state.calibration.accept(report);
                 }
             }
             WorkerEvent::RunProgress(progress) => {
@@ -262,6 +277,7 @@ impl KcsdiApp {
 
     fn clear_connection(&mut self) {
         self.state.source.lost();
+        self.state.calibration.lost();
         self.state.connection = ConnectionState::Disconnected;
         self.state.device_info = None;
         self.state.health = Default::default();
@@ -474,6 +490,9 @@ impl eframe::App for KcsdiApp {
             self.state.workspace.run = run;
         }
         self.state.reconcile_plan();
+        if !self.closing {
+            crate::calibration_panel::show(&ctx, &mut self.state);
+        }
         ctx.request_repaint_after(Duration::from_millis(500));
         self.persist_config_debounced();
     }
@@ -537,6 +556,19 @@ impl KcsdiApp {
                         {
                             self.state.select_function(function);
                         }
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.state.source.busy(),
+                            egui::Button::new(language.text(Text::CalibrationWizard)),
+                        )
+                        .on_disabled_hover_text(language.text(Text::CalibrationStopSource))
+                        .clicked()
+                    {
+                        self.state.workspace.editor = None;
+                        self.state.workspace.frequency_editor.cancel();
+                        self.state.workspace.run_editor.cancel();
+                        self.state.calibration.open();
                     }
                     if ui
                         .add_enabled(
@@ -1439,6 +1471,272 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn calibration_retains_complete_exports_and_rejects_stale_step_reports() {
+        use kcsdi_core::calibration::{
+            CalibrationKind, CalibrationParams, CalibrationPhase, CalibrationPrompt,
+            CalibrationReport,
+        };
+        let mut app = active_impedance_app();
+        let completed = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .clone()
+            .unwrap();
+        for display in [TraceDisplay::S11(S11Display::Impedance), TraceDisplay::Spec] {
+            let id = app
+                .state
+                .workspace
+                .add_trace(TraceSettings {
+                    display,
+                    visible: false,
+                    ..Default::default()
+                })
+                .unwrap();
+            let trace = app
+                .state
+                .workspace
+                .traces
+                .iter_mut()
+                .find(|trace| trace.id == id)
+                .unwrap();
+            trace.completed = Some(completed.clone());
+        }
+        for trace in &mut app.state.workspace.traces {
+            trace
+                .analysis
+                .restore_config(&crate::analysis_tools::AnalysisConfig {
+                    hold: true,
+                    max_hold: true,
+                    ..Default::default()
+                });
+            trace.analysis.observe(&completed);
+            assert!(trace.analysis.held_trace().is_some());
+        }
+        let previous_request = app.state.request_id;
+        app.state.send(WorkerCommand::StartCalibration(
+            CalibrationParams::S11System,
+        ));
+        assert!(!app.state.any_running());
+        assert!(app.state.active_plan.is_none());
+        assert!(app.state.calibration.busy());
+        for trace in &app.state.workspace.traces {
+            assert!(Arc::ptr_eq(trace.completed.as_ref().unwrap(), &completed));
+            assert!(trace.analysis.held_trace().is_none());
+        }
+        let current_request = app.state.request_id;
+        let session_id = app.state.session_id;
+        let event = |request_id, phase| EventEnvelope {
+            session_id,
+            request_id,
+            cycle_id: None,
+            event: WorkerEvent::CalibrationReport(CalibrationReport {
+                kind: Some(CalibrationKind::S11System),
+                phase,
+            }),
+        };
+        app.apply_worker_event(event(previous_request, CalibrationPhase::Completed));
+        assert_eq!(
+            app.state.calibration.report.phase,
+            CalibrationPhase::NotStarted
+        );
+        app.apply_worker_event(event(
+            current_request,
+            CalibrationPhase::Prompt(CalibrationPrompt::Short),
+        ));
+        assert_eq!(
+            app.state.calibration.current_prompt,
+            Some(CalibrationPrompt::Short)
+        );
+        app.state
+            .send(WorkerCommand::AdvanceCalibration(CalibrationPrompt::Short));
+        app.apply_worker_event(event(
+            current_request,
+            CalibrationPhase::Prompt(CalibrationPrompt::Open),
+        ));
+        assert_eq!(
+            app.state.calibration.current_prompt,
+            Some(CalibrationPrompt::Short)
+        );
+        app.state.send(WorkerCommand::CancelCalibration);
+        let cancel_request = app.state.request_id;
+        app.apply_worker_event(event(cancel_request, CalibrationPhase::Cancelled));
+        assert!(!app.state.calibration.busy());
+        assert!(Arc::ptr_eq(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap(),
+            &completed
+        ));
+    }
+
+    #[test]
+    fn full_calibration_modal_fits_languages_themes_and_packet_phases() {
+        use kcsdi_core::calibration::{
+            CalibrationParams, CalibrationPhase, CalibrationPrompt, CalibrationReport,
+            UserCalibrationParams,
+        };
+        let user = UserCalibrationParams::from_range(
+            1_000_000,
+            2_000_001,
+            1001,
+            kcsdi_core::model::Rbw::R30k,
+        )
+        .unwrap();
+        for size in [egui::vec2(960.0, 600.0), egui::vec2(1280.0, 850.0)] {
+            for language in Language::ALL {
+                for mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+                    let ctx = egui::Context::default();
+                    theme::setup(&ctx);
+                    theme::apply(&ctx, mode);
+                    for params in [
+                        CalibrationParams::S11System,
+                        CalibrationParams::S21System,
+                        CalibrationParams::S11User(user),
+                        CalibrationParams::S21User(user),
+                    ] {
+                        for phase in [
+                            CalibrationPhase::NotStarted,
+                            CalibrationPhase::WarmingUp,
+                            CalibrationPhase::Measuring,
+                            CalibrationPhase::Completed,
+                            CalibrationPhase::Unknown,
+                        ] {
+                            let mut app = active_impedance_app();
+                            app.state.language = language;
+                            app.state.calibration.begin(params);
+                            app.state.calibration.pending = None;
+                            app.state.calibration.accept(CalibrationReport {
+                                kind: Some(params.kind()),
+                                phase: CalibrationPhase::Prompt(
+                                    if params.kind().mode() == StreamMode::S11 {
+                                        CalibrationPrompt::Open
+                                    } else {
+                                        CalibrationPrompt::Through
+                                    },
+                                ),
+                            });
+                            app.state.calibration.report.phase = phase;
+                            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                            for _ in 0..3 {
+                                let mut output = ctx.run_ui(
+                                    egui::RawInput {
+                                        screen_rect: Some(screen),
+                                        ..Default::default()
+                                    },
+                                    |ui| {
+                                        app.instrument_ui(ui);
+                                        crate::calibration_panel::show(ui.ctx(), &mut app.state);
+                                    },
+                                );
+                                let shapes = std::mem::take(&mut output.shapes);
+                                output.drop_without_applying_deltas();
+                                let mut keys = vec![Text::CalibrationWizard];
+                                if phase == CalibrationPhase::NotStarted {
+                                    keys.extend([
+                                        Text::CalibrationConsent,
+                                        Text::CalibrationStart,
+                                        Text::CalibrationWriteWarning,
+                                    ]);
+                                } else if phase == CalibrationPhase::Completed {
+                                    keys.extend([
+                                        Text::CalibrationCompleted,
+                                        Text::CalibrationReacquire,
+                                        Text::Close,
+                                    ]);
+                                } else if phase == CalibrationPhase::Unknown {
+                                    keys.extend([
+                                        Text::CalibrationUnknown,
+                                        Text::CalibrationChanged,
+                                        Text::Close,
+                                    ]);
+                                } else {
+                                    keys.push(Text::Cancel);
+                                }
+                                for key in keys {
+                                    let matched: Vec<_> = shapes.iter().filter(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == language.text(key))).collect();
+                                    assert!(
+                                        !matched.is_empty(),
+                                        "{language:?} {phase:?} missing {key:?}"
+                                    );
+                                    for shape in matched {
+                                        let egui::Shape::Text(text) = &shape.shape else {
+                                            unreachable!()
+                                        };
+                                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                                        assert!(
+                                            screen.contains_rect(bounds)
+                                                && shape.clip_rect.contains_rect(bounds),
+                                            "{language:?} {phase:?} {key:?}: {bounds:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_rejection_keeps_authoritative_prompt_and_cancel_available() {
+        use kcsdi_core::calibration::{
+            CalibrationKind, CalibrationParams, CalibrationPhase, CalibrationPrompt,
+            CalibrationReport,
+        };
+        let mut app = active_impedance_app();
+        app.state.send(WorkerCommand::StartCalibration(
+            CalibrationParams::S11System,
+        ));
+        let report = CalibrationReport {
+            kind: Some(CalibrationKind::S11System),
+            phase: CalibrationPhase::Prompt(CalibrationPrompt::Open),
+        };
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::CalibrationReport(report),
+        });
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::Error("Calibration rejected an out-of-date step".into()),
+        });
+        assert_eq!(app.state.calibration.report, report);
+        assert!(app.state.calibration.busy());
+        assert!(app.state.calibration.error.is_some());
+        app.state.stop_operation();
+        assert_eq!(
+            app.state.calibration.pending,
+            Some(crate::calibration_panel::Pending::Cancel)
+        );
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::CalibrationReport(report),
+        });
+        app.apply_worker_event(EventEnvelope {
+            session_id: app.state.session_id,
+            request_id: app.state.request_id,
+            cycle_id: None,
+            event: WorkerEvent::Error("Calibration control request was rejected".into()),
+        });
+        assert_eq!(app.state.calibration.report, report);
+        assert_eq!(app.state.calibration.pending, None);
+        assert!(app.state.calibration.busy());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use crate::calibration::{CalibrationPhase, CalibrationReport};
 use crate::commands::{self, Cal, Format, Lo, ScanMode};
 use crate::control::{CancellationToken, POLL_INTERVAL};
 use crate::data::{DeviceInfo, SweepData, SweepPoint, Voltage, parse_f64, telemetry_values};
@@ -20,6 +21,7 @@ use crate::protocol::{Packet, PacketParser, StreamEvent, StreamMode, StreamParse
 use crate::source::{SourceKind, SourceOutputState, SourceReport};
 use crate::transport::{GENERIC_TIMEOUT, TcpTransport, Transport, remaining_timeout};
 
+mod calibration_session;
 mod source_session;
 
 /// Conservative mode-control pacing, exercised on KC901V V1.6.1.
@@ -155,6 +157,8 @@ pub struct Device<T: Transport> {
     session_failed: bool,
     source: SourceReport,
     source_kind: Option<SourceKind>,
+    calibration: Option<calibration_session::CalibrationSession>,
+    calibration_report: CalibrationReport,
 }
 
 impl Device<TcpTransport> {
@@ -205,6 +209,8 @@ impl<T: Transport> Device<T> {
             session_failed: false,
             source: SourceReport::default(),
             source_kind: None,
+            calibration: None,
+            calibration_report: CalibrationReport::default(),
         }
     }
 
@@ -239,6 +245,7 @@ impl<T: Transport> Device<T> {
     /// Perform the handshake without accepting a reply after cancellation.
     pub fn handshake_controlled(&mut self, cancel: &CancellationToken) -> Result<String> {
         cancel.check()?;
+        self.check_calibration_idle()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
@@ -591,6 +598,7 @@ impl<T: Transport> Device<T> {
     /// Stop the initialized measurement mode. This also permits switching
     /// modes without a mode-conflict error (sections 3.4, 3.5, 3.8 and 12).
     pub fn stop_sweep(&mut self) -> Result<()> {
+        self.check_calibration_idle()?;
         if let Some(mode) = self.active_mode {
             let result = self.transport.send(stop_command(mode).as_bytes());
             self.record_result(result)?;
@@ -641,6 +649,7 @@ impl<T: Transport> Device<T> {
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
+        self.check_calibration_idle()?;
         if self.source_kind.is_some() || self.source.state == SourceOutputState::Unknown {
             return Err(Error::InvalidParameter(
                 "stop the signal source before starting an acquisition".into(),
@@ -677,6 +686,10 @@ impl<T: Transport> Device<T> {
     /// Exit remote mode (`$local`). Best effort; also called from `Drop`.
     pub fn close(&mut self) {
         self.session_failed = true;
+        let calibration_active = self.calibration.take().is_some();
+        if calibration_active {
+            self.calibration_report.phase = CalibrationPhase::Unknown;
+        }
         let source_stop_needed = matches!(
             self.source.state,
             SourceOutputState::Requested(_) | SourceOutputState::Unknown
@@ -686,6 +699,13 @@ impl<T: Transport> Device<T> {
         }
         if self.remote || self.release_on_close {
             let started = Instant::now();
+            if calibration_active {
+                for command in [commands::ABORT, calibration_session::EXIT] {
+                    if let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT) {
+                        let _ = self.transport.send_with_timeout(command, remaining);
+                    }
+                }
+            }
             if source_stop_needed {
                 for &kind in self.source_stop_kinds() {
                     if let Ok(remaining) = remaining_timeout(started, CLEANUP_TIMEOUT) {
@@ -752,6 +772,7 @@ impl<T: Transport> Device<T> {
         cancel: &CancellationToken,
     ) -> Result<Packet> {
         cancel.check()?;
+        self.check_calibration_idle()?;
         if self.requires_reconnect() {
             return Err(Error::NotConnected);
         }
@@ -799,7 +820,10 @@ impl<T: Transport> Device<T> {
                 if packet.name == name {
                     return Ok(packet);
                 }
-                if self.source_kind.is_none() && self.source.state != SourceOutputState::Unknown {
+                if self.source_kind.is_none()
+                    && self.source.state != SourceOutputState::Unknown
+                    && self.calibration.is_none()
+                {
                     // A synchronous logger must not hold source control open.
                     log::warn!("unexpected packet {}, waiting for {name}", packet.name);
                 }

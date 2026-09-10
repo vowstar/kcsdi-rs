@@ -638,6 +638,7 @@ impl AppConfig {
         state.active_plan = None;
         state.run_progress = None;
         state.last_recording = None;
+        state.calibration = Default::default();
         state.function = self.function;
         state.source = crate::source_panel::SourceUi {
             config: self.sources.clone(),
@@ -1493,6 +1494,24 @@ rbw = "30k"
         old.apply_to(&mut restored);
         assert_eq!(restored.function, InstrumentFunction::Measurements);
         assert_eq!(restored.source.config, Default::default());
+    }
+
+    #[test]
+    fn calibration_runtime_and_write_consent_are_never_restored() {
+        use kcsdi_core::calibration::{CalibrationParams, CalibrationPhase};
+        let mut state = AppState::default();
+        state.calibration.begin(CalibrationParams::S11System);
+        state.calibration.consent = true;
+        let text = toml::to_string(&AppConfig::from_state(&state)).unwrap();
+        assert!(!text.contains("calibration"));
+        assert!(!text.contains("consent"));
+        let loaded: AppConfig = toml::from_str(&text).unwrap();
+        loaded.apply_to(&mut state);
+        assert_eq!(state.calibration.report.phase, CalibrationPhase::NotStarted);
+        assert!(!state.calibration.busy());
+        assert!(!state.calibration.open);
+        assert!(!state.calibration.consent);
+        assert!(state.calibration.frozen.is_none());
     }
 
     #[test]

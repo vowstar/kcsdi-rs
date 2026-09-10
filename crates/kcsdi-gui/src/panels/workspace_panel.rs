@@ -90,7 +90,9 @@ pub fn run_button(ui: &mut egui::Ui, state: &mut AppState) {
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.add_enabled_ui(
-                    state.connection == ConnectionState::Connected && !state.source.busy(),
+                    state.connection == ConnectionState::Connected
+                        && !state.source.busy()
+                        && !state.calibration.busy(),
                     |ui| {
                         let size = [run_width, BUTTON_HEIGHT];
                         if state.sweep == SweepState::Stopping {

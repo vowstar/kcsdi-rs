@@ -6,6 +6,9 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
+use kcsdi_core::calibration::{
+    CalibrationParams, CalibrationPhase, CalibrationPrompt, CalibrationReport,
+};
 use kcsdi_core::commands::Format;
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::DeviceInfo;
@@ -29,6 +32,9 @@ pub enum WorkerCommand {
     StopSweep,
     StartSource(SourceParams),
     StopSource,
+    StartCalibration(CalibrationParams),
+    AdvanceCalibration(CalibrationPrompt),
+    CancelCalibration,
     RefreshStatus,
     Shutdown,
 }
@@ -43,6 +49,7 @@ pub enum WorkerEvent {
     SweepStopped,
     RunProgress(crate::run_settings::RunProgress),
     SourceReport(SourceReport),
+    CalibrationReport(CalibrationReport),
     Status(HealthSnapshot),
     StatusFailed(String),
 }
@@ -216,6 +223,7 @@ pub struct AppState {
     pub workspace: Workspace,
     pub function: InstrumentFunction,
     pub source: SourceUi,
+    pub calibration: crate::calibration_panel::CalibrationUi,
     pub active_plan: Option<SweepPlan>,
     pub run_progress: Option<crate::run_settings::RunProgress>,
     pub last_recording: Option<(u64, std::path::PathBuf)>,
@@ -246,6 +254,7 @@ impl Default for AppState {
             workspace: Default::default(),
             function: Default::default(),
             source: Default::default(),
+            calibration: Default::default(),
             active_plan: None,
             run_progress: None,
             last_recording: None,
@@ -287,6 +296,41 @@ impl AppState {
     }
 
     pub fn send(&mut self, command: WorkerCommand) {
+        if self.calibration.busy()
+            && matches!(
+                command,
+                WorkerCommand::RunWorkspace(_)
+                    | WorkerCommand::StartSource(_)
+                    | WorkerCommand::StopSweep
+                    | WorkerCommand::StopSource
+                    | WorkerCommand::StartCalibration(_)
+            )
+        {
+            self.status_message = Some(StatusMessage::Text(Text::CalibrationBusy));
+            return;
+        }
+        if matches!(command, WorkerCommand::StartCalibration(_))
+            && (self.source.busy() || self.connection != ConnectionState::Connected)
+        {
+            self.status_message = Some(StatusMessage::Text(if self.source.busy() {
+                Text::CalibrationStopSource
+            } else {
+                Text::DeviceInfoUnavailable
+            }));
+            return;
+        }
+        if let WorkerCommand::AdvanceCalibration(prompt) = &command
+            && (self.calibration.pending.is_some()
+                || self.calibration.report.phase != CalibrationPhase::Prompt(*prompt))
+        {
+            return;
+        }
+        if matches!(command, WorkerCommand::CancelCalibration)
+            && (!self.calibration.busy()
+                || self.calibration.pending == Some(crate::calibration_panel::Pending::Cancel))
+        {
+            return;
+        }
         if matches!(command, WorkerCommand::RunWorkspace(_)) && self.source.busy() {
             self.status_message = Some(StatusMessage::Text(Text::SourceStopBeforeMeasure));
             return;
@@ -294,6 +338,7 @@ impl AppState {
         if matches!(command, WorkerCommand::RefreshStatus)
             && (self.connection != ConnectionState::Connected
                 || self.source.busy()
+                || self.calibration.busy()
                 || !self.health.begin())
         {
             return;
@@ -321,6 +366,41 @@ impl AppState {
                 .expect("request ID exhausted");
         }
         let cancel = match &command {
+            WorkerCommand::StartCalibration(params) => {
+                self.acquisition_cancel.cancel();
+                self.acquisition_cancel = CancellationToken::default();
+                self.active_plan = None;
+                self.sweep = SweepState::Idle;
+                self.calibration.begin(*params);
+                let mode = crate::calibration_panel::affected_mode(params.kind());
+                let stream = match mode {
+                    AppMode::S11 => kcsdi_core::protocol::StreamMode::S11,
+                    AppMode::S21 => kcsdi_core::protocol::StreamMode::S21,
+                    AppMode::Spec => unreachable!(),
+                };
+                for trace in &mut self.workspace.traces {
+                    if trace.settings.display.mode() == mode
+                        || trace
+                            .completed
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.data.mode == stream)
+                    {
+                        trace.analysis.invalidate_measurements();
+                    }
+                }
+                self.acquisition_cancel.clone()
+            }
+            WorkerCommand::AdvanceCalibration(_) | WorkerCommand::CancelCalibration => {
+                self.acquisition_cancel.cancel();
+                self.acquisition_cancel = CancellationToken::default();
+                self.calibration.pending =
+                    Some(if matches!(command, WorkerCommand::CancelCalibration) {
+                        crate::calibration_panel::Pending::Cancel
+                    } else {
+                        crate::calibration_panel::Pending::Advance
+                    });
+                self.acquisition_cancel.clone()
+            }
             WorkerCommand::RunWorkspace(plan) => {
                 self.last_recording = None;
                 self.run_progress = Some(crate::run_settings::RunProgress::Acquiring);
@@ -355,6 +435,7 @@ impl AppState {
             }
             WorkerCommand::Connect { .. } => {
                 self.source.lost();
+                self.calibration.lost();
                 self.active_plan = None;
                 self.sweep = SweepState::Idle;
                 self.connection = ConnectionState::Connecting;
@@ -362,6 +443,7 @@ impl AppState {
             }
             WorkerCommand::Disconnect | WorkerCommand::Shutdown => {
                 self.source.lost();
+                self.calibration.lost();
                 self.active_plan = None;
                 self.sweep = SweepState::Idle;
                 self.connection = ConnectionState::Disconnecting;
@@ -394,6 +476,10 @@ impl AppState {
         if self.function == function {
             return;
         }
+        if self.calibration.busy() {
+            self.send(WorkerCommand::CancelCalibration);
+            return;
+        }
         if self.connection == ConnectionState::Connected {
             if self.source.busy() && self.source.pending != Some(SourcePending::Stop) {
                 self.send(WorkerCommand::StopSource);
@@ -408,7 +494,9 @@ impl AppState {
     }
 
     pub fn stop_operation(&mut self) {
-        if self.source.busy() {
+        if self.calibration.busy() {
+            self.send(WorkerCommand::CancelCalibration);
+        } else if self.source.busy() {
             if self.source.pending != Some(SourcePending::Stop) {
                 self.send(WorkerCommand::StopSource);
             }
@@ -420,6 +508,7 @@ impl AppState {
     pub fn refresh_health_if_due(&mut self, now: Instant) {
         if self.connection == ConnectionState::Connected
             && !self.source.busy()
+            && !self.calibration.busy()
             && self.sweep != SweepState::Stopping
             && self.health.due(now)
         {
@@ -434,6 +523,7 @@ impl AppState {
 
     pub fn worker_stopped(&mut self) {
         self.source.lost();
+        self.calibration.lost();
         self.session_cancel.cancel();
         self.acquisition_cancel.cancel();
         self.worker_shutdown.cancel();
@@ -453,6 +543,74 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::workspace::TraceDisplay;
+
+    #[test]
+    fn calibration_owns_controls_and_reconnect_never_resumes_a_step() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = AppState {
+            connection: ConnectionState::Connected,
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.send(WorkerCommand::StartCalibration(
+            CalibrationParams::S21System,
+        ));
+        let start = rx.try_recv().unwrap();
+        state.calibration.accept(CalibrationReport {
+            kind: Some(kcsdi_core::calibration::CalibrationKind::S21System),
+            phase: CalibrationPhase::Prompt(CalibrationPrompt::Through),
+        });
+        let request_id = state.request_id;
+        for command in [
+            WorkerCommand::RunWorkspace(state.workspace.plan().unwrap()),
+            WorkerCommand::StartSource(
+                state
+                    .source
+                    .config
+                    .rf
+                    .params(kcsdi_core::source::SourceKind::Rf)
+                    .unwrap(),
+            ),
+            WorkerCommand::StopSweep,
+            WorkerCommand::StopSource,
+            WorkerCommand::RefreshStatus,
+            WorkerCommand::StartCalibration(CalibrationParams::S11System),
+            WorkerCommand::AdvanceCalibration(CalibrationPrompt::Short),
+        ] {
+            state.send(command);
+        }
+        assert_eq!(state.request_id, request_id);
+        assert!(!state.health.pending);
+        assert!(rx.try_recv().is_err());
+        state.send(WorkerCommand::AdvanceCalibration(
+            CalibrationPrompt::Through,
+        ));
+        let advance = rx.try_recv().unwrap();
+        assert!(start.cancel.is_cancelled());
+        assert!(!advance.cancel.is_cancelled());
+        state.send(WorkerCommand::Disconnect);
+        rx.try_recv().unwrap();
+        assert!(advance.cancel.is_cancelled());
+        assert_eq!(state.calibration.report.phase, CalibrationPhase::Unknown);
+        state.send(WorkerCommand::Connect {
+            host: "127.0.0.1".into(),
+            port: 901,
+        });
+        let connect = rx.try_recv().unwrap();
+        assert!(matches!(connect.command, WorkerCommand::Connect { .. }));
+        assert_eq!(state.calibration.report.phase, CalibrationPhase::Unknown);
+        assert!(!state.calibration.busy());
+        state.connection = ConnectionState::Connected;
+        state.send(WorkerCommand::AdvanceCalibration(
+            CalibrationPrompt::Through,
+        ));
+        assert!(rx.try_recv().is_err());
+        state.send(WorkerCommand::RunWorkspace(state.workspace.plan().unwrap()));
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::RunWorkspace(_)
+        ));
+    }
 
     #[test]
     fn identities_and_cancellation_have_separate_lifetimes() {

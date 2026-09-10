@@ -30,7 +30,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
         match &state.connection {
             ConnectionState::Connected => {
                 ui.colored_label(crate::theme::SUCCESS, language.text(Text::Connected));
-                if (state.any_running() || state.source.busy())
+                if (state.any_running() || state.source.busy() || state.calibration.busy())
                     && ui.small_button(language.text(Text::StopSweep)).clicked()
                 {
                     state.stop_operation();
@@ -38,7 +38,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                 if ui.small_button(language.text(Text::Disconnect)).clicked() {
                     state.send(WorkerCommand::Disconnect);
                 }
-                if state.source.busy() {
+                if state.calibration.busy() {
+                    ui.label(state.calibration.label(language));
+                } else if state.source.busy() {
                     ui.label(state.source.label(language));
                 } else if state.sweep == SweepState::Stopping {
                     ui.spinner();

@@ -104,6 +104,14 @@ impl TargetRows<'_> {
 }
 
 impl AnalysisTools {
+    /// Keep definitions, but never combine data across a calibration write.
+    pub fn invalidate_measurements(&mut self) {
+        self.latest = None;
+        self.reset_holds();
+        self.rendered_overlays.clear();
+        self.restored_column = true;
+    }
+
     pub fn config(&self) -> AnalysisConfig {
         AnalysisConfig {
             markers: self.markers.clone(),
@@ -1437,6 +1445,35 @@ mod tests {
             assert_eq!(tools.maxima, Some(values(&next.data)));
             assert_eq!(tools.minima, Some(values(&next.data)));
         }
+    }
+
+    #[test]
+    fn calibration_boundary_retains_definitions_and_never_combines_old_holds() {
+        let before = snapshot(&trace(&[100.0, 200.0, 300.0]));
+        let after = snapshot(&trace(&[-1.0, -2.0, -3.0]));
+        let mut tools = AnalysisTools {
+            hold: true,
+            max_hold: true,
+            min_hold: true,
+            ..Default::default()
+        };
+        tools.observe(&before);
+        tools.add_marker(&before.data, 2e6);
+        let config = tools.config();
+        tools.invalidate_measurements();
+        assert_eq!(tools.config(), config);
+        assert!(tools.latest.is_none());
+        assert!(tools.held_trace().is_none());
+        assert!(tools.overlay_series(&[0]).is_empty());
+        // A hold toggle against a retained complete frame must remain hidden
+        // and cannot seed the first post-calibration envelope.
+        tools.refresh_holds(&before.data);
+        assert!(tools.overlay_series(&[0]).is_empty());
+        tools.observe(&after);
+        assert_eq!(tools.held_trace(), Some(after.data.clone()));
+        assert_eq!(tools.maxima, Some(values(&after.data)));
+        assert_eq!(tools.minima, Some(values(&after.data)));
+        assert_eq!(tools.config(), config);
     }
 
     #[test]
