@@ -672,9 +672,10 @@ impl KcsdiApp {
             .any(|trace| trace.settings.visible && trace.settings.display.is_smith());
         if cartesian && smith {
             let height = ui.available_height();
+            let minimum = 240.0_f32.min(height * 0.5);
             egui::Panel::top("cartesian_region")
                 .default_size(height * 0.5)
-                .size_range(height * 0.25..=height * 0.75)
+                .size_range(minimum..=height - minimum)
                 .resizable(true)
                 .show(ui, |ui| self.cartesian_ui(ui));
             egui::CentralPanel::default().show(ui, |ui| self.smith_ui(ui));
@@ -2250,7 +2251,7 @@ mod tests {
         }
         let after = chart_top(vec![], 0.2, size);
         assert!(
-            after > before + 60.0,
+            after > before + 40.0,
             "divider did not move: {before} {after}"
         );
         assert!(after < 470.0);
@@ -2259,6 +2260,99 @@ mod tests {
             (75.0..250.0).contains(&shrunk),
             "unbounded split after window resize: {shrunk}"
         );
+    }
+
+    #[test]
+    fn shrinking_a_resized_mixed_workspace_keeps_the_smith_circle_usable() {
+        for language in Language::ALL {
+            for theme_mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+                let ctx = egui::Context::default();
+                theme::setup(&ctx);
+                theme::apply(&ctx, theme_mode);
+                i18n::set_language(&ctx, language);
+                let mut app = active_impedance_app();
+                app.state.language = language;
+                app.state
+                    .workspace
+                    .add_trace(TraceSettings {
+                        display: TraceDisplay::S11(S11Display::Smith),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let large = egui::vec2(1280.0, 850.0);
+                let divider = |output: &egui::FullOutput| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::LineSegment { points, .. }
+                                if points[0].y == points[1].y
+                                    && points[0].x > 200.0
+                                    && points[1].x < large.x - 200.0
+                                    && points[1].x - points[0].x > large.x - 530.0
+                                    && points[0].y > 150.0 =>
+                            {
+                                Some(points[0].y)
+                            }
+                            _ => None,
+                        })
+                        .expect("mixed workspace divider")
+                };
+                let output =
+                    interaction_frame(&ctx, large, vec![], 0.0, |ui| app.instrument_ui(ui));
+                let before = divider(&output);
+                output.drop_without_applying_deltas();
+                let from = egui::pos2(large.x * 0.5, before);
+                let to = from + egui::vec2(0.0, 85.0);
+                for (index, events) in [
+                    vec![egui::Event::PointerMoved(from)],
+                    vec![pointer_button(from, true)],
+                    vec![egui::Event::PointerMoved(to)],
+                    vec![pointer_button(to, false)],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    interaction_frame(&ctx, large, events, (index + 1) as f64 * 0.02, |ui| {
+                        app.instrument_ui(ui)
+                    })
+                    .drop_without_applying_deltas();
+                }
+                let output =
+                    interaction_frame(&ctx, large, vec![], 0.12, |ui| app.instrument_ui(ui));
+                assert!(divider(&output) > before + 50.0);
+                output.drop_without_applying_deltas();
+                for frame in 0..3 {
+                    let output = interaction_frame(
+                        &ctx,
+                        egui::vec2(960.0, 600.0),
+                        vec![],
+                        0.2 + frame as f64 * 0.02,
+                        |ui| app.instrument_ui(ui),
+                    );
+                    let (circle, clip) = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Circle(circle) => Some((circle, shape.clip_rect)),
+                            _ => None,
+                        })
+                        .max_by(|(left, _), (right, _)| left.radius.total_cmp(&right.radius))
+                        .expect("Smith unit circle");
+                    assert!(
+                        circle.radius >= 40.0,
+                        "Smith radius shrank to {}",
+                        circle.radius
+                    );
+                    assert!(clip.contains_rect(egui::Rect::from_center_size(
+                        circle.center,
+                        egui::Vec2::splat(circle.radius * 2.0)
+                    )));
+                    assert_eq!(app.state.workspace.smith.zoom, 1.0);
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
     }
 
     #[test]
