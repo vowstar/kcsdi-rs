@@ -16,13 +16,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let language = state.language;
-        let endpoint = if state.host.trim().is_empty() {
+        let endpoint = if state.target.validate().is_err() {
             language.text(Text::Connection).to_owned()
         } else {
-            format!("{}:{}", state.host, state.port)
+            state.target.to_string()
         };
         if ui
-            .button(egui::RichText::new(endpoint).monospace())
+            .add_sized(
+                [160.0, 18.0],
+                egui::Button::new(egui::RichText::new(&endpoint).monospace()).truncate(),
+            )
+            .on_hover_text(&endpoint)
             .clicked()
         {
             open_connection = true;
@@ -89,12 +93,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) -> bool {
             }
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
                 if ui.button(language.text(Text::Connect)).clicked() {
-                    if state.host.trim().is_empty() {
+                    if state.target.validate().is_err() {
                         open_connection = true;
                     } else {
                         state.send(WorkerCommand::Connect {
-                            host: state.host.clone(),
-                            port: state.port,
+                            target: state.target.clone(),
                         });
                     }
                 }
@@ -289,8 +292,10 @@ pub(crate) mod tests {
                         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                         let mut state = AppState {
                             language,
-                            host: "loopback.example.invalid".into(),
-                            port: 19117,
+                            target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                                host: "loopback.example.invalid".into(),
+                                port: 19117,
+                            },
                             connection: match case {
                                 8 => ConnectionState::Disconnected,
                                 9 => ConnectionState::Connecting,

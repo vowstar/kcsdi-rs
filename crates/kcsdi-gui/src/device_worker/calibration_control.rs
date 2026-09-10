@@ -8,7 +8,7 @@ type Owner = Option<(WorkerIdentity, CancellationToken)>;
 pub(super) fn track_request(
     command: &CommandEnvelope,
     identity: WorkerIdentity,
-    device: &Option<Device<TcpTransport>>,
+    device: &Option<Device<ConnectionTransport>>,
     owner: &mut Owner,
 ) {
     if command.session_id != identity.session_id
@@ -47,7 +47,7 @@ pub(super) fn track_request(
 
 pub(super) fn rejection_guard(
     command: &CommandEnvelope,
-    device: &Option<Device<TcpTransport>>,
+    device: &Option<Device<ConnectionTransport>>,
     owner: &Owner,
 ) -> Option<CancellationToken> {
     let report = device.as_ref()?.calibration_report();
@@ -73,7 +73,7 @@ pub(super) fn rejection_guard(
 
 pub(super) fn reject_while_active(
     command: &WorkerCommand,
-    device: &Option<Device<TcpTransport>>,
+    device: &Option<Device<ConnectionTransport>>,
     emit: &dyn Fn(WorkerEvent),
 ) -> bool {
     if !device

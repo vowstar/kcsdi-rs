@@ -34,7 +34,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Work
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 7;
+pub const CONFIG_VERSION: u32 = 8;
 
 fn legacy_config_version() -> u32 {
     1
@@ -51,7 +51,7 @@ pub struct AppConfig {
     /// Read-only migration fields from the fixed-mode workspace.
     #[serde(skip_serializing)]
     pub mode: String,
-    pub connection: Connection,
+    pub connection: kcsdi_core::connection::ConnectionTarget,
     #[serde(skip_serializing)]
     pub spec: Spec,
     #[serde(skip_serializing)]
@@ -447,14 +447,6 @@ impl WorkspaceConfig {
     }
 }
 
-/// Last-used connection target.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Connection {
-    pub host: String,
-    pub port: u16,
-}
-
 /// Last-used SPEC sweep parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -534,7 +526,7 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             language: LanguagePreference::default(),
             mode: mode_as_str(AppMode::default()).to_string(),
-            connection: Connection::default(),
+            connection: Default::default(),
             spec: Spec::default(),
             s11: S11::default(),
             legacy_sweeps: None,
@@ -542,15 +534,6 @@ impl Default for AppConfig {
             desktop: DesktopConfig::default(),
             function: Default::default(),
             sources: Default::default(),
-        }
-    }
-}
-
-impl Default for Connection {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            port: 901,
         }
     }
 }
@@ -589,10 +572,7 @@ impl AppConfig {
             version: CONFIG_VERSION,
             language: state.language_preference,
             legacy_sweeps: state.legacy_sweeps.clone(),
-            connection: Connection {
-                host: state.host.clone(),
-                port: state.port,
-            },
+            connection: state.target.clone(),
             workspace: WorkspaceConfig::from_workspace(&state.workspace),
             desktop: state.desktop.settings.clone(),
             function: state.function,
@@ -607,19 +587,23 @@ impl AppConfig {
         state.desktop.settings = self.desktop.clone();
         // Import the legacy connection once. A version-2 empty profile list
         // represents the user's choice and must stay empty after deletion.
-        if self.version < 2 && state.desktop.settings.profiles.is_empty() {
-            let host = self.connection.host.trim();
+        if self.version < 2
+            && state.desktop.settings.profiles.is_empty()
+            && let kcsdi_core::connection::ConnectionTarget::Tcp { host, port } = &self.connection
+        {
+            let host = host.trim();
             if !host.is_empty() {
                 state.desktop.settings.profiles.push(DeviceProfile {
                     name: host.to_owned(),
-                    host: host.to_owned(),
-                    port: self.connection.port,
+                    target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                        host: host.to_owned(),
+                        port: *port,
+                    },
                 });
             }
         }
         state.set_language_preference(self.language);
-        state.host = self.connection.host.clone();
-        state.port = self.connection.port;
+        state.target = self.connection.clone();
         state.legacy_sweeps = if self.version < 3 {
             Some(LegacySweeps {
                 mode: self.mode.clone(),
@@ -1166,6 +1150,70 @@ visible = false
     }
 
     #[test]
+    fn legacy_tcp_and_tagged_serial_profiles_share_one_config() {
+        use kcsdi_core::connection::ConnectionTarget;
+        let old = r#"
+version = 7
+language = "zh-CN"
+[connection]
+host = "instrument.local"
+port = 4321
+[[desktop.profiles]]
+name = "TCP bench"
+host = "instrument.local"
+port = 4321
+[[desktop.profiles]]
+name = "USB bench"
+kind = "serial"
+path = "/dev/serial/by-id/unavailable"
+"#;
+        let config: AppConfig = toml::from_str(old).unwrap();
+        let mut state = AppState::default();
+        config.apply_to(&mut state);
+        assert_eq!(state.target.to_string(), "instrument.local:4321");
+        assert_eq!(state.desktop.settings.profiles.len(), 2);
+        let serial = ConnectionTarget::Serial {
+            path: "/dev/serial/by-id/unavailable".into(),
+        };
+        assert_eq!(state.desktop.settings.profiles[1].target, serial);
+        state.target = serial.clone();
+        let encoded = toml::to_string(&AppConfig::from_state(&state)).unwrap();
+        assert!(encoded.contains("kind = \"serial\""));
+        assert!(encoded.contains("kind = \"tcp\""));
+        assert!(!encoded.contains("lookup"));
+        let restored: AppConfig = toml::from_str(&encoded).unwrap();
+        let mut restarted = AppState::default();
+        restored.apply_to(&mut restarted);
+        assert_eq!(restarted.target, serial);
+        assert_eq!(restarted.desktop.settings, state.desktop.settings);
+        assert_eq!(
+            restarted.connection,
+            crate::state::ConnectionState::Disconnected
+        );
+        assert!(!restarted.desktop.lookup.is_pending());
+        assert!(!restarted.any_running());
+        assert!(!restarted.source.busy());
+        assert!(!restarted.calibration.busy());
+    }
+
+    #[test]
+    fn unknown_transport_tags_are_not_silently_changed_to_tcp() {
+        for text in [
+            "[connection]\nkind = \"bluetooth\"\nhost = \"instrument.local\"\n",
+            "[[desktop.profiles]]\nname = \"Unknown\"\nkind = \"bluetooth\"\nhost = \"instrument.local\"\n",
+        ] {
+            assert!(toml::from_str::<AppConfig>(text).is_err());
+        }
+        let config: AppConfig = toml::from_str(
+            "version = 2\n[connection]\nhost = \"instrument.local\"\n[desktop]\nprofiles = []\n",
+        )
+        .unwrap();
+        let mut state = AppState::default();
+        config.apply_to(&mut state);
+        assert!(state.desktop.settings.profiles.is_empty());
+    }
+
+    #[test]
     fn legacy_connection_becomes_one_profile_without_changing_sweeps() {
         for version in ["", "version = 1\n"] {
             let text = format!(
@@ -1178,8 +1226,10 @@ visible = false
                 state.desktop.settings.profiles,
                 vec![DeviceProfile {
                     name: "bench.example.invalid".into(),
-                    host: "bench.example.invalid".into(),
-                    port: 4321,
+                    target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                        host: "bench.example.invalid".into(),
+                        port: 4321
+                    },
                 }]
             );
             assert_eq!(state.workspace.range.points, 401);
@@ -1213,7 +1263,7 @@ visible = false
         let mut restored = AppState::default();
         parsed.apply_to(&mut restored);
         assert!(restored.desktop.settings.profiles.is_empty());
-        assert_eq!(restored.host, "bench.example.invalid");
+        assert_eq!(restored.target.to_string(), "bench.example.invalid:901");
     }
 
     #[test]
@@ -1221,8 +1271,10 @@ visible = false
         let mut config = AppConfig::default();
         config.desktop.profiles = vec![DeviceProfile {
             name: "Bench A".into(),
-            host: "analyzer.example.invalid".into(),
-            port: 901,
+            target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                host: "analyzer.example.invalid".into(),
+                port: 901,
+            },
         }];
         config.desktop.theme = ThemeMode::Light;
         let parsed: AppConfig = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
@@ -1254,7 +1306,7 @@ visible = false
         )
         .unwrap();
         assert_eq!(cfg.language, LanguagePreference::System);
-        assert_eq!(cfg.connection.host, "example.invalid");
+        assert_eq!(cfg.connection.to_string(), "example.invalid:901");
         let legacy: AppConfig = toml::from_str("").unwrap();
         assert_eq!(legacy.language, LanguagePreference::System);
     }
@@ -1276,8 +1328,7 @@ visible = false
     #[test]
     fn partial_file_uses_defaults() {
         let cfg: AppConfig = toml::from_str("[connection]\nhost = \"example.invalid\"\n").unwrap();
-        assert_eq!(cfg.connection.host, "example.invalid");
-        assert_eq!(cfg.connection.port, 901);
+        assert_eq!(cfg.connection.to_string(), "example.invalid:901");
         assert_eq!(cfg.spec.points, 201);
         // Sections absent from old config files fall back to defaults.
         assert_eq!(cfg.mode, "spec");
@@ -1349,8 +1400,10 @@ rbw = "30k"
     fn state_roundtrip() {
         let mut state = AppState::default();
         state.set_language_preference(LanguagePreference::SimplifiedChinese);
-        state.host = "analyzer.example.invalid".to_string();
-        state.port = 5025;
+        state.target = kcsdi_core::connection::ConnectionTarget::Tcp {
+            host: "analyzer.example.invalid".into(),
+            port: 5025,
+        };
         state.workspace.range = SweepRange::new(10e6, 400e6, 101);
         state.workspace.log_x = true;
         state
@@ -1376,8 +1429,7 @@ rbw = "30k"
             restored.language_preference,
             LanguagePreference::SimplifiedChinese
         );
-        assert_eq!(restored.host, "analyzer.example.invalid");
-        assert_eq!(restored.port, 5025);
+        assert_eq!(restored.target.to_string(), "analyzer.example.invalid:5025");
         assert_eq!(restored.workspace.range, state.workspace.range);
         assert!(restored.workspace.log_x);
         assert_eq!(restored.workspace.selected, state.workspace.selected);

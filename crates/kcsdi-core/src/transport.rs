@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use crate::control::{CancellationToken, POLL_INTERVAL};
 use crate::error::{Error, Result};
 
+pub mod serial;
+
 /// Host budget for name resolution and TCP connection setup.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -214,17 +216,13 @@ impl Transport for TcpTransport {
         let started = Instant::now();
         let mut chunk = [0u8; 4096];
         loop {
-            let end = self.buf.iter().position(|&b| b == b'\n');
-            if end.unwrap_or(self.buf.len()) > MAX_LINE_BYTES {
-                self.invalidate();
-                return Err(Error::Protocol(format!(
-                    "line exceeds {MAX_LINE_BYTES} bytes"
-                )));
-            }
-            if let Some(pos) = end {
-                let line: Vec<u8> = self.buf.drain(..=pos).collect();
-                let text = String::from_utf8_lossy(&line);
-                return Ok(text.trim_end_matches(['\n', '\r']).to_string());
+            match take_buffered_line(&mut self.buf) {
+                Ok(Some(line)) => return Ok(line),
+                Ok(None) => {}
+                Err(error) => {
+                    self.invalidate();
+                    return Err(error);
+                }
             }
             let remaining = remaining_timeout(started, timeout)?;
             if let Err(error) = self.stream.set_read_timeout(Some(remaining)) {
@@ -246,6 +244,21 @@ impl Transport for TcpTransport {
             }
         }
     }
+}
+
+fn take_buffered_line(buf: &mut Vec<u8>) -> Result<Option<String>> {
+    let end = buf.iter().position(|&b| b == b'\n');
+    if end.unwrap_or(buf.len()) > MAX_LINE_BYTES {
+        return Err(Error::Protocol(format!(
+            "line exceeds {MAX_LINE_BYTES} bytes"
+        )));
+    }
+    Ok(end.map(|pos| {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        String::from_utf8_lossy(&line)
+            .trim_end_matches(['\n', '\r'])
+            .to_string()
+    }))
 }
 
 pub(crate) fn remaining_timeout(started: Instant, timeout: Duration) -> Result<Duration> {

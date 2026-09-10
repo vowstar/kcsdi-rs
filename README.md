@@ -5,7 +5,7 @@
 
 [简体中文](README.zh-CN.md)
 
-A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11, S21 and spectrum sweeps, and save measurements.
+A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet or USB serial, view S11, S21 and spectrum sweeps, and save measurements.
 
 ![English impedance and Smith views of one recorded S11 sweep](https://github.com/user-attachments/assets/8eee9271-257a-42d9-8f8b-7aabc8dfcf17)
 
@@ -18,7 +18,7 @@ A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet, view S11,
 | Analysis | Selectable traces, hold, maximum and minimum envelopes, markers, zoom, pan and fit |
 | Interface | English and Simplified Chinese. Saved devices, light, dark and system themes |
 
-S11 and spectrum hardware tests use a KC901V with firmware V1.6.1. S21 has software and local replay tests. Other KC901 models need hardware tests.
+S11 and spectrum hardware tests use a KC901V with firmware V1.6.1. S21, serial and LAN discovery have software and local replay tests. Other KC901 models need hardware tests.
 
 ## Build and connect
 
@@ -39,7 +39,7 @@ cargo run --release -p kcsdi-gui
 
 The binaries are in `target/release`. Add that directory to PATH to use the CLI commands that follow.
 
-In the GUI, add a device with its address and TCP port, open it, then select Connect in the bottom bar. The instrument accepts one control connection at a time.
+In the GUI, add a device with its TCP address and port or serial path, open it, then select Connect in the bottom bar. Discover scans for KC901V advertisements and lets you add a saved device. The instrument accepts one control connection at a time.
 
 Add up to ten traces in the left panel and choose their views and colors. Run acquires the visible traces in sequence and shares matching measurements. Each trace keeps its last complete sweep and Y scale. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
 
@@ -49,6 +49,9 @@ For the CLI, replace `192.0.2.10` with the instrument address. Frequencies use H
 
 ```sh
 kcsdi info --host 192.0.2.10 --port 901
+kcsdi serial-ports
+kcsdi info --serial /dev/ttyUSB0
+kcsdi discover
 kcsdi limits --model kc901v
 kcsdi sweep s11 --host 192.0.2.10 --port 901 \
     --start 5000 --stop 100000000 --points 201 --out antenna.s1p

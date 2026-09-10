@@ -83,8 +83,10 @@ impl Replay {
         replay.send(
             1,
             WorkerCommand::Connect {
-                host: "127.0.0.1".into(),
-                port,
+                target: ConnectionTarget::Tcp {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
             },
         );
         assert!(matches!(replay.event().event, WorkerEvent::Connected(_)));
@@ -258,6 +260,7 @@ fn serve(
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut line = Vec::new();
     let mut kind = CalibrationKind::S11System;
+    let mut aborted = false;
     loop {
         assert!(Instant::now() < deadline, "fixture exceeded its deadline");
         while let Ok((bytes, sent)) = injected.try_recv() {
@@ -296,6 +299,11 @@ fn serve(
             }
             String::from_utf8(std::mem::take(&mut line)).unwrap()
         };
+        if command == "\x03" {
+            aborted = true;
+        } else if command.starts_with("$cal_") {
+            aborted = false;
+        }
         if command.starts_with("$cal_user_s11,") {
             kind = CalibrationKind::S11User;
         }
@@ -312,7 +320,9 @@ fn serve(
         let response = match command.as_str() {
             "C" => b"$start,id\n$000000000001\n$end\n".as_slice(),
             "$device\n" => IDENTITY,
-            "$exit\n" => exit.as_bytes(),
+            // Uncertain cleanup does not read replies after abort. An EXIT
+            // reply here can race the closing client and hide queued LOCAL.
+            "$exit\n" if !aborted => exit.as_bytes(),
             S11_RUN => sweep_reply,
             _ => b"",
         };

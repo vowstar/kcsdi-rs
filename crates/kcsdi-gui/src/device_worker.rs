@@ -13,9 +13,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kcsdi_core::Device;
 use kcsdi_core::calibration::{CalibrationPhase, CalibrationReport};
+#[cfg(test)]
+use kcsdi_core::connection::ConnectionTarget;
+use kcsdi_core::connection::ConnectionTransport;
 use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
 use kcsdi_core::source::{SourceOutputState, SourceReport};
+#[cfg(test)]
 use kcsdi_core::transport::TcpTransport;
 use log::{error, info};
 
@@ -253,7 +257,7 @@ fn run_worker(
     preview: PreviewMailbox,
     mut recording: RecordingState,
 ) {
-    let mut device: Option<Device<TcpTransport>> = None;
+    let mut device: Option<Device<ConnectionTransport>> = None;
     let mut job: Option<SweepRequest> = None;
     let mut identity = WorkerIdentity::default();
     let mut cycle_id = 0_u64;
@@ -642,7 +646,7 @@ fn track_source_request(
 
 fn source_rejection_guard(
     command: &CommandEnvelope,
-    device: &Option<Device<TcpTransport>>,
+    device: &Option<Device<ConnectionTransport>>,
     owner: &Option<(WorkerIdentity, CancellationToken)>,
 ) -> Option<CancellationToken> {
     let rejects_without_stopping = match &command.command {
@@ -714,7 +718,7 @@ fn handle_or_defer(
     envelope: CommandEnvelope,
     pending_status: &mut Option<CommandEnvelope>,
     identity: &mut WorkerIdentity,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     writer_pending: bool,
     emit: &dyn Fn(EventEnvelope),
@@ -789,7 +793,7 @@ fn send_request_event(
 fn handle(
     envelope: CommandEnvelope,
     identity: &mut WorkerIdentity,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     emit_event: &dyn Fn(EventEnvelope),
 ) {
@@ -799,7 +803,7 @@ fn handle(
 fn handle_with_recording(
     envelope: CommandEnvelope,
     identity: &mut WorkerIdentity,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     writer_pending: bool,
     emit_event: &dyn Fn(EventEnvelope),
@@ -841,25 +845,33 @@ fn handle_with_recording(
         return;
     }
     match command {
-        WorkerCommand::Connect { host, port } => {
+        WorkerCommand::Connect { target } => {
             discard_job(job);
             // Drop an old session before opening the device's single
             // control connection, including reconnect after a failure.
             *device = None;
-            match Device::connect_with_model_controlled(&host, port, DEVICE_MODEL, &cancel)
+            match target
+                .connect_controlled(DEVICE_MODEL, &cancel)
                 .and_then(|mut dev| {
                     let info = dev.device_info_controlled(&cancel)?;
                     Ok((dev, info))
                 }) {
                 Ok((dev, info)) => {
-                    info!("connected to {host}:{port}, serial {}", info.serial);
+                    info!(
+                        "connected to {}, serial {}",
+                        target.to_string().escape_default(),
+                        info.serial.escape_default()
+                    );
                     *device = Some(dev);
                     emit(WorkerEvent::Connected(info));
                 }
                 Err(e) => {
                     *device = None;
                     if !matches!(e, kcsdi_core::Error::Cancelled) {
-                        error!("connect to {host}:{port} failed: {e}");
+                        error!(
+                            "connect to {} failed: {e}",
+                            target.to_string().escape_default()
+                        );
                         emit(WorkerEvent::Error(format!("Connect failed: {e}")));
                     }
                 }
@@ -955,7 +967,7 @@ fn handle_with_recording(
 
 fn calibration_result(
     result: kcsdi_core::Result<CalibrationReport>,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
@@ -990,7 +1002,7 @@ fn calibration_result(
 
 fn source_result(
     result: kcsdi_core::Result<SourceReport>,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
@@ -1011,7 +1023,7 @@ fn source_result(
 
 fn refresh_status(
     cancel: &CancellationToken,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
@@ -1070,7 +1082,7 @@ fn start_sweep(
     next: SweepPlan,
     request_id: u64,
     cancel: CancellationToken,
-    device: &mut Option<Device<TcpTransport>>,
+    device: &mut Option<Device<ConnectionTransport>>,
     job: &mut Option<SweepRequest>,
     emit: &dyn Fn(WorkerEvent),
 ) {
@@ -1474,8 +1486,10 @@ mod tests {
                         request_id: 1,
                         cancel: CancellationToken::default(),
                         command: WorkerCommand::Connect {
-                            host: "127.0.0.1".into(),
-                            port,
+                            target: ConnectionTarget::Tcp {
+                                host: "127.0.0.1".into(),
+                                port,
+                            },
                         },
                     })
                     .unwrap();
@@ -1691,8 +1705,10 @@ mod tests {
                     request_id: 1,
                     cancel: CancellationToken::default(),
                     command: WorkerCommand::Connect {
-                        host: "127.0.0.1".into(),
-                        port,
+                        target: ConnectionTarget::Tcp {
+                            host: "127.0.0.1".into(),
+                            port,
+                        },
                     },
                 })
                 .unwrap();
@@ -2111,7 +2127,7 @@ mod tests {
             let (mut peer, _) = listener.accept().unwrap();
             peer.set_read_timeout(Some(Duration::from_millis(50)))
                 .unwrap();
-            let mut device = Some(Device::new(transport));
+            let mut device = Some(Device::new(transport.into()));
             let mut job = Some(request(AcquisitionSettings::S11(s11())));
             let events = RefCell::new(Vec::new());
             start_sweep(
@@ -2330,8 +2346,10 @@ mod tests {
                     request_id: 1,
                     cancel: CancellationToken::default(),
                     command: WorkerCommand::Connect {
-                        host: "127.0.0.1".into(),
-                        port,
+                        target: ConnectionTarget::Tcp {
+                            host: "127.0.0.1".into(),
+                            port,
+                        },
                     },
                 })
                 .unwrap();
@@ -2620,8 +2638,10 @@ mod tests {
                 3,
                 10,
                 WorkerCommand::Connect {
-                    host: "127.0.0.1".into(),
-                    port: 0,
+                    target: ConnectionTarget::Tcp {
+                        host: "127.0.0.1".into(),
+                        port: 0,
+                    },
                 },
             ),
         ] {
@@ -2722,7 +2742,7 @@ mod tests {
             }
         });
         let mut device = Some(Device::new(
-            TcpTransport::connect("127.0.0.1", port).unwrap(),
+            TcpTransport::connect("127.0.0.1", port).unwrap().into(),
         ));
         let mut identity = WorkerIdentity {
             session_id: 2,
@@ -2900,7 +2920,7 @@ mod tests {
                 }
             });
             let mut device = Some(Device::new(
-                TcpTransport::connect("127.0.0.1", port).unwrap(),
+                TcpTransport::connect("127.0.0.1", port).unwrap().into(),
             ));
             let mut identity = WorkerIdentity {
                 session_id: 2,
@@ -3083,8 +3103,10 @@ mod tests {
                     request_id: 1,
                     cancel: session.clone(),
                     command: WorkerCommand::Connect {
-                        host: "127.0.0.1".into(),
-                        port,
+                        target: ConnectionTarget::Tcp {
+                            host: "127.0.0.1".into(),
+                            port,
+                        },
                     },
                 })
                 .unwrap();
@@ -3118,7 +3140,7 @@ mod tests {
             Error::Protocol("oversized packet".into()),
             Error::Io(std::io::ErrorKind::ConnectionReset.into()),
         ] {
-            let mut device: Option<Device<TcpTransport>> = None;
+            let mut device: Option<Device<ConnectionTransport>> = None;
             let mut job = Some(request(AcquisitionSettings::S11(s11())));
             let events = RefCell::new(Vec::new());
             fail(error, "Sweep failed", &mut device, &mut job, &|event| {
@@ -3157,7 +3179,7 @@ mod tests {
             assert_eq!(line, "$temp\n");
         });
         let mut device = Some(Device::new(
-            TcpTransport::connect("127.0.0.1", port).unwrap(),
+            TcpTransport::connect("127.0.0.1", port).unwrap().into(),
         ));
         let mut job = Some(request(AcquisitionSettings::S11(s11())));
         let events = RefCell::new(Vec::new());

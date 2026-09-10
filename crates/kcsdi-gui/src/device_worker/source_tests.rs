@@ -81,8 +81,10 @@ impl Replay {
         replay.send(
             1,
             WorkerCommand::Connect {
-                host: "127.0.0.1".into(),
-                port,
+                target: ConnectionTarget::Tcp {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
             },
         );
         assert!(matches!(replay.event().event, WorkerEvent::Connected(_)));

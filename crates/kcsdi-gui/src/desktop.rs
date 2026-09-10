@@ -3,6 +3,7 @@
 
 //! Local device profiles, desktop settings and existing device information.
 
+use kcsdi_core::connection::ConnectionTarget;
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::Text;
@@ -18,22 +19,12 @@ pub enum Page {
     Instrument,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceProfile {
     pub name: String,
-    pub host: String,
-    pub port: u16,
-}
-
-impl Default for DeviceProfile {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            host: String::new(),
-            port: 901,
-        }
-    }
+    #[serde(flatten)]
+    pub target: ConnectionTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -47,6 +38,7 @@ pub struct DesktopConfig {
 pub struct DesktopState {
     pub page: Page,
     pub settings: DesktopConfig,
+    pub lookup: crate::device_lookup::DeviceLookup,
     editor: Option<ProfileEditor>,
     delete_profile: Option<usize>,
 }
@@ -63,8 +55,11 @@ impl DeviceProfile {
         if name.is_empty() {
             return Some(Text::ProfileNameRequired);
         }
-        if !valid_host(self.host.trim()) || self.port == 0 {
-            return Some(Text::ProfileHostRequired);
+        if self.normalized().target.validate().is_err() {
+            return Some(match self.target {
+                ConnectionTarget::Tcp { .. } => Text::ProfileHostRequired,
+                ConnectionTarget::Serial { .. } => Text::SerialPathRequired,
+            });
         }
         if profiles.iter().enumerate().any(|(index, profile)| {
             Some(index) != own_index && profile.name.trim().to_lowercase() == name.to_lowercase()
@@ -77,28 +72,9 @@ impl DeviceProfile {
     fn normalized(&self) -> Self {
         Self {
             name: self.name.trim().to_owned(),
-            host: self.host.trim().to_owned(),
-            port: self.port,
+            target: crate::connection_editor::normalized(&self.target),
         }
     }
-}
-
-fn valid_host(host: &str) -> bool {
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-    let host = host.strip_suffix('.').unwrap_or(host);
-    !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
 }
 
 /// Show the local desktop shell. Opening a profile only selects its target.
@@ -129,7 +105,7 @@ pub fn show_home(ui: &mut egui::Ui, state: &mut AppState) {
                     state.desktop.page = page;
                 }
             }
-            if !state.host.is_empty() {
+            if state.target.validate().is_ok() {
                 ui.add_space(12.0);
                 ui.separator();
                 if ui
@@ -159,6 +135,7 @@ pub fn show_home(ui: &mut egui::Ui, state: &mut AppState) {
     });
     show_profile_editor(ui.ctx(), state);
     show_delete_confirmation(ui.ctx(), state);
+    show_discovery(ui.ctx(), state);
 }
 
 fn show_devices(ui: &mut egui::Ui, state: &mut AppState) {
@@ -167,7 +144,12 @@ fn show_devices(ui: &mut egui::Ui, state: &mut AppState) {
         egui::vec2(152.0, 36.0),
         ui.max_rect().shrink2(egui::vec2(0.0, 16.0)),
     );
-    ui.label(egui::RichText::new(language.text(Text::LocalDevices)).strong());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(language.text(Text::LocalDevices)).strong());
+        if ui.button(language.text(Text::DiscoverDevices)).clicked() {
+            state.desktop.lookup.discovery_open = true;
+        }
+    });
     ui.add_space(8.0);
     egui::ScrollArea::vertical()
         .max_height((ui.available_height() - 64.0).max(0.0))
@@ -191,6 +173,92 @@ fn show_devices(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
+fn show_discovery(ctx: &egui::Context, state: &mut AppState) {
+    let language = state.language;
+    let lookup = &mut state.desktop.lookup;
+    let was_open = lookup.discovery_open;
+    let mut add = None;
+    egui::Window::new(language.text(Text::DiscoverDevices))
+        .id(egui::Id::new("device_discovery"))
+        .open(&mut lookup.discovery_open)
+        .default_width(420.0)
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(language.text(Text::DiscoveryHelp));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !lookup.discovery.is_pending(),
+                        egui::Button::new(language.text(Text::DiscoveryScan)),
+                    )
+                    .clicked()
+                {
+                    lookup.discovery.start_scan();
+                }
+                if lookup.discovery.is_pending() {
+                    ui.spinner();
+                    if ui.button(language.text(Text::Cancel)).clicked() {
+                        lookup.discovery.cancel();
+                    }
+                }
+            });
+            if let Some(error) = &lookup.discovery.error {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    language.text(Text::DiscoveryFailed),
+                )
+                .on_hover_text(error);
+            }
+            let devices = lookup
+                .discovery
+                .data
+                .as_ref()
+                .map(|snapshot| snapshot.devices.as_slice())
+                .unwrap_or_default();
+            if devices.is_empty() {
+                ui.weak(language.text(Text::DiscoveryEmpty));
+            }
+            egui::ScrollArea::vertical()
+                .max_height(250.0)
+                .show(ui, |ui| {
+                    for device in devices {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    device.is_fresh(std::time::Instant::now()),
+                                    egui::Button::new(language.text(Text::AddDiscovered)),
+                                )
+                                .clicked()
+                            {
+                                add = Some(DeviceProfile {
+                                    name: device.hostname.clone(),
+                                    target: device.target.clone(),
+                                });
+                            }
+                            let caption = format!("{}  {}", device.product, device.target);
+                            ui.add(egui::Label::new(caption).truncate())
+                                .on_hover_text(&device.hostname);
+                        });
+                    }
+                });
+        });
+    if lookup.discovery_open {
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    if let Some(profile) = add {
+        state.desktop.editor = Some(ProfileEditor {
+            index: None,
+            profile,
+        });
+        lookup.discovery_open = false;
+    }
+    if was_open && !lookup.discovery_open {
+        lookup.discovery.cancel();
+    }
+}
+
 fn show_profiles(ui: &mut egui::Ui, state: &mut AppState) {
     let language = state.language;
     if state.desktop.settings.profiles.is_empty() {
@@ -209,7 +277,7 @@ fn show_profiles(ui: &mut egui::Ui, state: &mut AppState) {
     );
     ui.horizontal_wrapped(|ui| {
         for (index, profile) in state.desktop.settings.profiles.iter().enumerate() {
-            let selected = state.host == profile.host && state.port == profile.port;
+            let selected = state.target == profile.target;
             let stroke = if selected {
                 egui::Stroke::new(1.0, ui.visuals().hyperlink_color)
             } else {
@@ -225,10 +293,25 @@ fn show_profiles(ui: &mut egui::Ui, state: &mut AppState) {
                         ui.set_width(216.0);
                         ui.set_min_height(132.0);
                         ui.push_id(index, |ui| {
-                            ui.label(egui::RichText::new(&profile.name).size(15.0).strong());
-                            ui.small(format!("{} / TCP", DEVICE_MODEL.name()));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&profile.name).size(15.0).strong(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&profile.name);
+                            ui.small(format!(
+                                "{} / {}",
+                                DEVICE_MODEL.name(),
+                                crate::connection_editor::kind_label(&profile.target, language)
+                            ));
                             ui.add_space(6.0);
-                            ui.monospace(format!("{}:{}", profile.host, profile.port));
+                            let endpoint = profile.target.to_string();
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&endpoint).monospace())
+                                    .truncate(),
+                            )
+                            .on_hover_text(endpoint);
                             let status = if selected {
                                 match state.connection {
                                     ConnectionState::Connected => Text::Connected,
@@ -286,11 +369,10 @@ fn open_profile(state: &mut AppState, index: usize) {
         state.connection,
         ConnectionState::Connected | ConnectionState::Connecting | ConnectionState::Disconnecting
     );
-    if busy && (state.host != profile.host || state.port != profile.port) {
+    if busy && state.target != profile.target {
         return;
     }
-    state.host = profile.host.clone();
-    state.port = profile.port;
+    state.target = profile.target.clone();
     state.desktop.page = Page::Instrument;
 }
 
@@ -457,16 +539,16 @@ fn show_profile_editor(ctx: &egui::Context, state: &mut AppState) {
         } else {
             Text::AddDevice
         }));
-        ui.small(format!("{} / TCP", DEVICE_MODEL.name()));
+        ui.small(DEVICE_MODEL.name());
         ui.add_space(12.0);
         ui.label(language.text(Text::DeviceName));
         ui.add(egui::TextEdit::singleline(&mut editor.profile.name).desired_width(f32::INFINITY));
-        ui.label(language.text(Text::Host));
-        ui.add(egui::TextEdit::singleline(&mut editor.profile.host).desired_width(f32::INFINITY));
-        ui.horizontal(|ui| {
-            ui.label(language.text(Text::Port));
-            ui.add(egui::DragValue::new(&mut editor.profile.port).range(1..=65535));
-        });
+        crate::connection_editor::show(
+            ui,
+            &mut editor.profile.target,
+            &mut state.desktop.lookup.ports,
+            language,
+        );
         let error = editor
             .profile
             .validation_error(&state.desktop.settings.profiles, editor.index);
@@ -492,6 +574,9 @@ fn show_profile_editor(ctx: &egui::Context, state: &mut AppState) {
         }
     } else if !cancel && !response.should_close() {
         state.desktop.editor = Some(editor);
+    }
+    if state.desktop.editor.is_none() {
+        state.desktop.lookup.ports.cancel();
     }
 }
 
@@ -706,13 +791,17 @@ mod tests {
             state.desktop.settings.profiles = vec![
                 DeviceProfile {
                     name: "Bench A".into(),
-                    host: "first.example.invalid".into(),
-                    port: 901,
+                    target: ConnectionTarget::Tcp {
+                        host: "first.example.invalid".into(),
+                        port: 901,
+                    },
                 },
                 DeviceProfile {
                     name: "Bench B".into(),
-                    host: "second.example.invalid".into(),
-                    port: 901,
+                    target: ConnectionTarget::Tcp {
+                        host: "second.example.invalid".into(),
+                        port: 901,
+                    },
                 },
             ];
             for _ in 0..3 {
@@ -781,8 +870,10 @@ mod tests {
         };
         state.desktop.settings.profiles.push(DeviceProfile {
             name: "Bench".into(),
-            host: "instrument.local".into(),
-            port: 4321,
+            target: ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 4321,
+            },
         });
         let trace = kcsdi_core::data::SweepData {
             mode: kcsdi_core::protocol::StreamMode::S11,
@@ -799,8 +890,13 @@ mod tests {
                 completed_at: std::time::SystemTime::UNIX_EPOCH,
             }));
         open_profile(&mut state, 0);
-        assert_eq!(state.host, "instrument.local");
-        assert_eq!(state.port, 4321);
+        assert_eq!(
+            state.target,
+            ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 4321
+            }
+        );
         assert_eq!(state.desktop.page, Page::Instrument);
         assert_eq!(state.connection, ConnectionState::Disconnected);
         assert_eq!(
@@ -821,19 +917,253 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_serial_profile_is_valid_and_open_never_connects() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = ConnectionTarget::Serial {
+            path: "/dev/serial/by-id/not-present".into(),
+        };
+        let profile = DeviceProfile {
+            name: "Serial bench".into(),
+            target: target.clone(),
+        };
+        assert!(profile.validation_error(&[], None).is_none());
+        let mut state = AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.desktop.settings.profiles.push(profile);
+        open_profile(&mut state, 0);
+        assert_eq!(state.target, target);
+        assert_eq!(state.connection, ConnectionState::Disconnected);
+        assert!(!state.desktop.lookup.is_pending());
+        assert!(rx.try_recv().is_err());
+        state.connection = ConnectionState::Connected;
+        state.desktop.settings.profiles.push(DeviceProfile {
+            name: "Other".into(),
+            target: ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 901,
+            },
+        });
+        open_profile(&mut state, 1);
+        assert_eq!(state.target, target);
+    }
+
+    #[test]
+    fn discovery_add_only_opens_an_editor_and_expired_results_cannot_be_added() {
+        use kcsdi_core::discovery::{DiscoveredDevice, DiscoverySnapshot};
+        let ctx = egui::Context::default();
+        theme::setup(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = AppState {
+            language: Language::English,
+            cmd_tx: Some(tx),
+            ..Default::default()
+        };
+        state.desktop.lookup.discovery_open = true;
+        let target = ConnectionTarget::Tcp {
+            host: "192.0.2.1".into(),
+            port: 4321,
+        };
+        let now = std::time::Instant::now();
+        state.desktop.lookup.discovery.data = Some(DiscoverySnapshot {
+            devices: vec![DiscoveredDevice {
+                target: target.clone(),
+                hostname: "synthetic.local".into(),
+                product: "KC901V".into(),
+                observed_at: now,
+                expires_at: now + std::time::Duration::from_secs(30),
+            }],
+        });
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut at = None;
+        for _ in 0..3 {
+            let output = ctx.run_ui(input(), |ui| show_home(ui, &mut state));
+            at = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Add" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            });
+            output.drop_without_applying_deltas();
+        }
+        let at = at.unwrap();
+        for pressed in [true, false] {
+            let mut event = input();
+            event.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ];
+            ctx.run_ui(event, |ui| show_home(ui, &mut state))
+                .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            state.desktop.editor.as_ref().unwrap().profile.target,
+            target
+        );
+        assert!(state.desktop.settings.profiles.is_empty());
+        assert_eq!(state.target, ConnectionTarget::default());
+        assert_eq!(state.session_id, 0);
+        assert_eq!(state.request_id, 0);
+        assert!(rx.try_recv().is_err());
+        state.desktop.editor = None;
+        state.desktop.lookup.discovery_open = true;
+        state
+            .desktop
+            .lookup
+            .discovery
+            .data
+            .as_mut()
+            .unwrap()
+            .devices[0]
+            .expires_at = now;
+        state.desktop.lookup.poll();
+        let output = ctx.run_ui(input(), |ui| show_home(ui, &mut state));
+        assert!(!output.shapes.iter().any(
+            |shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Add")
+        ));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn connection_editors_and_discovery_fit_languages_themes_and_window_sizes() {
+        use kcsdi_core::transport::serial::SerialPortInfo;
+        for language in Language::ALL {
+            for theme_mode in [ThemeMode::Light, ThemeMode::Dark] {
+                for size in [egui::vec2(960.0, 600.0), egui::vec2(1280.0, 850.0)] {
+                    for serial in [false, true] {
+                        let ctx = egui::Context::default();
+                        theme::setup(&ctx);
+                        theme::apply(&ctx, theme_mode);
+                        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let mut state = AppState {
+                            language,
+                            ..Default::default()
+                        };
+                        state.desktop.editor = Some(ProfileEditor {
+                            index: None,
+                            profile: DeviceProfile {
+                                name: "Bench".into(),
+                                target: if serial {
+                                    ConnectionTarget::Serial {
+                                        path: format!("/dev/serial/by-id/{}", "x".repeat(220)),
+                                    }
+                                } else {
+                                    ConnectionTarget::Tcp {
+                                        host: "instrument.local".into(),
+                                        port: 901,
+                                    }
+                                },
+                            },
+                        });
+                        state.desktop.lookup.ports.data = Some(vec![SerialPortInfo {
+                            path: "COM7".into(),
+                            label: format!("COM7 {}", "USB metadata ".repeat(30)),
+                        }]);
+                        for _ in 0..3 {
+                            let output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ui| show_home(ui, &mut state),
+                            );
+                            for shape in &output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    let visible = text
+                                        .galley
+                                        .rect
+                                        .translate(text.pos.to_vec2())
+                                        .intersect(shape.clip_rect);
+                                    if visible.is_positive() {
+                                        assert!(
+                                            screen.contains_rect(visible),
+                                            "{language:?} {theme_mode:?}: {} {visible:?}",
+                                            text.galley.text()
+                                        );
+                                    }
+                                    if [
+                                        language.text(Text::Save),
+                                        language.text(Text::Cancel),
+                                        language.text(Text::Serial),
+                                        language.text(Text::SerialPath),
+                                    ]
+                                    .contains(&text.galley.text())
+                                    {
+                                        assert!(shape.clip_rect.contains_rect(
+                                            text.galley.rect.translate(text.pos.to_vec2())
+                                        ));
+                                    }
+                                }
+                            }
+                            output.drop_without_applying_deltas();
+                        }
+                        assert!(!state.desktop.lookup.is_pending());
+                        state.desktop.editor = None;
+                        state.desktop.lookup.discovery_open = true;
+                        for _ in 0..3 {
+                            let output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ui| show_home(ui, &mut state),
+                            );
+                            for shape in &output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                                    assert!(
+                                        screen.contains_rect(rect),
+                                        "{language:?}: {} {rect:?}",
+                                        text.galley.text()
+                                    );
+                                }
+                            }
+                            output.drop_without_applying_deltas();
+                        }
+                        assert!(!state.desktop.lookup.is_pending());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn an_active_session_cannot_be_retargeted_by_opening_another_profile() {
         let mut state = AppState {
-            host: "current.local".into(),
+            target: ConnectionTarget::Tcp {
+                host: "current.local".into(),
+                port: 901,
+            },
             connection: ConnectionState::Connected,
             ..AppState::default()
         };
         state.desktop.settings.profiles.push(DeviceProfile {
             name: "Other".into(),
-            host: "other.local".into(),
-            port: 901,
+            target: ConnectionTarget::Tcp {
+                host: "other.local".into(),
+                port: 901,
+            },
         });
         open_profile(&mut state, 0);
-        assert_eq!(state.host, "current.local");
+        assert_eq!(
+            state.target,
+            ConnectionTarget::Tcp {
+                host: "current.local".into(),
+                port: 901
+            }
+        );
         assert_eq!(state.desktop.page, Page::Devices);
     }
 
@@ -845,7 +1175,15 @@ mod tests {
             "instrument.local",
             "analyzer.example.invalid.",
         ] {
-            assert!(valid_host(host), "{host}");
+            assert!(
+                ConnectionTarget::Tcp {
+                    host: host.into(),
+                    port: 901
+                }
+                .validate()
+                .is_ok(),
+                "{host}"
+            );
         }
         for host in [
             "",
@@ -855,7 +1193,15 @@ mod tests {
             "a..local",
             "-name.local",
         ] {
-            assert!(!valid_host(host), "{host}");
+            assert!(
+                ConnectionTarget::Tcp {
+                    host: host.into(),
+                    port: 901
+                }
+                .validate()
+                .is_err(),
+                "{host}"
+            );
         }
     }
 
@@ -863,8 +1209,10 @@ mod tests {
     fn editing_a_profile_keeps_its_name_but_cannot_take_another_profiles_name() {
         let profiles = vec![DeviceProfile {
             name: "Bench".into(),
-            host: "instrument.local".into(),
-            port: 901,
+            target: ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 901,
+            },
         }];
         let profile = DeviceProfile {
             name: " bench ".into(),

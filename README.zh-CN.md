@@ -5,7 +5,7 @@
 
 [English](README.md)
 
-用 Rust 编写的 KC901 图形界面和命令行工具，通过以太网控制仪器，查看 S11、S21 和频谱曲线，保存测量数据。
+用 Rust 编写的 KC901 图形界面和命令行工具，通过以太网或 USB 串口控制仪器，查看 S11、S21 和频谱曲线，保存测量数据。
 
 ![同一次 S11 扫描回放的中文阻抗和史密斯图界面](https://github.com/user-attachments/assets/e6cdfcb7-c2c0-416f-8de0-cea8c79d6592)
 
@@ -18,7 +18,7 @@
 | 分析 | 曲线显隐、保持、最大值与最小值包络、标记、缩放、平移和自动适配 |
 | 界面 | 中文和英文，保存设备，支持浅色、深色和跟随系统主题 |
 
-S11 和频谱实机测试使用 KC901V，固件版本为 V1.6.1。S21 已做软件和本地回放测试。其他 KC901 型号仍需实机测试。
+S11 和频谱实机测试使用 KC901V，固件版本为 V1.6.1。S21、串口和局域网发现已做软件和本地回放测试。其他 KC901 型号仍需实机测试。
 
 ## 构建与连接
 
@@ -39,7 +39,7 @@ cargo run --release -p kcsdi-gui
 
 可执行文件位于 `target/release`。将该目录加入 PATH 后，即可使用下文的 CLI 命令。
 
-在 GUI 首页添加设备，填写地址和 TCP 端口，打开设备后点击底栏的连接。仪器同一时间只能接受一个控制连接。
+在 GUI 首页添加设备，填写 TCP 地址和端口或串口路径，打开设备后点击底栏的连接。发现功能可扫描 KC901V 广播并添加设备。仪器同一时间只能接受一个控制连接。
 
 在左栏添加最多十条轨迹，选择各自的视图和颜色。运行时依次采集可见轨迹，条件相同的轨迹共用一次测量。每条轨迹保留最近一次完整扫描和独立的 Y 刻度。在右栏添加标记后，可以在图中拖动。按 F11 切换全屏。
 
@@ -49,6 +49,9 @@ cargo run --release -p kcsdi-gui
 
 ```sh
 kcsdi info --host 192.0.2.10 --port 901
+kcsdi serial-ports
+kcsdi info --serial /dev/ttyUSB0
+kcsdi discover
 kcsdi limits --model kc901v
 kcsdi sweep s11 --host 192.0.2.10 --port 901 \
     --start 5000 --stop 100000000 --points 201 --out antenna.s1p

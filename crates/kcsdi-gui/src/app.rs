@@ -190,6 +190,7 @@ impl KcsdiApp {
         match event {
             WorkerEvent::Connected(info) => {
                 self.connection_open = false;
+                self.state.desktop.lookup.ports.cancel();
                 info!("connected, serial {}", info.serial);
                 self.state.connection = ConnectionState::Connected;
                 self.state.source.connected();
@@ -295,6 +296,7 @@ impl KcsdiApp {
             self.state.export.cancel();
             self.state.workspace.frequency_editor.cancel();
             self.state.workspace.run_editor.cancel();
+            self.state.desktop.lookup.cancel();
             self.state.send(crate::state::WorkerCommand::Shutdown);
         }
         if !self.closing {
@@ -318,6 +320,7 @@ impl KcsdiApp {
         if self.state.export.is_pending()
             || self.state.workspace.frequency_editor.is_pending()
             || self.state.workspace.run_editor.is_pending()
+            || self.state.desktop.lookup.is_pending()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -409,6 +412,10 @@ impl eframe::App for KcsdiApp {
         self.state.export.poll();
         self.state.workspace.frequency_editor.poll();
         self.state.workspace.run_editor.poll();
+        self.state.desktop.lookup.poll();
+        if self.state.desktop.lookup.is_pending() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         self.poll_close(&ctx);
 
         // Drain all pending events from the device worker.
@@ -461,11 +468,15 @@ impl eframe::App for KcsdiApp {
             self.desktop_ui(ui);
         }
 
+        let was_connection_open = self.connection_open;
         egui::Window::new(self.state.language.text(Text::Connection))
             .open(&mut self.connection_open)
             .resizable(false)
             .collapsible(false)
             .show(&ctx, |ui| panels::top_bar::show(ui, &mut self.state));
+        if was_connection_open && !self.connection_open {
+            self.state.desktop.lookup.ports.cancel();
+        }
 
         trace_editor(&ctx, &mut self.state);
         let allowed = self.state.workspace.visible_range();
@@ -499,6 +510,7 @@ impl eframe::App for KcsdiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_config();
+        self.state.desktop.lookup.cancel();
         self.state.send(crate::state::WorkerCommand::Shutdown);
         self.state.cmd_tx = None;
         if let Some(worker) = self.worker.take()
@@ -511,6 +523,7 @@ impl eframe::App for KcsdiApp {
 
 impl Drop for KcsdiApp {
     fn drop(&mut self) {
+        self.state.desktop.lookup.cancel();
         self.state.worker_shutdown.cancel();
         self.state.session_cancel.cancel();
         self.state.acquisition_cancel.cancel();
@@ -2698,6 +2711,54 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cleanup_never_delays_dispatching_device_shutdown() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = test_app(AppState {
+            cmd_tx: Some(tx),
+            ..Default::default()
+        });
+        let (release, wait) = mpsc::channel();
+        app.state.desktop.lookup.ports.start_test(move |cancel| {
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(cancel.is_cancelled());
+            Ok(Vec::new())
+        });
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run_ui(input, |ui| app.poll_close(ui.ctx()));
+        assert!(matches!(
+            rx.try_recv().unwrap().command,
+            WorkerCommand::Shutdown
+        ));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        output.drop_without_applying_deltas();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.state.desktop.lookup.is_pending() {
+            assert!(Instant::now() < deadline);
+            app.state.desktop.lookup.poll();
+            std::thread::yield_now();
+        }
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| app.poll_close(ui.ctx()));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn dropping_the_ui_cancels_all_worker_operations() {
         let app = active_impedance_app();
         let acquisition = app.state.acquisition_cancel.clone();
@@ -2717,8 +2778,10 @@ mod tests {
             app.state.send(crate::state::WorkerCommand::Disconnect);
             if reconnect {
                 app.state.send(crate::state::WorkerCommand::Connect {
-                    host: "instrument.local".into(),
-                    port: 901,
+                    target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                        host: "instrument.local".into(),
+                        port: 901,
+                    },
                 });
             }
             for event in [
@@ -2904,7 +2967,10 @@ mod tests {
             let mut app = active_impedance_app();
             app.state.desktop.page = Page::About;
             app.state.language = language;
-            app.state.host = "instrument.local".into();
+            app.state.target = kcsdi_core::connection::ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 901,
+            };
             let (sender, receiver) = mpsc::channel();
             app.state.cmd_tx = Some(sender);
             app.apply_event(WorkerEvent::ConnectionLost("health query timeout".into()));
@@ -2962,6 +3028,103 @@ mod tests {
             output.textures_delta.clear();
             assert!(text_position(&output, language.text(Text::Connect)).is_none());
             assert!(text_position(&output, language.text(Text::Error)).is_none());
+        }
+    }
+
+    #[test]
+    fn connection_window_is_explicit_and_fits_the_desktop_in_both_languages() {
+        use kcsdi_core::connection::ConnectionTarget;
+        for language in Language::ALL {
+            for theme_mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+                for size in [egui::vec2(960.0, 600.0), egui::vec2(1280.0, 850.0)] {
+                    for target in [
+                        ConnectionTarget::Tcp {
+                            host: "instrument.local".into(),
+                            port: 4321,
+                        },
+                        ConnectionTarget::Serial {
+                            path: "/dev/serial/by-id/unavailable".into(),
+                        },
+                    ] {
+                        let ctx = egui::Context::default();
+                        theme::setup(&ctx);
+                        theme::apply(&ctx, theme_mode);
+                        let (tx, rx) = mpsc::channel();
+                        let mut app = test_app(AppState {
+                            language,
+                            target: target.clone(),
+                            cmd_tx: Some(tx),
+                            ..Default::default()
+                        });
+                        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let frame = |app: &mut KcsdiApp, events| {
+                            ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    events,
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    app.desktop_ui(ui);
+                                    egui::Window::new(language.text(Text::Connection))
+                                        .resizable(false)
+                                        .show(ui.ctx(), |ui| {
+                                            panels::top_bar::show(ui, &mut app.state)
+                                        });
+                                },
+                            )
+                        };
+                        let mut connect = None;
+                        for _ in 0..3 {
+                            let output = frame(&mut app, Vec::new());
+                            for shape in &output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                                    let visible = rect.intersect(shape.clip_rect);
+                                    if visible.is_positive() {
+                                        assert!(
+                                            screen.contains_rect(visible),
+                                            "{language:?} {theme_mode:?}: {}",
+                                            text.galley.text()
+                                        );
+                                    }
+                                    if text.galley.text() == language.text(Text::Connect) {
+                                        connect = Some(rect.center());
+                                        assert!(shape.clip_rect.contains_rect(rect));
+                                    }
+                                }
+                            }
+                            output.drop_without_applying_deltas();
+                        }
+                        assert!(rx.try_recv().is_err());
+                        assert!(!app.state.desktop.lookup.is_pending());
+                        let at = connect.unwrap();
+                        for pressed in [true, false] {
+                            frame(
+                                &mut app,
+                                vec![
+                                    egui::Event::PointerMoved(at),
+                                    egui::Event::PointerButton {
+                                        pos: at,
+                                        button: egui::PointerButton::Primary,
+                                        pressed,
+                                        modifiers: Default::default(),
+                                    },
+                                ],
+                            )
+                            .drop_without_applying_deltas();
+                        }
+                        match rx.try_recv().unwrap().command {
+                            WorkerCommand::Connect { target: requested } => {
+                                assert_eq!(requested, target)
+                            }
+                            _ => panic!("expected explicit Connect"),
+                        }
+                        assert_eq!(app.state.connection, ConnectionState::Connecting);
+                        assert!(rx.try_recv().is_err());
+                    }
+                }
+            }
         }
     }
 

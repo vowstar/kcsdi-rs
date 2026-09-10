@@ -26,7 +26,9 @@ pub const DEVICE_MODEL: Model = Model::Kc901V;
 
 #[derive(Debug)]
 pub enum WorkerCommand {
-    Connect { host: String, port: u16 },
+    Connect {
+        target: kcsdi_core::connection::ConnectionTarget,
+    },
     Disconnect,
     RunWorkspace(SweepPlan),
     StopSweep,
@@ -215,8 +217,7 @@ pub struct AppState {
     pub desktop: crate::desktop::DesktopState,
     pub language: Language,
     pub language_preference: crate::i18n::LanguagePreference,
-    pub host: String,
-    pub port: u16,
+    pub target: kcsdi_core::connection::ConnectionTarget,
     pub connection: ConnectionState,
     pub device_info: Option<DeviceInfo>,
     pub health: HealthState,
@@ -246,8 +247,7 @@ impl Default for AppState {
             desktop: Default::default(),
             language: Default::default(),
             language_preference: Default::default(),
-            host: String::new(),
-            port: 901,
+            target: Default::default(),
             connection: Default::default(),
             device_info: None,
             health: Default::default(),
@@ -593,8 +593,10 @@ mod tests {
         assert!(advance.cancel.is_cancelled());
         assert_eq!(state.calibration.report.phase, CalibrationPhase::Unknown);
         state.send(WorkerCommand::Connect {
-            host: "127.0.0.1".into(),
-            port: 901,
+            target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                host: "127.0.0.1".into(),
+                port: 901,
+            },
         });
         let connect = rx.try_recv().unwrap();
         assert!(matches!(connect.command, WorkerCommand::Connect { .. }));
@@ -620,8 +622,10 @@ mod tests {
             ..Default::default()
         };
         state.send(WorkerCommand::Connect {
-            host: "instrument.local".into(),
-            port: 901,
+            target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                host: "instrument.local".into(),
+                port: 901,
+            },
         });
         let connect = rx.try_recv().unwrap();
         state.connection = ConnectionState::Connected;
@@ -757,8 +761,10 @@ mod tests {
             WorkerCommand::Disconnect,
             WorkerCommand::Shutdown,
             WorkerCommand::Connect {
-                host: "instrument.local".into(),
-                port: 901,
+                target: kcsdi_core::connection::ConnectionTarget::Tcp {
+                    host: "instrument.local".into(),
+                    port: 901,
+                },
             },
         ] {
             let mut state = AppState {

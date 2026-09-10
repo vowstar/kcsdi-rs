@@ -140,15 +140,12 @@ pub fn run(command: SourceCommand) -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         SourceCommand::Stop(conn) => {
-            let cancel = signal_token()?;
-            let mut device = Device::connect_with_model_controlled(
-                &conn.host,
-                conn.port,
-                Model::Kc901V,
-                &cancel,
-            )?;
+            conn.target()?;
+            let cancel = crate::signal_token()?;
+            let mut device = conn.connect_controlled(Model::Kc901V, &cancel)?;
             let result = device.stop_source_controlled(&CancellationToken::default());
             device.close();
+            drop(device);
             result?;
             println!("Source stop sent. Physical output is not measured.");
             return Ok(());
@@ -158,13 +155,9 @@ pub fn run(command: SourceCommand) -> Result<(), Box<dyn Error>> {
     };
     // No connection or signal handler is installed for invalid settings.
     let params = args.params(kind)?;
-    let cancel = signal_token()?;
-    let mut device = Device::connect_with_model_controlled(
-        &args.conn.host,
-        args.conn.port,
-        Model::Kc901V,
-        &cancel,
-    )?;
+    args.conn.target()?;
+    let cancel = crate::signal_token()?;
+    let mut device = args.conn.connect_controlled(Model::Kc901V, &cancel)?;
     let outcome = run_session(
         &mut device,
         &params,
@@ -173,6 +166,7 @@ pub fn run(command: SourceCommand) -> Result<(), Box<dyn Error>> {
     );
     // Release remote mode even after a failed stop fence.
     device.close();
+    drop(device);
     // Console pipes can block. Report only after stop and remote release.
     report_warning(outcome.warning);
     if outcome.stop_sent {
@@ -181,13 +175,6 @@ pub fn run(command: SourceCommand) -> Result<(), Box<dyn Error>> {
         eprintln!("WARN: Source output state is unknown. Check the instrument.");
     }
     outcome.result.map_err(Into::into)
-}
-
-fn signal_token() -> Result<CancellationToken, ctrlc::Error> {
-    let token = CancellationToken::default();
-    let handler = token.clone();
-    ctrlc::try_set_handler(move || handler.cancel())?;
-    Ok(token)
 }
 
 struct RunOutcome {

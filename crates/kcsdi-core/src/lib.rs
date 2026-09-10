@@ -6,7 +6,7 @@
 //! Blocking I/O implementation of the KC901 text protocol documented in
 //! the project protocol reference:
 //!
-//! - [`transport`]: line-oriented transports (TCP),
+//! - [`transport`]: line-oriented TCP and serial transports,
 //! - [`protocol`]: `$start`/`$end` packet and measurement stream parsers,
 //! - [`commands`]: byte-exact command builders,
 //! - [`device`]: high-level session API (handshake, info queries, sweeps),
@@ -17,9 +17,11 @@
 pub mod atomic_file;
 pub mod calibration;
 pub mod commands;
+pub mod connection;
 pub mod control;
 pub mod data;
 pub mod device;
+pub mod discovery;
 pub mod error;
 pub mod model;
 pub mod protocol;

@@ -12,11 +12,12 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use kcsdi_core::commands::{Cal, Format, Lo};
+use kcsdi_core::connection::{ConnectionTarget, ConnectionTransport};
+use kcsdi_core::control::CancellationToken;
 use kcsdi_core::data::SweepData;
 use kcsdi_core::device::{Device, S11Params, S21Params, SpecParams};
 use kcsdi_core::model::{Model, Rbw};
 use kcsdi_core::protocol::StreamMode;
-use kcsdi_core::transport::TcpTransport;
 
 #[derive(Parser)]
 #[command(name = "kcsdi", version, about = "KC901 instrument command-line tool")]
@@ -27,6 +28,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List serial port metadata without opening an instrument
+    SerialPorts,
+    /// Find advertised KC901V network endpoints without connecting
+    Discover,
     /// Show finite-sweep parameter limits without connecting to a device
     Limits {
         #[arg(long, default_value = "kc901v")]
@@ -64,11 +69,41 @@ enum SweepCommand {
 #[derive(Args)]
 struct ConnArgs {
     /// Instrument host (IP address or hostname)
-    #[arg(long)]
-    host: String,
-    /// Instrument TCP port (configured on the instrument, manual uses 901)
-    #[arg(long, default_value_t = 901)]
-    port: u16,
+    #[arg(long, required_unless_present = "serial", conflicts_with = "serial")]
+    host: Option<String>,
+    /// Serial port path. KC901V uses 921600 baud, 8N1
+    #[arg(long, required_unless_present = "host", conflicts_with_all = ["host", "port"])]
+    serial: Option<String>,
+    /// Instrument TCP port (default: 901)
+    #[arg(long, requires = "host")]
+    port: Option<u16>,
+}
+
+impl ConnArgs {
+    fn target(&self) -> Result<ConnectionTarget, Box<dyn Error>> {
+        let target = match (&self.host, &self.serial, self.port) {
+            (Some(host), None, port) => ConnectionTarget::Tcp {
+                host: host.clone(),
+                port: port.unwrap_or(901),
+            },
+            (None, Some(path), None) => ConnectionTarget::Serial { path: path.clone() },
+            _ => {
+                return Err(
+                    "choose exactly one of --host or --serial, with --port only for TCP".into(),
+                );
+            }
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    fn connect_controlled(
+        &self,
+        model: Model,
+        cancel: &CancellationToken,
+    ) -> Result<Device<ConnectionTransport>, Box<dyn Error>> {
+        Ok(self.target()?.connect_controlled(model, cancel)?)
+    }
 }
 
 #[derive(Args)]
@@ -182,6 +217,32 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::SerialPorts => {
+            let cancel = signal_token()?;
+            let ports = kcsdi_core::transport::serial::available_ports_controlled(&cancel)?;
+            for port in ports {
+                println!(
+                    "{}\t{}",
+                    port.path.escape_default(),
+                    port.label.escape_default()
+                );
+            }
+            Ok(())
+        }
+        Command::Discover => {
+            let cancel = signal_token()?;
+            let mut snapshot = kcsdi_core::discovery::scan_controlled(&cancel, |_| {})?;
+            snapshot.retain_fresh(std::time::Instant::now());
+            for device in snapshot.devices {
+                println!(
+                    "{}\t{}\t{}",
+                    device.product.escape_default(),
+                    device.target.to_string().escape_default(),
+                    device.hostname.escape_default()
+                );
+            }
+            Ok(())
+        }
         Command::Limits { model } => {
             print!("{}", limits(model));
             Ok(())
@@ -195,6 +256,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             SweepCommand::Spec(args) => sweep_spec(&args),
         },
     }
+}
+
+fn signal_token() -> Result<CancellationToken, ctrlc::Error> {
+    let token = CancellationToken::default();
+    let handler = token.clone();
+    ctrlc::try_set_handler(move || handler.cancel())?;
+    Ok(token)
 }
 
 fn limits(model: Model) -> String {
@@ -268,11 +336,14 @@ fn choices<T: std::fmt::Display>(values: &[T]) -> String {
 }
 
 fn info(args: &ConnArgs) -> Result<(), Box<dyn Error>> {
-    let mut dev = Device::<TcpTransport>::connect(&args.host, args.port)?;
-    let info = dev.device_info()?;
-    let temp = dev.temperature()?;
-    let voltage = dev.voltage()?;
+    args.target()?;
+    let cancel = signal_token()?;
+    let mut dev = args.connect_controlled(Model::Kc901V, &cancel)?;
+    let info = dev.device_info_controlled(&cancel)?;
+    let temp = dev.temperature_controlled(&cancel)?;
+    let voltage = dev.voltage_controlled(&cancel)?;
     dev.close();
+    drop(dev);
 
     println!("Serial:      {}", info.serial);
     println!("User:        {}", info.username);
@@ -299,10 +370,13 @@ fn sweep_s11(args: &S11Args) -> Result<(), Box<dyn Error>> {
         rbw: args.rbw,
     };
     params.validate(&caps)?;
-    let mut dev =
-        Device::<TcpTransport>::connect_with_model(&args.conn.host, args.conn.port, args.model)?;
-    let data = dev.sweep_s11(&params)?;
+    args.conn.target()?;
+    let cancel = signal_token()?;
+    let mut dev = args.conn.connect_controlled(args.model, &cancel)?;
+    let result = dev.sweep_s11_controlled(&params, &cancel, |_| {});
     dev.close();
+    drop(dev);
+    let data = result?;
 
     if export::is_s1p(&args.out) {
         kcsdi_core::touchstone::Document::s1p(&data, args.touchstone.touchstone_version.into())?
@@ -330,10 +404,13 @@ fn sweep_spec(args: &SpecArgs) -> Result<(), Box<dyn Error>> {
         ref_level_dbm: args.ref_level,
     };
     params.validate(&caps)?;
-    let mut dev =
-        Device::<TcpTransport>::connect_with_model(&args.conn.host, args.conn.port, args.model)?;
-    let data = dev.sweep_spec(&params)?;
+    args.conn.target()?;
+    let cancel = signal_token()?;
+    let mut dev = args.conn.connect_controlled(args.model, &cancel)?;
+    let result = dev.sweep_spec_controlled(&params, &cancel, |_| {});
     dev.close();
+    drop(dev);
+    let data = result?;
 
     write_csv(&args.out, &data)?;
     println!(
@@ -362,10 +439,13 @@ fn sweep_s21(args: &S21Args) -> Result<(), Box<dyn Error>> {
         rbw: args.rbw,
     };
     params.validate(&args.model.capabilities())?;
-    let mut dev =
-        Device::<TcpTransport>::connect_with_model(&args.conn.host, args.conn.port, args.model)?;
-    let data = dev.sweep_s21(&params)?;
+    args.conn.target()?;
+    let cancel = signal_token()?;
+    let mut dev = args.conn.connect_controlled(args.model, &cancel)?;
+    let result = dev.sweep_s21_controlled(&params, &cancel, |_| {});
     dev.close();
+    drop(dev);
+    let data = result?;
     write_csv(&args.out, &data)?;
     println!(
         "{} points written to {}",
@@ -424,6 +504,126 @@ fn write_csv(path: &Path, data: &SweepData) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_arguments_choose_one_transport_and_preserve_tcp_defaults() {
+        for (args, expected) in [
+            (
+                vec!["--host", "instrument.example.invalid"],
+                ConnectionTarget::Tcp {
+                    host: "instrument.example.invalid".into(),
+                    port: 901,
+                },
+            ),
+            (
+                vec!["--host", "::1", "--port", "1901"],
+                ConnectionTarget::Tcp {
+                    host: "::1".into(),
+                    port: 1901,
+                },
+            ),
+            (
+                vec!["--serial", "/dev/serial/by-id/unavailable"],
+                ConnectionTarget::Serial {
+                    path: "/dev/serial/by-id/unavailable".into(),
+                },
+            ),
+            (
+                vec!["--serial", "COM7"],
+                ConnectionTarget::Serial {
+                    path: "COM7".into(),
+                },
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["kcsdi", "info"].into_iter().chain(args)).unwrap();
+            let Command::Info(connection) = cli.command else {
+                unreachable!()
+            };
+            assert_eq!(connection.target().unwrap(), expected);
+        }
+        for args in [
+            vec![],
+            vec!["--port", "901"],
+            vec!["--serial", "COM7", "--host", "localhost"],
+            vec!["--serial", "COM7", "--port", "901"],
+        ] {
+            assert!(Cli::try_parse_from(["kcsdi", "info"].into_iter().chain(args)).is_err());
+        }
+    }
+
+    #[test]
+    fn every_connection_command_accepts_serial_without_accessing_it() {
+        for args in [
+            vec!["info"],
+            vec![
+                "sweep",
+                "s11",
+                "--start",
+                "5000",
+                "--stop",
+                "1000000",
+                "--points",
+                "3",
+                "--out",
+                "unused.csv",
+            ],
+            vec![
+                "sweep",
+                "s21",
+                "--start",
+                "0",
+                "--stop",
+                "1000000",
+                "--points",
+                "3",
+                "--out",
+                "unused.csv",
+            ],
+            vec![
+                "sweep",
+                "spec",
+                "--start",
+                "0",
+                "--stop",
+                "1000000",
+                "--points",
+                "3",
+                "--out",
+                "unused.csv",
+            ],
+            vec!["source", "stop"],
+            vec![
+                "source",
+                "rf",
+                "--frequency",
+                "1000000",
+                "--amplitude",
+                "-20",
+                "--seconds",
+                "1",
+            ],
+            vec![
+                "source",
+                "af",
+                "--frequency",
+                "1000",
+                "--amplitude",
+                "100",
+                "--seconds",
+                "1",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(
+                ["kcsdi"]
+                    .into_iter()
+                    .chain(args)
+                    .chain(["--serial", "not-a-real-port"]),
+            );
+            assert!(cli.is_ok(), "{}", cli.err().unwrap());
+        }
+        assert!(Cli::try_parse_from(["kcsdi", "serial-ports"]).is_ok());
+        assert!(Cli::try_parse_from(["kcsdi", "discover"]).is_ok());
+    }
 
     #[test]
     fn limits_are_ascii_and_use_mode_ranges_and_sample_counts() {
