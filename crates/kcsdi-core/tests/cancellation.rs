@@ -63,6 +63,12 @@ fn expect_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
     assert_eq!(read_line(peer), "$s11,stop\n");
     assert_eq!(read_line(peer), "$s21,stop\n");
     assert_eq!(read_line(peer), "$spec,stop\n");
+    assert_eq!(read_line(peer), "$rfsource,stop\n");
+    assert_eq!(read_line(peer), "$afsource,stop\n");
+    expect_receiver_run(peer, mode);
+}
+
+fn expect_receiver_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
     if mode == StreamMode::Spec {
         assert_eq!(read_line(peer), "$spec,init\n");
         assert_eq!(read_line(peer), "$bw,10k\n");
@@ -84,6 +90,121 @@ fn expect_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
             "$s11,run,caloff,loss,2,ss,1000000,2000000\n"
         );
     }
+}
+
+#[test]
+fn initial_front_panel_sources_are_stopped_before_each_receiver_mode() {
+    for source in ["rfsource", "afsource"] {
+        for mode in [StreamMode::S11, StreamMode::S21, StreamMode::Spec] {
+            let (mut device, mut peer) = connected_pair();
+            thread::scope(|scope| {
+                let server = scope.spawn(move || {
+                    handshake(&mut peer);
+                    let mut active_source = Some(source);
+                    for command in [
+                        "$s11,stop\n",
+                        "$s21,stop\n",
+                        "$spec,stop\n",
+                        "$rfsource,stop\n",
+                        "$afsource,stop\n",
+                    ] {
+                        assert_eq!(read_line(&mut peer), command);
+                        if command == format!("${source},stop\n") {
+                            active_source = None;
+                        }
+                    }
+                    // This peer models the documented source-mode conflict.
+                    // No receiver init is accepted before the old source stop.
+                    assert_eq!(active_source, None);
+                    expect_receiver_run(&mut peer, mode);
+                    let header = if mode == StreamMode::Spec {
+                        "$start,spec\n".to_owned()
+                    } else {
+                        format!("$start,{},loss\n", mode.name())
+                    };
+                    for pass in 0..2 {
+                        if pass == 1 {
+                            // Repeating the initialized receiver must not replay
+                            // source stops or any source initialization/output.
+                            if mode == StreamMode::Spec {
+                                assert_eq!(read_line(&mut peer), "$bw,10k\n");
+                                assert_eq!(read_line(&mut peer), "$specref,-10\n");
+                            }
+                            let run = match mode {
+                                StreamMode::S11 => "$s11,run,caloff,loss,2,ss,1000000,2000000\n",
+                                StreamMode::S21 => {
+                                    "$s21,run,caloff,loss,highlo,2,ss,1000000,2000000\n"
+                                }
+                                StreamMode::Spec => {
+                                    "$spec,run,caloff,highlo,2,ss,1000000,2000000\n"
+                                }
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(read_line(&mut peer), run);
+                        }
+                        peer.get_mut().write_all(header.as_bytes()).unwrap();
+                        peer.get_mut()
+                            .write_all(b"$1000000,-1\n$1500000,-2\n$2000000,-3\n$end\n")
+                            .unwrap();
+                    }
+                    assert_eq!(read_line(&mut peer), format!("${},stop\n", mode.name()));
+                    assert_eq!(read_line(&mut peer), "$local\n");
+                    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+                });
+                device.handshake().unwrap();
+                for _ in 0..2 {
+                    let data =
+                        sweep(&mut device, mode, &CancellationToken::default(), |_| {}).unwrap();
+                    assert_eq!(data.points.len(), 3);
+                    assert_eq!(
+                        device.source_report().state,
+                        kcsdi_core::source::SourceOutputState::NotStarted
+                    );
+                }
+                device.close();
+                drop(device);
+                server.join().unwrap();
+            });
+        }
+    }
+}
+
+#[test]
+fn cancellation_during_source_normalization_never_initializes_or_retries_output() {
+    let (mut device, mut peer) = connected_pair();
+    let cancel = CancellationToken::default();
+    let peer_cancel = cancel.clone();
+    thread::scope(|scope| {
+        let server = scope.spawn(move || {
+            handshake(&mut peer);
+            for command in [
+                "$s11,stop\n",
+                "$s21,stop\n",
+                "$spec,stop\n",
+                "$rfsource,stop\n",
+            ] {
+                assert_eq!(read_line(&mut peer), command);
+            }
+            peer_cancel.cancel();
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [3]);
+            assert_eq!(read_line(&mut peer), "$device\n");
+            peer.get_mut().write_all(IDENTITY).unwrap();
+            // Cancellation has no automatic retry or further init/run command.
+            assert_eq!(read_line(&mut peer), "$local\n");
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        });
+        device.handshake().unwrap();
+        assert!(matches!(
+            sweep(&mut device, StreamMode::S11, &cancel, |_| {}),
+            Err(Error::Cancelled)
+        ));
+        assert!(!device.requires_reconnect());
+        device.close();
+        drop(device);
+        server.join().unwrap();
+    });
 }
 
 fn sweep(
@@ -276,7 +397,13 @@ fn point_params(mode: StreamMode) -> PointParams {
 }
 
 fn expect_point_run(peer: &mut BufReader<TcpStream>, mode: StreamMode) {
-    for command in ["$s11,stop\n", "$s21,stop\n", "$spec,stop\n"] {
+    for command in [
+        "$s11,stop\n",
+        "$s21,stop\n",
+        "$spec,stop\n",
+        "$rfsource,stop\n",
+        "$afsource,stop\n",
+    ] {
         assert_eq!(read_line(peer), command);
     }
     assert_eq!(read_line(peer), format!("${},init\n", mode.name()));

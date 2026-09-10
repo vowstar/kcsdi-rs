@@ -620,8 +620,20 @@ impl<T: Transport> Device<T> {
         if self.active_mode.is_some() {
             self.stop_sweep()?;
         } else {
-            // Front-panel or previous-session mode state is unknown.
-            for command in [commands::S11_STOP, commands::S21_STOP, commands::SPEC_STOP] {
+            // Front-panel mode state is unknown. KC901V sources also conflict
+            // with receiver initialization (sections 3.12 and 5.1).
+            let stops: &[_] = if self.caps.model == Model::Kc901V {
+                &[
+                    commands::S11_STOP,
+                    commands::S21_STOP,
+                    commands::SPEC_STOP,
+                    commands::RF_SOURCE_STOP,
+                    commands::AF_SOURCE_STOP,
+                ]
+            } else {
+                &[commands::S11_STOP, commands::S21_STOP, commands::SPEC_STOP]
+            };
+            for command in stops {
                 self.send_controlled(command.as_bytes(), cancel)?;
                 cancel.pause(COMMAND_GAP)?;
             }
@@ -1161,7 +1173,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let commands = format!(
-                "$s11,stop\n$s21,stop\n$spec,stop\n${},init\n{receiver}{run}\x03$device\n",
+                "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n${},init\n{receiver}{run}\x03$device\n",
                 mode.name()
             );
             assert_eq!(dev.transport.sent_text(), commands.repeat(2));
@@ -1260,8 +1272,8 @@ mod tests {
                 "device" => mock
                     .incoming
                     .extend(["$start,err_cmd", "$bad", "$end"].map(str::to_owned)),
-                "abort" => mock.fail_send = Some(7),
-                "query" => mock.fail_send = Some(8),
+                "abort" => mock.fail_send = Some(9),
+                "query" => mock.fail_send = Some(10),
                 _ => unreachable!(),
             }
             let mut dev = Device::new(mock);
@@ -1301,7 +1313,7 @@ mod tests {
 
     #[test]
     fn point_setup_cancellation_never_sends_run_and_still_synchronizes() {
-        for send in 1..=5 {
+        for send in 1..=7 {
             let cancel = CancellationToken::default();
             let mut mock = MockTransport::with_lines(&[]);
             mock.queue_identity();
@@ -1336,7 +1348,7 @@ mod tests {
     fn point_device_error_preserves_its_diagnostic_when_cleanup_also_fails() {
         let params = point_params(StreamMode::S11);
         let mut mock = MockTransport::with_lines(&["$start,err_par5", "$error", "$end"]);
-        mock.fail_send = Some(7);
+        mock.fail_send = Some(9);
         let mut dev = Device::new(mock);
         assert!(
             matches!(dev.measure_point(&params), Err(Error::Device(name)) if name == "err_par5")
@@ -1480,7 +1492,7 @@ mod tests {
 
     #[test]
     fn cancellation_during_setup_does_not_start_a_sweep() {
-        for send in 1..=4 {
+        for send in 1..=6 {
             let cancel = CancellationToken::default();
             let mut mock = MockTransport::with_lines(&[]);
             mock.cancel_on_send = Some((send, cancel.clone()));
@@ -2025,7 +2037,7 @@ mod tests {
         assert_eq!(data.points[0].values, vec![0.528, -0.269]);
         assert_eq!(
             dev.transport.sent_text(),
-            "$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n$s11,run,caloff,ri,2,ss,75000000,125000000\n"
+            "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$s11,init\n$s11,run,caloff,ri,2,ss,75000000,125000000\n"
         );
     }
 
@@ -2070,7 +2082,7 @@ mod tests {
         assert_eq!(data.points[2].values, vec![-71.002]);
         assert_eq!(
             dev.transport.sent_text(),
-            "$s11,stop\n$s21,stop\n$spec,stop\n$spec,init\n$bw,10k\n$specref,-10\n$spec,run,caloff,highlo,2,ss,75000000,100000000\n"
+            "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$spec,init\n$bw,10k\n$specref,-10\n$spec,run,caloff,highlo,2,ss,75000000,100000000\n"
         );
     }
 
@@ -2116,7 +2128,7 @@ mod tests {
                 assert_eq!(
                     dev.transport.sent_text(),
                     format!(
-                        "$s11,stop\n$s21,stop\n$spec,stop\n$s21,init\n$bw,1k\n$s21,run,caloff,{format},{lo},2,ss,0,1000\n"
+                        "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$s21,init\n$bw,1k\n$s21,run,caloff,{format},{lo},2,ss,0,1000\n"
                     )
                 );
             }
@@ -2247,7 +2259,7 @@ mod tests {
 
     #[test]
     fn s21_setup_and_run_write_failure_retires_the_session() {
-        for failed_send in 1..=6 {
+        for failed_send in 1..=8 {
             let mut mock = MockTransport::with_lines(&[]);
             mock.fail_send = Some(failed_send);
             let mut dev = Device::new(mock);
@@ -2316,10 +2328,9 @@ mod tests {
         let before_retry = dev.transport.sent.len();
         let data = dev.sweep_s21(&s21_params(3)).unwrap();
         assert_eq!(data.points.len(), 3);
-        assert!(
-            dev.transport.sent[before_retry..]
-                .starts_with(b"$s11,stop\n$s21,stop\n$spec,stop\n$s21,init\n")
-        );
+        assert!(dev.transport.sent[before_retry..].starts_with(
+            b"$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$s21,init\n"
+        ));
     }
 
     #[test]
@@ -2483,6 +2494,23 @@ mod tests {
     }
 
     #[test]
+    fn initial_source_normalization_is_limited_to_kc901v() {
+        for model in [Model::Kc901V, Model::Kc901M, Model::Kc901K] {
+            let mut dev = Device::with_model(MockTransport::with_lines(&[]), model);
+            dev.prepare_mode(StreamMode::S11, &CancellationToken::default())
+                .unwrap();
+            let sent = dev.transport.sent_text();
+            assert_eq!(sent.contains("$rfsource,stop\n"), model == Model::Kc901V);
+            assert_eq!(sent.contains("$afsource,stop\n"), model == Model::Kc901V);
+            for mode in ["field", "s22", "s12"] {
+                assert!(!sent.contains(&format!("${mode},")));
+            }
+            assert!(sent.ends_with("$s11,init\n"));
+            assert_eq!(dev.source_report(), SourceReport::default());
+        }
+    }
+
+    #[test]
     fn switching_modes_stops_the_previous_mode_before_initializing() {
         let mut mock = MockTransport::with_lines(&[]);
         mock.queue_sweep(StreamMode::S11, 3);
@@ -2496,7 +2524,7 @@ mod tests {
         assert_eq!(
             dev.transport.sent_text(),
             concat!(
-                "$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n",
+                "$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$s11,init\n",
                 "$s11,run,caloff,loss,2,ss,1000000,2000000\n",
                 "$s11,stop\n$spec,init\n$bw,10k\n$specref,-10\n",
                 "$spec,run,caloff,highlo,2,ss,1000000,2000000\n",
@@ -2646,16 +2674,15 @@ mod tests {
         let before_retry = dev.transport.sent.len();
         dev.sweep_s11(&s11_params(3)).unwrap();
         assert_eq!(dev.active_mode, Some(StreamMode::S11));
-        assert!(
-            dev.transport.sent[before_retry..]
-                .starts_with(b"$s11,stop\n$s21,stop\n$spec,stop\n$s11,init\n")
-        );
+        assert!(dev.transport.sent[before_retry..].starts_with(
+            b"$s11,stop\n$s21,stop\n$spec,stop\n$rfsource,stop\n$afsource,stop\n$s11,init\n"
+        ));
     }
 
     #[test]
     fn setup_and_run_send_failures_require_a_fresh_connection() {
         // A send failure can leave an unknown amount of a command on the wire.
-        for failed_send in 1..=6 {
+        for failed_send in 1..=8 {
             let mut mock = MockTransport::with_lines(&[]);
             mock.fail_send = Some(failed_send);
             mock.queue_sweep(StreamMode::S11, 3);
@@ -2814,13 +2841,13 @@ mod tests {
             "$error:Please initialize the mode first!",
             "$end",
         ]);
-        // Fail the cleanup stop after the three initial stops, init and run.
-        mock.fail_send = Some(6);
+        // Fail the cleanup stop after the five initial stops, init and run.
+        mock.fail_send = Some(8);
         let mut dev = Device::new(mock);
         assert!(
             matches!(dev.sweep_s11(&s11_params(3)), Err(Error::Device(ref name)) if name == "err_uninit")
         );
-        assert_eq!(dev.transport.send_calls, 6);
+        assert_eq!(dev.transport.send_calls, 8);
         assert_eq!(dev.active_mode, None);
         assert_eq!(dev.last_rbw, None);
         assert!(dev.requires_reconnect());
@@ -2828,7 +2855,7 @@ mod tests {
             dev.sweep_s11(&s11_params(3)),
             Err(Error::NotConnected)
         ));
-        assert_eq!(dev.transport.send_calls, 6);
+        assert_eq!(dev.transport.send_calls, 8);
     }
 
     #[test]

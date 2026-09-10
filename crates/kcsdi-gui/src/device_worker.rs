@@ -1451,6 +1451,7 @@ mod tests {
                     for (command, response) in [
                         ("$device\n", "$start,device\n$Synthetic peer\n$<-User @ :replay>\n$<-Software ver:test>\n$<-Hardware ver:test>\n$<-Serial num:000000000001>\n$<-Copyright:Test fixture>\n$end\n"),
                         ("$s11,stop\n", ""), ("$s21,stop\n", ""), ("$spec,stop\n", ""),
+                        ("$rfsource,stop\n", ""), ("$afsource,stop\n", ""),
                         ("$s11,init\n", ""), ("$bw,10k\n", ""),
                         ("$s11,run,caloff,z,2,ss,1000000,2000000\n", "$start,s11,z\n$1000000,50,50,0\n$1500000,50,50,0\n$2000000,50,50,0\n$end\n"),
                         ("$temp\n", "$start,temp\n$42\n$end\n"),
@@ -1654,7 +1655,7 @@ mod tests {
                 let passes = if fail_second_group { 1 } else { 2 };
                 for pass in 1..=passes {
                     if pass == 1 {
-                        for command in ["$s11,stop\n", "$s21,stop\n", "$spec,stop\n"] {
+                        for command in ["$s11,stop\n", "$s21,stop\n", "$spec,stop\n", "$rfsource,stop\n", "$afsource,stop\n"] {
                             expect(&mut peer, command);
                         }
                     } else {
@@ -2248,6 +2249,8 @@ mod tests {
                     "$s11,stop\n",
                     "$s21,stop\n",
                     "$spec,stop\n",
+                    "$rfsource,stop\n",
+                    "$afsource,stop\n",
                     "$s11,init\n",
                     "$bw,10k\n",
                     "$s11,run,caloff,z,2,ss,1000000,2000000\n",
@@ -3215,7 +3218,7 @@ mod tests {
         impl kcsdi_core::transport::Transport for CleanupFailure {
             fn send_with_timeout(&mut self, _: &[u8], _: Duration) -> kcsdi_core::Result<()> {
                 self.sends += 1;
-                if self.sends == 7 {
+                if self.sends == 9 {
                     Err(Error::NotConnected)
                 } else {
                     Ok(())

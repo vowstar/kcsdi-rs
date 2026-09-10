@@ -3,9 +3,9 @@
 
 //! Model capability tables (protocol doc section 7).
 //!
-//! KC901V is fully implemented. The other models are filled from the KCSDI
-//! capability table where documented, so extending them later is a data
-//! change, not a structural one.
+//! KC901V has high-level S11/S21/SPEC acquisition, RF/AF control and legacy
+//! calibration. Other model records are filled from the KCSDI capability
+//! table where documented. Their high-level API coverage is model-specific.
 
 use std::fmt;
 use std::str::FromStr;
