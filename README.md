@@ -7,18 +7,20 @@
 
 A Rust GUI and CLI for KC901 network analyzers. Connect over Ethernet or USB serial, view S11, S21 and spectrum sweeps, and save measurements.
 
-![English impedance and Smith views of one recorded S11 sweep](https://github.com/user-attachments/assets/8eee9271-257a-42d9-8f8b-7aabc8dfcf17)
+![English impedance and Smith views of one recorded S11 sweep](https://github.com/user-attachments/assets/aeaad8d6-3ca6-44a2-b8b1-3b2b2b9a8eca)
 
 | Measurement | Views and exports |
 | --- | --- |
 | S11 | Impedance, Smith chart, phase, return loss and VSWR |
 | S21 | Phase, loss and group delay |
 | Spectrum | Live trace with linear or logarithmic frequency axis |
+| Sources | KC901V RF and AF frequency, level and modulation controls |
+| Calibration | Guided KC901V S11 and S21 system and user calibration |
 | Data | CSV, XLSX and Touchstone `.s1p`. CLI assembly of `.s2p` from four complex measurements |
 | Analysis | Selectable traces, hold, maximum and minimum envelopes, markers, zoom, pan and fit |
 | Interface | English and Simplified Chinese. Saved devices, light, dark and system themes |
 
-S11 and spectrum hardware tests use a KC901V with firmware V1.6.1. S21, serial and LAN discovery have software and local replay tests. Other KC901 models need hardware tests.
+S11 and spectrum hardware tests use a KC901V with firmware V1.6.1. S21, sources, calibration, serial and LAN discovery have software and local replay tests. Other KC901 models need hardware tests.
 
 ## Build and connect
 
@@ -43,7 +45,11 @@ In the GUI, add a device with its TCP address and port or serial path, open it, 
 
 Add up to ten traces in the left panel and choose their views and colors. Run acquires the visible traces in sequence and shares matching measurements. Each trace keeps its last complete sweep and Y scale. Add markers on the right, then drag them on the chart. Press F11 to toggle fullscreen.
 
-Language follows the system by default. Choose English, Simplified Chinese or Follow system in Settings. Other system languages use English.
+Choose List, then Edit list, to set individual frequencies. Settings beside Run controls CSV or XLSX recording and the wait between passes.
+
+Source edits stay in the draft until Start output or Apply. Calibration shows the instrument's prompts and waits for confirmation.
+
+Language follows the system by default. Settings lets you choose English or Simplified Chinese. Other system languages use English.
 
 For the CLI, replace `192.0.2.10` with the instrument address. Frequencies use Hz.
 
