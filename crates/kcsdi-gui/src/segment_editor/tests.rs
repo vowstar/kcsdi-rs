@@ -36,6 +36,9 @@ fn segment_inputs_accept_si_units_but_reject_fractional_hz_and_invalid_numbers()
         ("5e3", 5000),
         ("0 Hz", 0),
         ("0.001 kHz", 1),
+        ("8.001 kHz", 8001),
+        ("1.000000001 GHz", 1_000_000_001),
+        ("18446744073709551615 Hz", u64::MAX),
     ] {
         assert_eq!(whole_hz(text), Some(expected));
     }
@@ -48,8 +51,24 @@ fn segment_inputs_accept_si_units_but_reject_fractional_hz_and_invalid_numbers()
         "0.0000015 MHz",
         "18446744073709551616",
         "1 ohm",
+        "8.0010000000000001 kHz",
+        "1.0000000001 Hz",
     ] {
         assert_eq!(whole_hz(text), None, "{text}");
+    }
+}
+
+#[test]
+fn opening_whole_hz_segments_never_changes_their_values() {
+    for value in
+        (5000..100_000)
+            .step_by(7)
+            .chain([1_000_001, 50_000_001, 1_000_000_001, 7_000_000_000])
+    {
+        assert_eq!(
+            whole_hz(&format_axis_value(value as f64, "Hz")),
+            Some(value)
+        );
     }
 }
 

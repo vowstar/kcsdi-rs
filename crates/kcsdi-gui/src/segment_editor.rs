@@ -8,9 +8,10 @@ use kcsdi_core::model::FreqRange;
 use kcsdi_core::segments::{MAX_SEGMENTS, Segment, SegmentError, SegmentPlan, SegmentProblem};
 
 use crate::acquisition::TraceId;
+use crate::frequency_list::parse_si_hz as whole_hz;
 use crate::i18n::{Language, Text};
 use crate::state::DEVICE_MODEL;
-use crate::widgets::plot::{format_axis_value, parse_axis_value};
+use crate::widgets::plot::format_axis_value;
 use crate::workspace::SweepRange;
 
 #[derive(Clone)]
@@ -59,12 +60,6 @@ pub(crate) fn error_text(error: &SegmentError, language: Language) -> String {
     } else {
         text
     }
-}
-
-fn whole_hz(text: &str) -> Option<u64> {
-    let value = parse_axis_value(text, "Hz")?;
-    (value.is_finite() && value >= 0.0 && value < u64::MAX as f64 && value.fract() == 0.0)
-        .then_some(value as u64)
 }
 
 impl Draft {

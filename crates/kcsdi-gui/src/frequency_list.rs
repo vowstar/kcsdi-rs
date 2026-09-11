@@ -130,13 +130,17 @@ impl Decimal {
     }
 
     fn into_hz(self, unit: FrequencyUnit) -> Result<u64, String> {
+        self.into_scaled_hz(unit.power())
+    }
+
+    fn into_scaled_hz(self, unit_power: i32) -> Result<u64, String> {
         if self.negative {
             return Err("Frequency must not be negative".into());
         }
         if self.digits == "0" {
             return Ok(0);
         }
-        let power = self.power + unit.power();
+        let power = self.power + unit_power;
         if power < 0 {
             return Err("Frequency must resolve to whole Hz".into());
         }
@@ -153,6 +157,25 @@ impl Decimal {
             })
             .ok_or_else(|| "Frequency is too large".into())
     }
+}
+
+/// Exact whole-Hz input with an optional SI prefix and Hz suffix.
+pub(crate) fn parse_si_hz(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let text = text.strip_suffix("Hz").unwrap_or(text).trim();
+    if let Ok(value) = Decimal::parse(text) {
+        return value.into_scaled_hz(0).ok();
+    }
+    let prefix = text.chars().last()?;
+    let index = [
+        'y', 'z', 'a', 'f', 'p', 'n', 'u', 'm', ' ', 'k', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y',
+    ]
+    .iter()
+    .position(|candidate| *candidate == prefix)?;
+    Decimal::parse(text.strip_suffix(prefix)?.trim())
+        .ok()?
+        .into_scaled_hz((index as i32 - 8) * 3)
+        .ok()
 }
 
 fn header_unit(value: &str) -> Option<FrequencyUnit> {
