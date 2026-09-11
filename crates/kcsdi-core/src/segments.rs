@@ -16,8 +16,8 @@ mod join;
 pub use join::{SampleOrigin, SegmentJoiner, SegmentMetadata};
 
 /// Application resource limits, independent of per-command device limits.
-pub const MAX_SEGMENTS: usize = 32;
-pub const MAX_ACQUIRED_POINTS: u32 = 32_032;
+pub const MAX_SEGMENTS: usize = 8;
+pub const MAX_ACQUIRED_POINTS: u32 = 8_008;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {

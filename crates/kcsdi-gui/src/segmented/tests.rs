@@ -14,6 +14,8 @@ use kcsdi_core::segments::{PlannedSegment, Segment};
 
 use super::*;
 
+mod workflow;
+
 fn receiver(mode: &str, format: Format) -> PointSettings {
     match mode {
         "s11" => PointSettings::S11 {
