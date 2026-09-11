@@ -524,46 +524,66 @@ fn run_worker(
             };
             let emit_result = |event| emit(source.event(event));
             let mut last_preview = None;
-            let progress = |progress: kcsdi_core::device::SweepProgress<'_>| {
-                if current.cancel.is_cancelled()
-                    || shutdown.is_cancelled()
-                    || !preview_due(last_preview, progress.points.is_empty())
-                {
-                    return;
-                }
-                last_preview = Some(Instant::now());
-                preview.publish(PreviewEnvelope {
-                    session_id: source.session_id,
-                    request_id: source.request_id,
-                    cycle_id,
-                    data: SweepData {
-                        mode: progress.mode,
-                        format: progress.format.to_owned(),
-                        points: progress.points.to_vec(),
-                    },
-                    group: group.clone(),
-                });
-                ctx.request_repaint();
-            };
+            let mut progress =
+                |progress: kcsdi_core::device::SweepProgress<'_>,
+                 segment: Option<crate::preview::SegmentProgress>| {
+                    if current.cancel.is_cancelled()
+                        || shutdown.is_cancelled()
+                        || !preview_due(
+                            last_preview,
+                            progress.points.is_empty()
+                                || segment.is_some_and(|segment| segment.segment_points == 0),
+                        )
+                    {
+                        return;
+                    }
+                    last_preview = Some(Instant::now());
+                    preview.publish(PreviewEnvelope {
+                        segment,
+                        session_id: source.session_id,
+                        request_id: source.request_id,
+                        cycle_id,
+                        data: SweepData {
+                            mode: progress.mode,
+                            format: progress.format.to_owned(),
+                            points: progress.points.to_vec(),
+                        },
+                        group: group.clone(),
+                    });
+                    ctx.request_repaint();
+                };
             let dev = device.as_mut().expect("checked above");
+            let mut segment_metadata = None;
             let result = match &group.settings {
                 AcquisitionSettings::Spec(params) => {
-                    dev.sweep_spec_controlled(params, &current.cancel, progress)
+                    dev.sweep_spec_controlled(params, &current.cancel, |p| progress(p, None))
                 }
                 AcquisitionSettings::S11(params) => {
-                    dev.sweep_s11_controlled(params, &current.cancel, progress)
+                    dev.sweep_s11_controlled(params, &current.cancel, |p| progress(p, None))
                 }
                 AcquisitionSettings::S21(params) => {
-                    dev.sweep_s21_controlled(params, &current.cancel, progress)
+                    dev.sweep_s21_controlled(params, &current.cancel, |p| progress(p, None))
+                }
+                AcquisitionSettings::Segments(plan) => {
+                    crate::segmented::acquire(dev, plan, &current.cancel, |p, segment| {
+                        progress(p, Some(segment))
+                    })
+                    .map(|(data, metadata)| {
+                        segment_metadata = Some(metadata);
+                        data
+                    })
                 }
                 AcquisitionSettings::List {
                     settings,
                     frequencies_hz,
-                } => measure_list(dev, settings, frequencies_hz, &current.cancel, progress),
+                } => measure_list(dev, settings, frequencies_hz, &current.cancel, |p| {
+                    progress(p, None)
+                }),
             };
             match result {
                 Ok(data) => {
                     let snapshot = Arc::new(CompletedSweep {
+                        segments: segment_metadata,
                         data,
                         settings: group.settings.clone(),
                         session_id: source.session_id,

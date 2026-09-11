@@ -37,6 +37,16 @@ const METADATA_HEADERS: [&str; 13] = [
     "frequency_plan",
 ];
 const REQUESTED_FREQUENCY_HEADER: &str = "requested_freq_hz";
+const SEGMENT_HEADERS: [&str; 8] = [
+    "segment_index",
+    "segment_point_index",
+    "segment_start_hz",
+    "segment_stop_hz",
+    "segment_max_step_hz",
+    "segment_requested_points",
+    "segment_received_points",
+    "segment_retained_points",
+];
 
 /// A bounded selection frozen before a file dialog or background serialization.
 #[derive(Debug, Clone)]
@@ -74,6 +84,10 @@ impl FrozenSnapshots {
 
     /// One rectangular record per raw value. Point indices preserve repeated Hz.
     pub fn csv_bytes(&self) -> Result<Vec<u8>, String> {
+        let segmented = self
+            .traces
+            .iter()
+            .any(|(_, snapshot)| snapshot.segments.is_some());
         let mut writer = csv::WriterBuilder::new()
             .terminator(csv::Terminator::CRLF)
             .from_writer(Vec::new());
@@ -82,11 +96,17 @@ impl FrozenSnapshots {
                 VALUE_HEADERS
                     .into_iter()
                     .chain(METADATA_HEADERS)
-                    .chain([REQUESTED_FREQUENCY_HEADER]),
+                    .chain([REQUESTED_FREQUENCY_HEADER])
+                    .chain(SEGMENT_HEADERS.into_iter().take(if segmented {
+                        SEGMENT_HEADERS.len()
+                    } else {
+                        0
+                    })),
             )
             .map_err(|error| error.to_string())?;
         for (id, snapshot) in &self.traces {
             let metadata = metadata(snapshot);
+            let segments = segment_rows(snapshot);
             let columns = schema(snapshot)?;
             for (index, point) in snapshot.data.points.iter().enumerate() {
                 let requested = requested_frequencies(&snapshot.settings)
@@ -102,6 +122,20 @@ impl FrozenSnapshots {
                     ];
                     record.extend(metadata.iter().cloned());
                     record.push(requested.clone());
+                    if segmented {
+                        if let Some(origin) = snapshot
+                            .segments
+                            .as_ref()
+                            .map(|metadata| metadata.origins[index])
+                        {
+                            record.push(origin.segment.to_string());
+                            record.push(origin.point.to_string());
+                            record.extend(segments[origin.segment].iter().cloned());
+                        } else {
+                            record
+                                .extend(std::iter::repeat_n(String::new(), SEGMENT_HEADERS.len()));
+                        }
+                    }
                     writer
                         .write_record(&record)
                         .map_err(|error| error.to_string())?;
@@ -136,6 +170,10 @@ impl FrozenSnapshots {
             if requested.is_some() {
                 worksheet.write_string(0, requested_column, REQUESTED_FREQUENCY_HEADER)?;
             }
+            if snapshot.segments.is_some() {
+                worksheet.write_string(0, requested_column, SEGMENT_HEADERS[0])?;
+                worksheet.write_string(0, requested_column + 1, SEGMENT_HEADERS[1])?;
+            }
             worksheet.set_column_range_width(
                 0,
                 columns.len() as u16 + u16::from(requested.is_some()),
@@ -150,6 +188,11 @@ impl FrozenSnapshots {
                 }
                 if let Some(frequencies) = requested {
                     worksheet.write_number(row, requested_column, frequencies[index] as f64)?;
+                }
+                if let Some(metadata) = &snapshot.segments {
+                    let origin = metadata.origins[index];
+                    worksheet.write_number(row, requested_column, origin.segment as f64)?;
+                    worksheet.write_number(row, requested_column + 1, origin.point as f64)?;
                 }
             }
         }
@@ -171,6 +214,34 @@ impl FrozenSnapshots {
                 worksheet.write_string(row, index as u16 + 1, value)?;
             }
         }
+        if self
+            .traces
+            .iter()
+            .any(|(_, snapshot)| snapshot.segments.is_some())
+        {
+            let sheet = workbook.add_worksheet();
+            sheet.set_name("Segments")?;
+            sheet.set_freeze_panes(1, 2)?;
+            sheet.set_column_range_width(0, 7, 24)?;
+            for (column, header) in ["trace_id", SEGMENT_HEADERS[0]]
+                .into_iter()
+                .chain(SEGMENT_HEADERS[2..].iter().copied())
+                .enumerate()
+            {
+                sheet.write_string(0, column as u16, header)?;
+            }
+            let mut row = 1;
+            for (id, snapshot) in &self.traces {
+                for (index, values) in segment_rows(snapshot).into_iter().enumerate() {
+                    sheet.write_string(row, 0, id.0.to_string())?;
+                    sheet.write_number(row, 1, index as f64)?;
+                    for (column, value) in values.iter().enumerate() {
+                        sheet.write_string(row, column as u16 + 2, value)?;
+                    }
+                    row += 1;
+                }
+            }
+        }
         Ok(workbook)
     }
 }
@@ -183,7 +254,7 @@ fn validate(snapshot: &CompletedSweep) -> Result<(), String> {
         .settings
         .validate()
         .map_err(|error| error.to_string())?;
-    if !snapshot.settings.accepts(&snapshot.data) {
+    if !snapshot.accepts_data() {
         return Err(
             "completed data does not match its captured mode, format or point count".into(),
         );
@@ -219,60 +290,34 @@ fn schema(snapshot: &CompletedSweep) -> Result<&'static [Column], String> {
 }
 
 fn metadata(snapshot: &CompletedSweep) -> [String; METADATA_HEADERS.len()] {
-    let (cal, rbw, lo, reference, start, stop, points) = match &snapshot.settings {
-        AcquisitionSettings::S11(params) => (
-            params.cal,
-            params.rbw,
-            None,
-            None,
-            params.start_hz,
-            params.stop_hz,
-            params.points,
+    let (cal, rbw, lo, reference) = match snapshot.settings.receiver() {
+        PointSettings::S11 { cal, rbw, .. } => (cal, rbw, None, None),
+        PointSettings::S21 { cal, rbw, lo, .. } => (cal, rbw, Some(lo), None),
+        PointSettings::Spec {
+            cal,
+            rbw,
+            lo,
+            ref_level_dbm,
+        } => (cal, Some(rbw), Some(lo), Some(ref_level_dbm)),
+    };
+    let (start, stop, kind) = match &snapshot.settings {
+        AcquisitionSettings::S11(params) => (params.start_hz, params.stop_hz, "range"),
+        AcquisitionSettings::S21(params) => (params.start_hz, params.stop_hz, "range"),
+        AcquisitionSettings::Spec(params) => (params.start_hz, params.stop_hz, "range"),
+        AcquisitionSettings::List { frequencies_hz, .. } => (
+            frequencies_hz[0],
+            *frequencies_hz.last().expect("validated frequency list"),
+            "list",
         ),
-        AcquisitionSettings::S21(params) => (
-            params.cal,
-            params.rbw,
-            Some(params.lo),
-            None,
-            params.start_hz,
-            params.stop_hz,
-            params.points,
+        AcquisitionSettings::Segments(plan) => (
+            plan.segments()[0].definition().start_hz,
+            plan.segments()
+                .last()
+                .expect("validated segment plan")
+                .definition()
+                .stop_hz,
+            "segments",
         ),
-        AcquisitionSettings::Spec(params) => (
-            params.cal,
-            Some(params.rbw),
-            Some(params.lo),
-            Some(params.ref_level_dbm),
-            params.start_hz,
-            params.stop_hz,
-            params.points,
-        ),
-        AcquisitionSettings::List {
-            settings,
-            frequencies_hz,
-        } => {
-            let (cal, rbw, lo, reference) = match settings {
-                PointSettings::S11 { cal, rbw, .. } => (*cal, *rbw, None, None),
-                PointSettings::S21 { cal, rbw, lo, .. } => (*cal, *rbw, Some(*lo), None),
-                PointSettings::Spec {
-                    cal,
-                    rbw,
-                    lo,
-                    ref_level_dbm,
-                } => (*cal, Some(*rbw), Some(*lo), Some(*ref_level_dbm)),
-            };
-            (
-                cal,
-                rbw,
-                lo,
-                reference,
-                frequencies_hz[0],
-                *frequencies_hz
-                    .last()
-                    .expect("validated nonempty frequency list"),
-                frequencies_hz.len() as u32,
-            )
-        }
     };
     [
         "measured".into(),
@@ -284,16 +329,34 @@ fn metadata(snapshot: &CompletedSweep) -> [String; METADATA_HEADERS.len()] {
         reference.map_or_else(String::new, |value| value.to_string()),
         start.to_string(),
         stop.to_string(),
-        points.to_string(),
+        snapshot.settings.points().to_string(),
         unix_timestamp(snapshot.completed_at),
         snapshot.session_id.to_string(),
-        if requested_frequencies(&snapshot.settings).is_some() {
-            "list"
-        } else {
-            "range"
-        }
-        .into(),
+        kind.into(),
     ]
+}
+
+fn segment_rows(snapshot: &CompletedSweep) -> Vec<[String; 6]> {
+    let (AcquisitionSettings::Segments(plan), Some(metadata)) =
+        (&snapshot.settings, &snapshot.segments)
+    else {
+        return Vec::new();
+    };
+    plan.segments()
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let definition = segment.definition();
+            [
+                definition.start_hz.to_string(),
+                definition.stop_hz.to_string(),
+                definition.max_step_hz.to_string(),
+                segment.points().to_string(),
+                metadata.received[index].to_string(),
+                metadata.retained(index).to_string(),
+            ]
+        })
+        .collect()
 }
 
 fn unix_timestamp(time: SystemTime) -> String {
@@ -396,6 +459,7 @@ mod tests {
             })
             .collect();
         CompletedSweep {
+            segments: None,
             data: SweepData {
                 mode,
                 format: format.into(),
@@ -432,7 +496,7 @@ mod tests {
                 rbw: params.rbw,
                 ref_level_dbm: params.ref_level_dbm,
             },
-            AcquisitionSettings::List { .. } => unreachable!(),
+            AcquisitionSettings::List { .. } | AcquisitionSettings::Segments(_) => unreachable!(),
         };
         snapshot.settings = AcquisitionSettings::List {
             settings,

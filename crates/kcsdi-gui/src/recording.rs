@@ -483,6 +483,7 @@ mod tests {
                     (
                         TraceId(index as u64 + 1),
                         Arc::new(CompletedSweep {
+                            segments: None,
                             data,
                             settings,
                             session_id: 1,

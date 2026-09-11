@@ -181,6 +181,7 @@ fn old_completed_data_cannot_hide_a_new_lists_lowest_positive_target() {
     settings.start_hz = 1_000;
     settings.stop_hz = 10_000;
     workspace.traces[0].completed = Some(std::sync::Arc::new(crate::acquisition::CompletedSweep {
+        segments: None,
         data: kcsdi_core::data::SweepData {
             mode: kcsdi_core::protocol::StreamMode::Spec,
             format: String::new(),

@@ -1066,10 +1066,13 @@ mod tests {
                 params.start_hz = start_hz;
                 params.stop_hz = stop_hz;
             }
-            AcquisitionSettings::List { .. } => unreachable!("finite snapshot fixture"),
+            AcquisitionSettings::List { .. } | AcquisitionSettings::Segments(_) => {
+                unreachable!("finite snapshot fixture")
+            }
         }
         assert!(settings.accepts(data));
         CompletedSweep {
+            segments: None,
             data: data.clone(),
             settings,
             session_id: 1,

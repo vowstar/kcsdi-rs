@@ -862,6 +862,7 @@ visible = false
             ..Default::default()
         });
         let snapshot = CompletedSweep {
+            segments: None,
             settings: trace.settings.acquisition(&state.workspace.range).unwrap(),
             session_id: 812,
             completed_at: SystemTime::UNIX_EPOCH,

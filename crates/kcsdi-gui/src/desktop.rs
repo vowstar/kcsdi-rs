@@ -882,6 +882,7 @@ mod tests {
         };
         state.workspace.selected_mut().unwrap().completed =
             Some(std::sync::Arc::new(crate::acquisition::CompletedSweep {
+                segments: None,
                 data: trace.clone(),
                 settings: crate::acquisition::AcquisitionSettings::S11(
                     crate::acquisition::tests::s11(),

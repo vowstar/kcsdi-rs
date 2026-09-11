@@ -13,14 +13,48 @@ use kcsdi_core::data::SweepData;
 
 use crate::acquisition::AcquisitionGroup;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentProgress {
+    pub index: usize,
+    pub count: usize,
+    pub acquired: u32,
+    pub expected: u32,
+    pub segment_points: usize,
+}
+
 /// An incomplete sweep, even when all expected rows have arrived before its end.
 #[derive(Debug)]
 pub struct PreviewEnvelope {
+    pub segment: Option<SegmentProgress>,
     pub session_id: u64,
     pub request_id: u64,
     pub cycle_id: u64,
     pub data: SweepData,
     pub group: AcquisitionGroup,
+}
+
+impl PreviewEnvelope {
+    pub fn valid_progress(&self) -> bool {
+        match (&self.group.settings, self.segment) {
+            (crate::acquisition::AcquisitionSettings::Segments(plan), Some(progress)) => {
+                let Some(row) = plan.segments().get(progress.index) else {
+                    return false;
+                };
+                progress.count == plan.segments().len()
+                    && progress.expected == plan.acquired_points()
+                    && progress.segment_points <= row.points() as usize
+                    && progress.acquired
+                        == plan.segments()[..progress.index]
+                            .iter()
+                            .map(|row| row.points())
+                            .sum::<u32>()
+                            + progress.segment_points as u32
+                    && self.data.points.len() <= progress.acquired as usize
+            }
+            (crate::acquisition::AcquisitionSettings::Segments(_), None) | (_, Some(_)) => false,
+            (_, None) => true,
+        }
+    }
 }
 
 /// Shared latest-preview slot. Lock contention never delays the producer.
@@ -72,6 +106,7 @@ mod tests {
 
     fn preview(cycle_id: u64, rows: usize) -> PreviewEnvelope {
         PreviewEnvelope {
+            segment: None,
             session_id: 1,
             request_id: 2,
             cycle_id,

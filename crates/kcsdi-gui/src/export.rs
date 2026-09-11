@@ -564,6 +564,7 @@ mod tests {
 
     fn completed() -> Arc<CompletedSweep> {
         Arc::new(CompletedSweep {
+            segments: None,
             data: SweepData {
                 mode: StreamMode::S11,
                 format: "ri".into(),
@@ -619,6 +620,7 @@ mod tests {
             prefix.points[0].values[0] = 0.9;
             workspace.selected_mut().unwrap().preview =
                 Some(Arc::new(crate::preview::PreviewEnvelope {
+                    segment: None,
                     session_id: 1,
                     request_id: 1,
                     cycle_id: 2,

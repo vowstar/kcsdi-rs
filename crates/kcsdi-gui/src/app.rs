@@ -114,7 +114,7 @@ impl KcsdiApp {
         };
         if !self.accepts_group(&group)
             || delivery.snapshot.session_id != self.state.session_id
-            || !group.settings.accepts(&delivery.snapshot.data)
+            || !delivery.snapshot.accepts_data()
         {
             return;
         }
@@ -153,6 +153,7 @@ impl KcsdiApp {
         if preview.session_id != self.state.session_id
             || preview.request_id != self.state.request_id
             || !self.accepts_group(&preview.group)
+            || !preview.valid_progress()
             || preview.data.mode != preview.group.settings.mode()
             || preview.data.format != preview.group.settings.format()
             || preview.data.points.len() > preview.group.settings.points() as usize
@@ -1285,6 +1286,7 @@ mod tests {
             .unwrap();
         state.send(WorkerCommand::RunWorkspace(state.workspace.plan().unwrap()));
         let snapshot = Arc::new(CompletedSweep {
+            segments: None,
             data: completed_impedance(),
             settings: state.active_plan.as_ref().unwrap().groups[0]
                 .settings
@@ -1919,6 +1921,7 @@ mod tests {
             }
         }
         crate::preview::PreviewEnvelope {
+            segment: None,
             session_id: app.state.session_id,
             request_id: app.state.request_id,
             cycle_id,
@@ -1936,6 +1939,7 @@ mod tests {
             event: WorkerEvent::SweepTrace(SweepDelivery {
                 members: preview.group.members,
                 snapshot: Arc::new(CompletedSweep {
+                    segments: None,
                     data: preview.data,
                     settings: preview.group.settings,
                     session_id: app.state.session_id,
@@ -2213,6 +2217,7 @@ mod tests {
                     } else {
                         let old = trace.preview.take().unwrap();
                         trace.preview = Some(Arc::new(crate::preview::PreviewEnvelope {
+                            segment: None,
                             session_id: old.session_id + 1,
                             request_id: old.request_id,
                             cycle_id: old.cycle_id,
@@ -3724,6 +3729,7 @@ mod tests {
                         let range = app.state.workspace.range;
                         let trace = app.state.workspace.selected_mut().unwrap();
                         let snapshot = Arc::new(CompletedSweep {
+                            segments: None,
                             settings: trace.settings.acquisition(&range).unwrap(),
                             session_id: 1,
                             completed_at: SystemTime::UNIX_EPOCH,

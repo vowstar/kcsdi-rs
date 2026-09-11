@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use kcsdi_core::data::SweepData;
 use kcsdi_core::device::{PointParams, PointSettings, S11Params, S21Params, SpecParams};
 use kcsdi_core::protocol::StreamMode;
+use kcsdi_core::segments::{SegmentMetadata, SegmentPlan};
 use kcsdi_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -25,13 +26,44 @@ pub enum AcquisitionSettings {
     S11(S11Params),
     S21(S21Params),
     Spec(SpecParams),
+    Segments(SegmentPlan),
     List {
         settings: PointSettings,
         frequencies_hz: Vec<u64>,
     },
 }
 
+impl From<SegmentPlan> for AcquisitionSettings {
+    fn from(plan: SegmentPlan) -> Self {
+        Self::Segments(plan)
+    }
+}
+
 impl AcquisitionSettings {
+    pub fn receiver(&self) -> PointSettings {
+        match self {
+            Self::S11(p) => PointSettings::S11 {
+                cal: p.cal,
+                format: p.format,
+                rbw: p.rbw,
+            },
+            Self::S21(p) => PointSettings::S21 {
+                cal: p.cal,
+                format: p.format,
+                rbw: p.rbw,
+                lo: p.lo,
+            },
+            Self::Spec(p) => PointSettings::Spec {
+                cal: p.cal,
+                rbw: p.rbw,
+                lo: p.lo,
+                ref_level_dbm: p.ref_level_dbm,
+            },
+            Self::List { settings, .. } => settings.clone(),
+            Self::Segments(plan) => plan.settings().clone(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let caps = crate::state::DEVICE_MODEL.capabilities();
         let rbw = match self {
@@ -46,6 +78,15 @@ impl AcquisitionSettings {
             Self::Spec(params) => {
                 params.validate(&caps)?;
                 Some(params.rbw)
+            }
+            Self::Segments(plan) => {
+                for segment in plan.segments() {
+                    segment.sweep(plan.settings()).validate(&caps)?;
+                }
+                match plan.settings() {
+                    PointSettings::S11 { rbw, .. } | PointSettings::S21 { rbw, .. } => *rbw,
+                    PointSettings::Spec { rbw, .. } => Some(*rbw),
+                }
             }
             Self::List {
                 settings,
@@ -85,6 +126,7 @@ impl AcquisitionSettings {
             Self::S11(_) => StreamMode::S11,
             Self::S21(_) => StreamMode::S21,
             Self::Spec(_) => StreamMode::Spec,
+            Self::Segments(plan) => plan.settings().mode(),
             Self::List { settings, .. } => settings.mode(),
         }
     }
@@ -94,6 +136,7 @@ impl AcquisitionSettings {
             Self::S11(params) => params.format.as_str(),
             Self::S21(params) => params.format.as_str(),
             Self::Spec(_) => "",
+            Self::Segments(plan) => plan.settings().format(),
             Self::List { settings, .. } => settings.format(),
         }
     }
@@ -103,6 +146,7 @@ impl AcquisitionSettings {
             Self::S11(params) => params.points,
             Self::S21(params) => params.points,
             Self::Spec(params) => params.points,
+            Self::Segments(plan) => plan.acquired_points(),
             Self::List { frequencies_hz, .. } => frequencies_hz.len() as u32,
         }
     }
@@ -110,7 +154,13 @@ impl AcquisitionSettings {
     pub fn accepts(&self, data: &SweepData) -> bool {
         data.mode == self.mode()
             && data.format == self.format()
-            && data.points.len() == self.points() as usize
+            && match self {
+                Self::Segments(plan) => {
+                    let maximum = plan.acquired_points() as usize;
+                    (maximum - plan.segments().len() + 1..=maximum).contains(&data.points.len())
+                }
+                _ => data.points.len() == self.points() as usize,
+            }
     }
 }
 
@@ -200,9 +250,23 @@ impl SweepPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedSweep {
     pub data: SweepData,
+    pub segments: Option<SegmentMetadata>,
     pub settings: AcquisitionSettings,
     pub session_id: u64,
     pub completed_at: SystemTime,
+}
+
+impl CompletedSweep {
+    pub fn accepts_data(&self) -> bool {
+        self.settings.accepts(&self.data)
+            && match (&self.settings, &self.segments) {
+                (AcquisitionSettings::Segments(plan), Some(metadata)) => {
+                    metadata.validate(plan, &self.data).is_ok()
+                }
+                (AcquisitionSettings::Segments(_), None) | (_, Some(_)) => false,
+                (_, None) => true,
+            }
+    }
 }
 
 #[derive(Debug)]

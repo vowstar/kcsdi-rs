@@ -18,6 +18,60 @@ pub struct SegmentMetadata {
     pub received: Vec<u32>,
 }
 
+impl SegmentMetadata {
+    /// Recheck a frozen joined result before delivery or export.
+    pub fn validate(&self, plan: &SegmentPlan, data: &SweepData) -> Result<()> {
+        let invalid = || Error::Protocol("invalid segmented result or sample provenance".into());
+        if self.received.len() != plan.segments().len()
+            || self.origins.len() != data.points.len()
+            || data.mode != plan.settings().mode()
+            || data.format != plan.settings().format()
+            || data
+                .points
+                .windows(2)
+                .any(|pair| pair[0].freq_hz >= pair[1].freq_hz)
+        {
+            return Err(invalid());
+        }
+        let width = table::columns(data.mode, &data.format)
+            .ok_or_else(invalid)?
+            .len();
+        let mut next = vec![None; self.received.len()];
+        for (origin, point) in self.origins.iter().zip(&data.points) {
+            let row = plan.segments().get(origin.segment).ok_or_else(invalid)?;
+            if !point.freq_hz.is_finite()
+                || point.freq_hz < 0.0
+                || point.values.len() != width
+                || origin.point >= row.points as usize
+                || next[origin.segment]
+                    .map_or(origin.point > usize::from(origin.segment > 0), |expected| {
+                        origin.point != expected
+                    })
+                || (origin.point == 0
+                    && !endpoint_matches(point.freq_hz, row.definition.start_hz, row))
+                || (origin.point + 1 == row.points as usize
+                    && !endpoint_matches(point.freq_hz, row.definition.stop_hz, row))
+            {
+                return Err(invalid());
+            }
+            next[origin.segment] = Some(origin.point + 1);
+        }
+        for (index, row) in plan.segments().iter().enumerate() {
+            if self.received[index] != row.points || next[index] != Some(row.points as usize) {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn retained(&self, segment: usize) -> usize {
+        self.origins
+            .iter()
+            .filter(|origin| origin.segment == segment)
+            .count()
+    }
+}
+
 /// A bounded builder. Only finish can expose an entire completed acquisition.
 pub struct SegmentJoiner {
     plan: SegmentPlan,
