@@ -6,6 +6,7 @@
 use super::sweep_controls::{self, BUTTON_HEIGHT, SweepEdit, SweepFields, group_heading};
 use crate::i18n::{Language, Text};
 use crate::state::{AppState, ConnectionState, S11Display, S21Display, SweepState, WorkerCommand};
+use crate::widgets::plot::{self, YScale};
 use crate::workspace::{TraceDisplay, TraceSettings, TraceState};
 
 pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
@@ -204,25 +205,278 @@ pub fn settings_fields(ui: &mut egui::Ui, settings: &mut TraceSettings, language
     });
 }
 
+pub fn log_y_control(ui: &mut egui::Ui, trace: &mut TraceState, language: Language) {
+    if let Some(scale) = trace.settings.display.logarithmic_y() {
+        let mut enabled = trace.view.y_scale != YScale::Linear;
+        let help = if scale == YScale::LogImpedance {
+            Text::LogYHelp
+        } else {
+            Text::LogVswrHelp
+        };
+        if ui
+            .checkbox(&mut enabled, language.text(Text::LogY))
+            .on_hover_text(language.text(help))
+            .changed()
+        {
+            trace.view.y_scale = if enabled { scale } else { YScale::Linear };
+            trace.view.ensure_y_view();
+            trace.view_locked = false;
+            trace.needs_fit = true;
+        }
+    }
+}
+
 pub fn display_fields(ui: &mut egui::Ui, trace: &mut TraceState, language: Language) {
     if trace.settings.display.is_smith() {
         return;
     }
-    if sweep_controls::scale_fields(
-        ui,
-        &mut trace.view,
-        language,
-        trace.settings.display.unit(),
-        trace.settings.display == TraceDisplay::Spec,
-    ) {
+    // A logarithmic axis has no constant value per division.
+    if trace.view.y_scale == YScale::Linear
+        && sweep_controls::scale_fields(
+            ui,
+            &mut trace.view,
+            language,
+            trace.settings.display.unit(),
+            trace.settings.display == TraceDisplay::Spec,
+        )
+    {
         trace.view_locked = true;
         trace.needs_fit = false;
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct AxisRange {
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+}
+
+impl AxisRange {
+    fn valid(self, log_x: bool, y_scale: YScale) -> bool {
+        let valid_span = |min: f64, max: f64| {
+            min.is_finite() && max.is_finite() && min < max && (max - min).is_finite()
+        };
+        valid_span(self.x_min, self.x_max)
+            && valid_span(self.y_min, self.y_max)
+            && (self.y_min + self.y_max).is_finite()
+            && (!log_x || (self.x_min > 0.0 && self.x_max.log10() > self.x_min.log10()))
+            && y_scale
+                .floor()
+                .is_none_or(|floor| self.y_min >= floor && self.y_max.log10() > self.y_min.log10())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RangeDraft {
+    source: AxisRange,
+    values: AxisRange,
+    log_x: bool,
+    y_scale: YScale,
+    display: TraceDisplay,
+}
+
+/// Display bounds are independent of the acquisition range and point grid.
+pub fn view_fields(ui: &mut egui::Ui, state: &mut AppState) {
+    let language = state.language;
+    let workspace = &mut state.workspace;
+    let log_x = workspace.log_x;
+    let x_view = workspace.x_view;
+    let Some(trace) = workspace.selected_mut() else {
+        return;
+    };
+    if trace.settings.display.is_smith() {
+        return;
+    }
+    let source = AxisRange {
+        x_min: x_view.x_min,
+        x_max: x_view.x_max,
+        y_min: trace.view.y_min,
+        y_max: trace.view.y_max,
+    };
+    let y_scale = trace.view.y_scale;
+    let id = ui.id().with(("axis_range", trace.id.0));
+    let mut draft = ui
+        .ctx()
+        .data(|data| data.get_temp::<RangeDraft>(id))
+        .filter(|draft| {
+            (draft.source == source || draft.values != draft.source)
+                && draft.log_x == log_x
+                && draft.y_scale == y_scale
+                && draft.display == trace.settings.display
+        })
+        .unwrap_or(RangeDraft {
+            source,
+            values: source,
+            log_x,
+            y_scale,
+            display: trace.settings.display,
+        });
+    let mut applied = false;
+    let mut fit = false;
+    let response = egui::CollapsingHeader::new(language.text(Text::AxisRange))
+        .id_salt(id)
+        .show(ui, |ui| {
+            egui::Grid::new(id.with("fields"))
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for (label, value, unit) in [
+                        (Text::XMinimum, &mut draft.values.x_min, "Hz"),
+                        (Text::XMaximum, &mut draft.values.x_max, "Hz"),
+                        (
+                            Text::YMinimum,
+                            &mut draft.values.y_min,
+                            trace.settings.display.unit(),
+                        ),
+                        (
+                            Text::YMaximum,
+                            &mut draft.values.y_max,
+                            trace.settings.display.unit(),
+                        ),
+                    ] {
+                        ui.label(language.text(label));
+                        let speed =
+                            (value.abs() * 0.01).max(if unit == "s" { 1e-15 } else { 1e-6 });
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .speed(speed)
+                                .max_decimals(15)
+                                .custom_formatter(move |value, _| {
+                                    plot::format_axis_value(value, unit)
+                                })
+                                .custom_parser(move |text| plot::parse_axis_value(text, unit)),
+                        );
+                        ui.end_row();
+                    }
+                });
+            let valid = draft.values.valid(log_x, y_scale);
+            if !valid {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    language.text(Text::InvalidAxisRange),
+                );
+            }
+            applied = ui
+                .add_enabled(valid, egui::Button::new(language.text(Text::ApplyRange)))
+                .clicked();
+            fit = ui.button(language.text(Text::FitRange)).clicked();
+        });
+    response
+        .header_response
+        .on_hover_text(language.text(Text::AxisRangeHelp));
+    if applied {
+        trace.view.y_min = draft.values.y_min;
+        trace.view.y_max = draft.values.y_max;
+        trace.view_locked = true;
+        trace.needs_fit = false;
+        workspace.x_view.x_min = draft.values.x_min;
+        workspace.x_view.x_max = draft.values.x_max;
+        draft.source = draft.values;
+    } else if fit {
+        let (low, high) = trace.settings.display.default_y();
+        trace.view.reset(source.x_min, source.x_max, low, high);
+        trace.view_locked = false;
+        trace.needs_fit = true;
+        workspace.reset_frequency_view();
+    }
+    ui.ctx().data_mut(|data| {
+        if fit {
+            data.remove::<RangeDraft>(id);
+        } else {
+            data.insert_temp(id, draft);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_ranges_validate_units_floors_and_finite_spans() {
+        let base = AxisRange {
+            x_min: 5e3,
+            x_max: 1e9,
+            y_min: 1e-3,
+            y_max: 1e3,
+        };
+        assert!(base.valid(true, YScale::LogImpedance));
+        assert!(!base.valid(true, YScale::LogVswr));
+        assert!(AxisRange { y_min: 1.0, ..base }.valid(true, YScale::LogVswr));
+        let signed = AxisRange {
+            y_min: -100.0,
+            ..base
+        };
+        assert!(signed.valid(true, YScale::Linear));
+        assert!(!signed.valid(true, YScale::LogImpedance));
+        let dc = AxisRange { x_min: 0.0, ..base };
+        assert!(dc.valid(false, YScale::LogImpedance));
+        assert!(!dc.valid(true, YScale::LogImpedance));
+        for invalid in [
+            AxisRange {
+                x_max: base.x_min,
+                ..base
+            },
+            AxisRange {
+                y_max: base.y_min,
+                ..base
+            },
+            AxisRange {
+                x_min: f64::NAN,
+                ..base
+            },
+            AxisRange {
+                y_min: f64::NEG_INFINITY,
+                ..base
+            },
+            AxisRange {
+                y_max: f64::INFINITY,
+                ..base
+            },
+            AxisRange {
+                y_min: -f64::MAX,
+                y_max: f64::MAX,
+                ..base
+            },
+        ] {
+            assert!(!invalid.valid(false, YScale::Linear));
+        }
+        assert!(
+            AxisRange {
+                y_min: -2e-18,
+                y_max: 3e-18,
+                ..base
+            }
+            .valid(false, YScale::Linear)
+        );
+    }
+
+    #[test]
+    fn display_controls_offer_log_y_only_for_impedance_and_vswr() {
+        for display in [TraceDisplay::Spec]
+            .into_iter()
+            .chain(S11Display::ALL.map(TraceDisplay::S11))
+            .chain(S21Display::ALL.map(TraceDisplay::S21))
+        {
+            let ctx = egui::Context::default();
+            let mut trace = TraceState::new(
+                crate::acquisition::TraceId(1),
+                TraceSettings {
+                    display,
+                    ..Default::default()
+                },
+                &Default::default(),
+            );
+            let output = ctx.run_ui(Default::default(), |ui| {
+                log_y_control(ui, &mut trace, Language::English)
+            });
+            let log_y = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "LOG Y"));
+            assert_eq!(log_y, display.logarithmic_y().is_some(), "{display:?}");
+            assert_eq!(trace.view.y_scale, YScale::Linear);
+            output.drop_without_applying_deltas();
+        }
+    }
 
     #[test]
     fn run_and_settings_captions_fit_the_parameter_panel() {

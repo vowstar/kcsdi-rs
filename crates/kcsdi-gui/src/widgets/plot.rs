@@ -175,8 +175,7 @@ impl ViewLock {
     }
 }
 
-/// Visible range in original data units. X is always in Hz, including
-/// in log mode. Y remains linear for layout, readout, zoom, and pan.
+/// Visible range in original data units, including logarithmic views.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlotView {
     pub x_min: f64,
@@ -184,6 +183,7 @@ pub struct PlotView {
     pub y_min: f64,
     pub y_max: f64,
     pub y_divisions: usize,
+    pub y_scale: YScale,
 }
 
 impl PlotView {
@@ -194,14 +194,63 @@ impl PlotView {
             y_min,
             y_max,
             y_divisions: 8,
+            y_scale: YScale::Linear,
         }
     }
 
     /// Reset the view to the given range (e.g. after parameters changed).
     pub fn reset(&mut self, x_min: f64, x_max: f64, y_min: f64, y_max: f64) {
         let divisions = self.y_divisions;
+        let y_scale = self.y_scale;
         *self = Self::new(x_min, x_max, y_min, y_max);
         self.y_divisions = divisions;
+        self.y_scale = y_scale;
+        self.ensure_y_view();
+    }
+
+    pub fn ensure_y_view(&mut self) {
+        if let Some(floor) = self.y_scale.floor() {
+            self.y_min = self.y_min.max(floor);
+            if !self.y_max.is_finite() || self.y_max.log10() <= self.y_min.log10() {
+                self.y_min = floor;
+                self.y_max = floor * 10.0;
+            }
+        }
+    }
+}
+
+/// Fixed display floor in ohms. Raw samples and readouts remain unchanged.
+pub const LOG_Y_FLOOR: f64 = 1e-3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YScale {
+    Linear,
+    LogImpedance,
+    LogVswr,
+}
+
+impl YScale {
+    pub fn floor(self) -> Option<f64> {
+        match self {
+            Self::Linear => None,
+            Self::LogImpedance => Some(LOG_Y_FLOOR),
+            Self::LogVswr => Some(1.0),
+        }
+    }
+
+    fn to_axis(self, value: f64) -> f64 {
+        match self.floor() {
+            Some(floor) if value.is_finite() => value.max(floor).log10(),
+            _ => value,
+        }
+    }
+
+    fn value_from_axis(self, value: f64) -> f64 {
+        if self.floor().is_some() {
+            10f64.powf(value)
+        } else {
+            value
+        }
     }
 }
 
@@ -265,6 +314,7 @@ fn x_from_axis(log_x: bool, x: f64) -> f64 {
 struct Mapping {
     rect: Rect,
     log_x: bool,
+    y_scale: YScale,
     x_min: f64,
     x_span: f64,
     y_min: f64,
@@ -274,13 +324,15 @@ struct Mapping {
 impl Mapping {
     fn new(view: &PlotView, log_x: bool, rect: Rect) -> Self {
         let x_min = x_to_axis(log_x, view.x_min);
+        let y_min = view.y_scale.to_axis(view.y_min);
         Self {
             rect,
             log_x,
+            y_scale: view.y_scale,
             x_min,
             x_span: positive_span(x_to_axis(log_x, view.x_max) - x_min),
-            y_min: view.y_min,
-            y_span: positive_span(view.y_max - view.y_min),
+            y_min,
+            y_span: positive_span(view.y_scale.to_axis(view.y_max) - y_min),
         }
     }
 
@@ -289,7 +341,9 @@ impl Mapping {
             self.rect.left()
                 + ((x_to_axis(self.log_x, x) - self.x_min) / self.x_span) as f32
                     * self.rect.width(),
-            self.rect.bottom() - ((y - self.y_min) / self.y_span) as f32 * self.rect.height(),
+            self.rect.bottom()
+                - ((self.y_scale.to_axis(y) - self.y_min) / self.y_span) as f32
+                    * self.rect.height(),
         )
     }
 
@@ -301,7 +355,12 @@ impl Mapping {
     }
 
     fn value_at(&self, screen_y: f32) -> f64 {
-        self.y_min + ((self.rect.bottom() - screen_y) / self.rect.height()) as f64 * self.y_span
+        self.y_scale.value_from_axis(
+            self.y_min
+                + (f64::from(self.rect.bottom()) - f64::from(screen_y))
+                    / f64::from(self.rect.height())
+                    * self.y_span,
+        )
     }
 }
 
@@ -320,6 +379,22 @@ fn set_x_bounds(view: &mut PlotView, log_x: bool, axis_min: f64, axis_max: f64) 
     if usable_x(log_x, min) && usable_x(log_x, max) && min < max {
         view.x_min = min;
         view.x_max = max;
+    }
+}
+
+fn set_y_bounds(view: &mut PlotView, axis_min: f64, axis_max: f64) {
+    let (axis_min, axis_max) = if let Some(floor) = view.y_scale.floor().map(f64::log10)
+        && axis_min < floor
+    {
+        (floor, axis_max + floor - axis_min)
+    } else {
+        (axis_min, axis_max)
+    };
+    let min = view.y_scale.value_from_axis(axis_min);
+    let max = view.y_scale.value_from_axis(axis_max);
+    if min.is_finite() && max.is_finite() && min < max && (max - min).is_finite() {
+        view.y_min = min;
+        view.y_max = max;
     }
 }
 
@@ -395,6 +470,68 @@ pub(crate) fn format_value(v: f64) -> String {
     }
 }
 
+fn si_prefix(value: f64) -> (&'static str, f64) {
+    let exponent = if value == 0.0 || !value.is_finite() {
+        0
+    } else {
+        ((value.abs().log10() / 3.0).floor() as i32).clamp(-8, 8)
+    };
+    let prefix = [
+        "y", "z", "a", "f", "p", "n", "u", "m", "", "k", "M", "G", "T", "P", "E", "Z", "Y",
+    ][(exponent + 8) as usize];
+    (prefix, 10f64.powi(exponent * 3))
+}
+
+pub(crate) fn format_axis_value(value: f64, unit: &str) -> String {
+    if matches!(unit, "Hz" | "ohm" | "s") {
+        let (prefix, scale) = si_prefix(value);
+        let number = format!("{:.12}", value / scale);
+        format!(
+            "{} {prefix}{unit}",
+            number.trim_end_matches('0').trim_end_matches('.')
+        )
+    } else {
+        format!("{} {unit}", format_value(value)).trim().to_owned()
+    }
+}
+
+pub(crate) fn parse_axis_value(text: &str, unit: &str) -> Option<f64> {
+    let text = text.trim();
+    let text = text.strip_suffix(unit).unwrap_or(text).trim();
+    if let Ok(value) = text.parse::<f64>() {
+        return Some(value);
+    }
+    if matches!(unit, "Hz" | "ohm" | "s") {
+        let prefix = text.chars().last()?;
+        let exponent = match prefix {
+            'y' => -24,
+            'z' => -21,
+            'a' => -18,
+            'f' => -15,
+            'p' => -12,
+            'n' => -9,
+            'u' | 'µ' => -6,
+            'm' => -3,
+            'k' => 3,
+            'M' => 6,
+            'G' => 9,
+            'T' => 12,
+            'P' => 15,
+            'E' => 18,
+            'Z' => 21,
+            'Y' => 24,
+            _ => return None,
+        };
+        return text
+            .strip_suffix(prefix)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value * 10f64.powi(exponent));
+    }
+    None
+}
+
 /// Retain at least the resolution of one division, including narrow views.
 fn y_tick_text(value: f64, step: f64) -> String {
     let precision = (2.0 - step.abs().log10().floor()).clamp(0.0, 16.0) as usize;
@@ -444,21 +581,31 @@ fn y_tick_labels(
                 .all(|pair| pair[0].job.text != pair[1].job.text)
     };
     let mut offset = 0.0;
-    let mut scale = 1.0;
+    let (prefix, si_scale) = if unit.ends_with("ohm") {
+        si_prefix(view.y_min.abs().max(view.y_max.abs()))
+    } else {
+        ("", 1.0)
+    };
+    let mut scale = si_scale;
     let mut ticks = labels(offset, scale);
     if !fits(&ticks) && view.y_min.abs().max(view.y_max.abs()) > span * 10.0 {
         offset = view.y_min;
+        scale = 1.0;
         ticks = labels(offset, scale);
     }
     if !fits(&ticks) {
         scale = 10f64.powf(step.log10().floor());
         ticks = labels(offset, scale);
     }
-    let caption = match (scale != 1.0, offset != 0.0) {
-        (false, false) => unit.to_string(),
-        (false, true) => format!("{unit} ({offset:+})"),
-        (true, false) => format!("{unit} (x{scale:e})"),
-        (true, true) => format!("{unit} (x{scale:e}, {offset:+})"),
+    let caption = if offset == 0.0 && scale == si_scale && !prefix.is_empty() {
+        format!("{}{prefix}ohm", unit.strip_suffix("ohm").unwrap_or(unit))
+    } else {
+        match (scale != 1.0, offset != 0.0) {
+            (false, false) => unit.to_string(),
+            (false, true) => format!("{unit} ({offset:+})"),
+            (true, false) => format!("{unit} (x{scale:e})"),
+            (true, true) => format!("{unit} (x{scale:e}, {offset:+})"),
+        }
     };
     (ticks, caption)
 }
@@ -511,13 +658,14 @@ fn frequency_ticks(log_x: bool, min: f64, max: f64) -> Vec<f64> {
     ticks
 }
 
-/// Full data extent over all drawable series, with 5% linear Y headroom.
-fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
+/// Full data extent over drawable series, with headroom in Y axis space.
+fn data_range(opts: &PlotOptions, y_scale: YScale) -> Option<(f64, f64, f64, f64)> {
     let mut range: Option<(f64, f64, f64, f64)> = None;
     for &(x, y) in opts.visible_series().flat_map(|s| &s.points) {
         if !usable_x(opts.log_x, x) || !y.is_finite() {
             continue;
         }
+        let y = y_scale.to_axis(y);
         range = Some(match range {
             None => (x, x, y, y),
             Some((x0, x1, y0, y1)) => (x0.min(x), x1.max(x), y0.min(y), y1.max(y)),
@@ -534,6 +682,17 @@ fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
             x0 = x_from_axis(opts.log_x, axis - pad);
             x1 = x_from_axis(opts.log_x, axis + pad);
         }
+        if let Some(floor) = y_scale.floor() {
+            let pad = ((y1 - y0) * 0.05).max(0.1);
+            return (
+                x0,
+                x1,
+                y_scale.value_from_axis((y0 - pad).max(floor.log10())),
+                y_scale
+                    .value_from_axis((y1 + pad).min(f64::MAX.log10()))
+                    .min(f64::MAX),
+            );
+        }
         let magnitude = y0.abs().max(y1.abs());
         let minimum_pad = if magnitude > 0.0 && magnitude < 1.0 {
             magnitude * 0.05
@@ -549,7 +708,7 @@ fn data_range(opts: &PlotOptions) -> Option<(f64, f64, f64, f64)> {
 
 /// Reset to all drawable data. Does nothing when no valid data exists.
 pub fn fit_view(view: &mut PlotView, opts: &PlotOptions) {
-    if let Some((x_min, x_max, y_min, y_max)) = data_range(opts) {
+    if let Some((x_min, x_max, y_min, y_max)) = data_range(opts, view.y_scale) {
         view.reset(x_min, x_max, y_min, y_max);
     }
 }
@@ -563,7 +722,7 @@ fn ensure_x_view(view: &mut PlotView, opts: &PlotOptions) {
     if valid(view) {
         return;
     }
-    if let Some((x_min, x_max, _, _)) = data_range(opts) {
+    if let Some((x_min, x_max, _, _)) = data_range(opts, view.y_scale) {
         view.x_min = x_min;
         view.x_max = x_max;
     }
@@ -626,6 +785,9 @@ pub fn show_multi(
     };
     let layer = &mut layers[active];
     ensure_x_view(layer.view, &layer.options);
+    for layer in layers.iter_mut() {
+        layer.view.ensure_y_view();
+    }
     sync_layer_x(layers, active);
     let legend = multi_legend_rect(ui.painter(), layers, plot_rect);
     let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
@@ -884,6 +1046,7 @@ pub fn show_with_markers(
     }
 
     ensure_x_view(view, opts);
+    view.ensure_y_view();
     let legend = legend_rect(ui.painter(), opts, plot_rect);
     let over_legend = response.hover_pos().is_some_and(|pos| legend.contains(pos));
     let badges = cartesian_marker_badges(
@@ -1057,7 +1220,7 @@ fn draw_markers(
 
 /// Plain wheel zooms X, Shift+wheel zooms Y, Ctrl/Command+wheel zooms
 /// both. Drag pans and double-click fits, per reference UI analysis
-/// section 5. Only X uses logarithmic axis space.
+/// section 5. Logarithmic axes interact in transformed space.
 fn handle_input(
     ui: &egui::Ui,
     view: &mut PlotView,
@@ -1091,12 +1254,14 @@ fn handle_input(
             wheel_factor(scroll)
         };
         if zoom_y_only || zoom_both {
+            let (mut min, mut max) = (mapping.y_min, mapping.y_min + mapping.y_span);
             zoom_axis(
-                &mut view.y_min,
-                &mut view.y_max,
-                mapping.value_at(pos.y),
+                &mut min,
+                &mut max,
+                view.y_scale.to_axis(mapping.value_at(pos.y)),
                 factor,
             );
+            set_y_bounds(view, min, max);
         }
         if !zoom_y_only {
             let (mut min, mut max) = (mapping.x_min, mapping.x_min + mapping.x_span);
@@ -1129,11 +1294,11 @@ fn pan_view(view: &mut PlotView, log_x: bool, rect: Rect, delta: egui::Vec2) {
         mapping.x_min + mapping.x_span + dx,
     );
     let dy = (delta.y as f64 / rect.height() as f64) * mapping.y_span;
-    let (min, max) = (view.y_min + dy, view.y_max + dy);
-    if min.is_finite() && max.is_finite() && min < max {
-        view.y_min = min;
-        view.y_max = max;
-    }
+    set_y_bounds(
+        view,
+        mapping.y_min + dy,
+        mapping.y_min + mapping.y_span + dy,
+    );
 }
 
 /// Zoom one axis around the cursor, refusing collapsed or infinite bounds.
@@ -1184,16 +1349,67 @@ fn draw_grid(painter: &egui::Painter, view: &PlotView, opts: &PlotOptions, mappi
         }
     }
 
-    let divisions = view.y_divisions.clamp(2, 30);
-    let step = (view.y_max - view.y_min) / divisions as f64;
-    let (labels, caption) = y_tick_labels(painter, view, opts.y_label);
-    for (index, label) in labels.into_iter().enumerate() {
-        let y = view.y_min + index as f64 * step;
+    let (ticks, mut caption) = if view.y_scale.floor().is_some() && mapping.y_span >= 0.5 {
+        let ticks = frequency_ticks(true, view.y_min, view.y_max);
+        let step = (view.y_max - view.y_min) / TARGET_DIVISIONS as f64;
+        let labels = ticks
+            .into_iter()
+            .map(|y| {
+                let (prefix, scale) = if view.y_scale == YScale::LogImpedance {
+                    si_prefix(y)
+                } else {
+                    ("", 1.0)
+                };
+                let text = format!("{}{prefix}", y_tick_text(y / scale, step.min(y) / scale));
+                (
+                    y,
+                    painter.layout_no_wrap(
+                        text,
+                        font.clone(),
+                        chart_color(painter.ctx(), TEXT_COLOR),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        (labels, opts.y_label.to_owned())
+    } else {
+        let divisions = view.y_divisions.clamp(2, 30);
+        let step = (view.y_max - view.y_min) / divisions as f64;
+        let (labels, caption) = y_tick_labels(painter, view, opts.y_label);
+        (
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| (view.y_min + index as f64 * step, label))
+                .collect(),
+            caption,
+        )
+    };
+    if view.y_scale != YScale::Linear {
+        let key = if view.y_scale == YScale::LogImpedance {
+            Text::LogYFloor
+        } else {
+            Text::LogVswrFloor
+        };
+        caption = format!("{caption} ({})", language(painter.ctx()).text(key));
+    }
+    let mut label_bottom = f32::INFINITY;
+    for (y, label) in ticks {
         let sy = mapping.to_screen(view.x_min, y).y;
         painter.line_segment(
             [Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)],
             Stroke::new(1.0, chart_color(painter.ctx(), GRID_COLOR)),
         );
+        if view.y_scale.floor().is_some()
+            && mapping.y_span > 2.0
+            && (y.log10() - y.log10().round()).abs() > 1e-9
+        {
+            continue;
+        }
+        if sy + label.size().y / 2.0 > label_bottom - 3.0 {
+            continue;
+        }
+        label_bottom = sy - label.size().y / 2.0;
         let left = (rect.left() - 4.0 - label.size().x).max(rect.left() - MARGIN_LEFT + 2.0);
         painter.galley(
             Pos2::new(left, sy - label.size().y / 2.0),
@@ -1667,7 +1883,8 @@ mod tests {
             egui::Modifiers::CTRL,
         ] {
             let ctx = egui::Context::default();
-            let mut first = PlotView::new(1e6, 3e6, 0.0, 100.0);
+            let mut first = PlotView::new(1e6, 3e6, LOG_Y_FLOOR, 100.0);
+            first.y_scale = YScale::LogImpedance;
             let mut second = PlotView::new(1e6, 3e6, -100.0, -20.0);
             let mut layers = [
                 test_layer(2, &mut first, &[(1e6, 25.0), (3e6, 75.0)]),
@@ -1701,7 +1918,10 @@ mod tests {
                 0.04,
             );
             assert_eq!(locks, [(2, ViewLock::Unchanged), (4, ViewLock::Locked)]);
-            assert_eq!((layers[0].view.y_min, layers[0].view.y_max), (0.0, 100.0));
+            assert_eq!(
+                (layers[0].view.y_min, layers[0].view.y_max),
+                (LOG_Y_FLOOR, 100.0)
+            );
             assert_eq!(
                 layers[1].view.y_min != -100.0,
                 modifiers.shift || modifiers.ctrl
@@ -2217,7 +2437,10 @@ mod tests {
                     label.size().x <= MARGIN_LEFT - 8.0
                         && label.job.sections[0].format.font_id.size == LABEL_FONT_SIZE
                 }));
-                assert!(caption.starts_with("ohm ("), "{caption}");
+                assert!(
+                    caption.starts_with("ohm (") || ["aohm", "uohm"].contains(&caption.as_str()),
+                    "{caption}"
+                );
             });
             output.drop_without_applying_deltas();
             assert_eq!((view.y_min, view.y_max), (min, max));
@@ -2345,6 +2568,156 @@ mod tests {
         assert_eq!(nearest_y(&points, 2.9, false), Some(40.0));
         let all_bad = [(1.0, f64::NAN), (f64::NAN, 2.0)];
         assert_eq!(nearest_y(&all_bad, 1.0, false), None);
+    }
+
+    #[test]
+    fn log_y_clips_only_display_values_and_keeps_decades_and_inverse_consistent() {
+        let mut view = PlotView::new(1e6, 1e9, LOG_Y_FLOOR, 1e3);
+        view.y_scale = YScale::LogImpedance;
+        let mapping = Mapping::new(&view, true, rect());
+        let floor = mapping.to_screen(1e6, LOG_Y_FLOOR).y;
+        for value in [-1e200, -50.0, -0.0, 0.0, 1e-6, LOG_Y_FLOOR] {
+            assert_eq!(mapping.to_screen(1e6, value).y, floor);
+        }
+        for value in [1e-3, 1e-2, 1.0, 1e2, 1e3] {
+            let pos = mapping.to_screen(1e6, value);
+            near(mapping.value_at(pos.y), value);
+        }
+        near(
+            f64::from(mapping.to_screen(1e6, 1.0).y),
+            f64::from(rect().center().y),
+        );
+        assert!(view.y_scale.to_axis(f64::NAN).is_nan());
+        assert!(!view.y_scale.to_axis(f64::INFINITY).is_finite());
+        view.y_scale = YScale::Linear;
+        view.reset(1e6, 1e9, -100.0, 100.0);
+        let linear = Mapping::new(&view, false, rect());
+        assert_ne!(linear.to_screen(1e6, -50.0), linear.to_screen(1e6, 0.0));
+        near(linear.value_at(linear.to_screen(1e6, -50.0).y), -50.0);
+    }
+
+    #[test]
+    fn log_y_floor_is_unit_specific_and_fit_handles_all_clipped_and_extreme_data() {
+        for scale in [YScale::LogImpedance, YScale::LogVswr] {
+            let floor = scale.floor().unwrap();
+            let mut view = PlotView::new(1e6, 1e9, -100.0, 100.0);
+            view.y_scale = scale;
+            for points in [
+                vec![(1e6, -200.0), (1e9, 0.0)],
+                vec![(1e6, floor / 2.0)],
+                vec![(1e6, floor), (1e9, f64::MAX)],
+            ] {
+                fit_view(&mut view, &options(&points, true));
+                assert_eq!(view.y_min, floor);
+                assert!(view.y_max.is_finite() && view.y_max > floor);
+                assert_eq!(view.y_scale, scale);
+            }
+            view.y_min = f64::INFINITY;
+            view.y_max = f64::NAN;
+            view.ensure_y_view();
+            assert_eq!((view.y_min, view.y_max), (floor, 10.0 * floor));
+        }
+    }
+
+    #[test]
+    fn log_y_rendering_keeps_finite_runs_and_raw_signed_readouts() {
+        let points = [
+            (1e6, -10.0),
+            (2e6, 0.0),
+            (3e6, 1e-6),
+            (4e6, 10.0),
+            (5e6, f64::NAN),
+            (6e6, 100.0),
+            (7e6, -50.0),
+        ];
+        let opts = options(&points, false);
+        let mut view = PlotView::new(1e6, 7e6, LOG_Y_FLOOR, 1000.0);
+        view.y_scale = YScale::LogImpedance;
+        let (_, paths) = frame(&egui::Context::default(), &mut view, &opts, vec![], 0.0);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].len(), 4);
+        assert_eq!(paths[1].len(), 2);
+        assert_eq!(paths[0][0].y, paths[0][1].y);
+        assert_eq!(paths[0][1].y, paths[0][2].y);
+        assert_eq!(nearest_y(&opts.series[0].points, 1e6, false), Some(-10.0));
+        assert_eq!(opts.series[0].points[6].1, -50.0);
+        view.y_scale = YScale::Linear;
+        fit_view(&mut view, &opts);
+        assert!(view.y_min < -50.0 && view.y_max > 100.0);
+    }
+
+    #[test]
+    fn log_y_zoom_and_pan_use_axis_space_and_refuse_invalid_bounds() {
+        let mut view = PlotView::new(1e6, 1e9, 1e-2, 1e2);
+        view.y_scale = YScale::LogImpedance;
+        let original = view;
+        set_y_bounds(&mut view, -1.0, 1.0);
+        assert_eq!((view.y_min, view.y_max), (0.1, 10.0));
+        for (min, max) in [
+            (1.0, f64::INFINITY),
+            (1.0, 400.0),
+            (2.0, 2.0),
+            (f64::NAN, 2.0),
+        ] {
+            let before = view;
+            set_y_bounds(&mut view, min, max);
+            assert_eq!(view, before);
+        }
+        view = original;
+        pan_view(
+            &mut view,
+            true,
+            rect(),
+            egui::vec2(0.0, rect().height() / 4.0),
+        );
+        near(view.y_min, 0.1);
+        near(view.y_max, 1e3);
+        pan_view(
+            &mut view,
+            true,
+            rect(),
+            egui::vec2(0.0, -10.0 * rect().height()),
+        );
+        near(view.y_min, LOG_Y_FLOOR);
+        near(view.y_max / view.y_min, 1e4);
+    }
+
+    #[test]
+    fn log_y_ticks_show_si_prefixes_and_the_display_floor() {
+        let mut view = PlotView::new(1e6, 1e9, 1e-3, 1e6);
+        view.y_scale = YScale::LogImpedance;
+        let mut opts = options(&[(1e6, -50.0), (1e9, 1e6)], true);
+        let (_, output) =
+            widget_frame(&egui::Context::default(), &mut view, &mut opts, vec![], 0.0);
+        let text = text_shapes(&output);
+        output.drop_without_applying_deltas();
+        for expected in ["1m", "1k", "1M"] {
+            assert!(text.iter().any(|(text, _)| text == expected), "{expected}");
+        }
+        assert!(text.iter().any(|(text, _)| text.contains("floor 1 mohm")));
+    }
+
+    #[test]
+    fn axis_edit_values_accept_si_units_without_changing_the_underlying_unit() {
+        for (text, unit, value) in [
+            ("5 kHz", "Hz", 5e3),
+            ("1GHz", "Hz", 1e9),
+            ("1 mohm", "ohm", 1e-3),
+            ("-50 uohm", "ohm", -50e-6),
+            ("-3 ns", "s", -3e-9),
+            ("-30 dB", "dB", -30.0),
+            ("5", "", 5.0),
+        ] {
+            near(parse_axis_value(text, unit).unwrap(), value);
+            near(
+                parse_axis_value(&format_axis_value(value, unit), unit).unwrap(),
+                value,
+            );
+        }
+        for (text, unit) in [("1 GHz", "ohm"), ("1 m", "dB"), ("bad", "Hz")] {
+            assert_eq!(parse_axis_value(text, unit), None);
+        }
+        assert_eq!(format_axis_value(0.0, "ohm"), "0 ohm");
     }
 
     fn options(points: &[(f64, f64)], log_x: bool) -> PlotOptions<'static> {
@@ -2634,7 +3007,9 @@ mod tests {
 
     #[test]
     fn wheel_modifiers_zoom_the_expected_axes_at_the_cursor() {
-        for log_x in [false, true] {
+        for (log_x, scale) in [false, true].into_iter().flat_map(|log_x| {
+            [YScale::Linear, YScale::LogImpedance, YScale::LogVswr].map(|scale| (log_x, scale))
+        }) {
             for modifiers in [
                 egui::Modifiers::NONE,
                 egui::Modifiers::SHIFT,
@@ -2642,7 +3017,9 @@ mod tests {
                 egui::Modifiers::COMMAND,
             ] {
                 let opts = options(&[(1e6, -100.0), (1e9, 100.0)], log_x);
-                let original = PlotView::new(1e6, 1e9, -100.0, 100.0);
+                let mut original = PlotView::new(1e6, 1e9, -100.0, 100.0);
+                original.y_scale = scale;
+                original.ensure_y_view();
                 let mut view = original;
                 let ctx = egui::Context::default();
                 let cursor = Pos2::new(300.0, 200.0);

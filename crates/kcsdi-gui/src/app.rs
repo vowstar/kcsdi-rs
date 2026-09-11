@@ -1024,8 +1024,13 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     }
                     ui.label(language.text(Text::Display));
                     if widgets::plot::log_x_control(ui, &mut state.workspace.log_x) {
+                        state.workspace.ensure_log_x_view();
                         ui.ctx().request_repaint();
                     }
+                    if let Some(trace) = state.workspace.selected_mut() {
+                        panels::workspace_panel::log_y_control(ui, trace, language);
+                    }
+                    panels::workspace_panel::view_fields(ui, state);
                 });
         });
 }
@@ -1300,6 +1305,51 @@ mod tests {
             .selected()
             .and_then(|trace| trace.completed.as_ref())
             .map(|snapshot| snapshot.data.clone())
+    }
+
+    #[test]
+    fn y_log_and_manual_views_do_not_change_acquisition_or_completed_exports() {
+        use crate::widgets::plot::YScale;
+        let mut app = active_impedance_app();
+        let trace = app.state.workspace.selected_mut().unwrap();
+        Arc::make_mut(trace.completed.as_mut().unwrap()).data.points[0].values =
+            vec![50.0, -30.0, -40.0];
+        let data = complete_data(&app).unwrap();
+        let plan = app.state.workspace.plan().unwrap();
+        let request = app.state.request_id;
+        let range = app.state.workspace.range;
+        for scale in [YScale::LogImpedance, YScale::Linear] {
+            let trace = app.state.workspace.selected_mut().unwrap();
+            trace.view.y_scale = scale;
+            trace.needs_fit = true;
+            plot_frame(&mut app);
+            app.state.reconcile_plan();
+            assert_eq!(complete_data(&app).as_ref(), Some(&data));
+            assert_eq!(app.state.workspace.plan().unwrap(), plan);
+            assert_eq!(app.state.request_id, request);
+            assert_eq!(app.state.workspace.range, range);
+            let view = app.state.workspace.selected().unwrap().view;
+            if scale == YScale::Linear {
+                assert!(view.y_min < -40.0);
+            } else {
+                assert_eq!(view.y_min, 1e-3);
+            }
+        }
+        let trace = app.state.workspace.selected_mut().unwrap();
+        trace.view.y_scale = YScale::LogImpedance;
+        trace.view.y_min = 1e-3;
+        trace.view.y_max = 1e4;
+        trace.view_locked = true;
+        trace.needs_fit = false;
+        app.state.workspace.x_view.x_min = 1.2e6;
+        app.state.workspace.x_view.x_max = 1.8e6;
+        plot_frame(&mut app);
+        let view = app.state.workspace.selected().unwrap().view;
+        assert_eq!(
+            (view.x_min, view.x_max, view.y_min, view.y_max),
+            (1.2e6, 1.8e6, 1e-3, 1e4)
+        );
+        assert_eq!(complete_data(&app).as_ref(), Some(&data));
     }
 
     #[test]

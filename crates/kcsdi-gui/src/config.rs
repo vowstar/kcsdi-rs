@@ -34,7 +34,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Work
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 8;
+pub const CONFIG_VERSION: u32 = 9;
 
 fn legacy_config_version() -> u32 {
     1
@@ -124,6 +124,7 @@ pub struct YViewConfig {
     pub max: f64,
     pub divisions: usize,
     pub locked: bool,
+    pub log_y: bool,
 }
 
 impl Default for YViewConfig {
@@ -133,6 +134,7 @@ impl Default for YViewConfig {
             max: 1.0,
             divisions: 8,
             locked: false,
+            log_y: false,
         }
     }
 }
@@ -287,6 +289,7 @@ impl TraceConfig {
             max: trace.view.y_max,
             divisions: trace.view.y_divisions,
             locked: trace.view_locked,
+            log_y: trace.view.y_scale.floor().is_some(),
         }
         .valid();
         let (min, max) = if valid_y {
@@ -299,6 +302,7 @@ impl TraceConfig {
             max,
             divisions: trace.view.y_divisions.clamp(2, 30),
             locked: valid_y && trace.view_locked,
+            log_y: trace.view.y_scale.floor().is_some(),
         });
         config.analysis = Some(trace.analysis.config());
         config
@@ -309,13 +313,25 @@ impl TraceConfig {
         trace.view.x_min = x_view.min;
         trace.view.x_max = x_view.max;
         if let Some(view) = self.y_view {
+            if view.log_y
+                && let Some(scale) = trace.settings.display.logarithmic_y()
+            {
+                trace.view.y_scale = scale;
+            }
             trace.view.y_divisions = view.divisions.clamp(2, 30);
-            if view.valid() {
+            if view.valid()
+                && trace
+                    .view
+                    .y_scale
+                    .floor()
+                    .is_none_or(|floor| view.min >= floor && view.max.log10() > view.min.log10())
+            {
                 trace.view.y_min = view.min;
                 trace.view.y_max = view.max;
                 trace.view_locked = view.locked;
                 trace.needs_fit = !view.locked;
             }
+            trace.view.ensure_y_view();
         }
         if let Some(analysis) = &self.analysis {
             trace.analysis.restore_config(analysis);
@@ -950,6 +966,7 @@ visible = false
                         max,
                         divisions: 0,
                         locked: true,
+                        log_y: false,
                     }),
                     ..Default::default()
                 }],
@@ -981,6 +998,7 @@ visible = false
                 max: 5e-18,
                 divisions: usize::MAX,
                 locked,
+                log_y: false,
             };
             let config = WorkspaceConfig {
                 traces: vec![TraceConfig {
@@ -996,6 +1014,61 @@ visible = false
             assert_eq!(trace.view.y_divisions, 30);
             assert_eq!(trace.view_locked, locked);
             assert_eq!(trace.needs_fit, !locked);
+        }
+    }
+
+    #[test]
+    fn log_y_views_round_trip_and_reject_incompatible_units_and_bounds() {
+        use crate::widgets::plot::YScale;
+        for display in S11Display::ALL {
+            let mut state = AppState::default();
+            let trace = state.workspace.selected_mut().unwrap();
+            trace.update_settings(TraceSettings {
+                display: TraceDisplay::S11(display),
+                ..Default::default()
+            });
+            if let Some(scale) = trace.settings.display.logarithmic_y() {
+                trace.view.y_scale = scale;
+                trace.view.y_min = scale.floor().unwrap();
+                trace.view.y_max = 1e3;
+                trace.view_locked = true;
+            }
+            let view = trace.view;
+            let serialized = toml::to_string(&AppConfig::from_state(&state)).unwrap();
+            let config: AppConfig = toml::from_str(&serialized).unwrap();
+            let mut restored = AppState::default();
+            config.apply_to(&mut restored);
+            assert_eq!(restored.workspace.selected_mut().unwrap().view, view);
+        }
+        for (display, min, max, expected) in [
+            ("impedance", -1.0, 1.0, YScale::LogImpedance),
+            ("vswr", 1e-3, 100.0, YScale::LogVswr),
+            ("s21_delay", -1e-9, 1e-9, YScale::Linear),
+            ("spec", -100.0, 0.0, YScale::Linear),
+        ] {
+            let config = WorkspaceConfig {
+                traces: vec![TraceConfig {
+                    display: display.into(),
+                    y_view: Some(YViewConfig {
+                        min,
+                        max,
+                        locked: true,
+                        log_y: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let restored = config.restore();
+            let trace = &restored.traces[0];
+            assert_eq!(trace.view.y_scale, expected);
+            if let Some(floor) = expected.floor() {
+                assert!(trace.view.y_min >= floor && trace.view.y_max > trace.view.y_min);
+                assert!(!trace.view_locked && trace.needs_fit);
+            } else {
+                assert_eq!((trace.view.y_min, trace.view.y_max), (min, max));
+            }
         }
     }
 
@@ -1459,7 +1532,13 @@ rbw = "30k"
         cfg.apply_to(&mut state);
         let upgraded = AppConfig::from_state(&state);
         let saved = toml::to_string_pretty(&upgraded).unwrap();
-        assert!(!saved.contains("log_y"));
+        assert!(
+            upgraded
+                .workspace
+                .traces
+                .iter()
+                .all(|trace| trace.y_view.is_none_or(|view| !view.log_y))
+        );
         let parsed: AppConfig = toml::from_str(&saved).unwrap();
         assert_eq!(upgraded, parsed);
     }

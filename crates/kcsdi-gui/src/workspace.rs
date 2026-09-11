@@ -16,7 +16,7 @@ use crate::analysis_tools::AnalysisTools;
 use crate::i18n::{Language, Text};
 use crate::preview::PreviewEnvelope;
 use crate::state::{AppMode, DEVICE_MODEL, S11Display, S21Display};
-use crate::widgets::plot::PlotView;
+use crate::widgets::plot::{PlotView, YScale};
 use crate::widgets::smith::SmithView;
 
 pub use crate::acquisition::MAX_TRACES;
@@ -48,6 +48,19 @@ impl TraceDisplay {
 
     pub fn is_smith(self) -> bool {
         self == Self::S11(S11Display::Smith)
+    }
+
+    pub fn logarithmic_y(self) -> Option<YScale> {
+        match self {
+            Self::S11(
+                S11Display::Impedance
+                | S11Display::Magnitude
+                | S11Display::Resistance
+                | S11Display::Reactance,
+            ) => Some(YScale::LogImpedance),
+            Self::S11(S11Display::Vswr) => Some(YScale::LogVswr),
+            _ => None,
+        }
     }
 
     pub fn default_y(self) -> (f64, f64) {
@@ -264,6 +277,7 @@ impl TraceState {
 
     pub fn update_settings(&mut self, settings: TraceSettings) {
         if self.settings.display != settings.display {
+            self.view.y_scale = YScale::Linear;
             let (low, high) = settings.display.default_y();
             self.view.y_min = low;
             self.view.y_max = high;

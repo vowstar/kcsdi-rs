@@ -368,9 +368,29 @@ catalog! {
     RunForDisplay => ("Run a sweep for this display", "请运行扫描以更新此视图"),
     LogX => ("LOG X", "X 对数"),
     LogXHelp => (
-        "Base-10 frequency axis. Only positive frequencies can be shown. Changes the display, not sweep sampling. Y remains linear.",
-        "以 10 为底的频率轴，仅显示正频率。只改变显示，不改变扫描采样。Y 轴保持线性。"
+        "Base-10 frequency axis. Only positive frequencies can be shown. Changes the display, not sweep sampling.",
+        "以 10 为底的频率轴，仅显示正频率。只改变显示，不改变扫描采样。"
     ),
+    LogY => ("LOG Y", "Y 对数"),
+    LogYHelp => (
+        "Base-10 impedance axis. Values below 1 mohm, including negatives, are drawn at 1 mohm. Readouts and exports keep the measured values.",
+        "以 10 为底的阻抗轴。小于 1 毫欧的值，包括负值，均画在 1 毫欧处。读数与导出保留实测值。"
+    ),
+    LogVswrHelp => (
+        "Base-10 VSWR axis with a display floor of 1. Readouts and exports keep the measured values.",
+        "以 10 为底的驻波比轴，显示下限为 1。读数与导出保留实测值。"
+    ),
+    LogYFloor => ("LOG Y, floor 1 mohm", "Y 对数，下限 1 毫欧"),
+    LogVswrFloor => ("LOG Y, floor 1", "Y 对数，下限 1"),
+    AxisRange => ("Display range", "显示范围"),
+    AxisRangeHelp => ("X is shared by frequency plots. Y applies to the selected trace. Does not change sweep sampling. SI prefixes are accepted, for example 5 kHz or 1 mohm.", "X 适用于所有频率图，Y 只适用于当前轨迹。不改变扫描采样。支持 SI 前缀，例如 5 kHz 或 1 mohm。"),
+    XMinimum => ("X min", "X 下限"),
+    XMaximum => ("X max", "X 上限"),
+    YMinimum => ("Y min", "Y 下限"),
+    YMaximum => ("Y max", "Y 上限"),
+    ApplyRange => ("Apply range", "应用范围"),
+    FitRange => ("Auto fit", "自动适配"),
+    InvalidAxisRange => ("Each minimum must be below its maximum. Log X requires positive bounds. Log Y cannot go below its display floor.", "下限必须小于上限。X 对数范围必须为正，Y 对数范围不能低于显示下限。"),
     AllTracesHidden => ("All traces hidden", "所有曲线已隐藏"),
     NoPositiveData => ("No data at positive frequencies", "没有正频率数据"),
     NoData => ("No data", "暂无数据"),
