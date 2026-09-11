@@ -79,9 +79,8 @@ fn frame(row: &PlannedSegment, settings: &PointSettings) -> SweepData {
     }
 }
 
-pub(crate) fn example_snapshot() -> CompletedSweep {
-    let settings = receiver("s11", Format::Z);
-    let plan = SegmentPlan::new(
+fn example_plan(settings: &PointSettings) -> SegmentPlan {
+    SegmentPlan::new(
         &[
             Segment {
                 start_hz: 5000,
@@ -94,10 +93,15 @@ pub(crate) fn example_snapshot() -> CompletedSweep {
                 max_step_hz: 1_000_000,
             },
         ],
-        &settings,
+        settings,
         &Model::Kc901V.capabilities(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+pub(crate) fn example_snapshot() -> CompletedSweep {
+    let settings = receiver("s11", Format::Z);
+    let plan = example_plan(&settings);
     let mut joiner = SegmentJoiner::new(plan.clone());
     for row in plan.segments() {
         joiner.append(frame(row, &settings)).unwrap();

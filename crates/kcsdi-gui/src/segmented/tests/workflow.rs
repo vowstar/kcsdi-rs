@@ -10,6 +10,101 @@ use crate::spreadsheet::FrozenSnapshots;
 use crate::widgets::plot::{self, CartesianLayer, Marker, PlotOptions, PlotView};
 use std::time::Instant;
 
+struct DelayedTail {
+    peer: Peer,
+    until: Option<Instant>,
+}
+
+impl Transport for DelayedTail {
+    fn send_with_timeout(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
+        if bytes == b"\x03" {
+            self.until = Some(Instant::now() + Duration::from_millis(2200));
+        }
+        if bytes.windows(5).any(|part| part == b",run,") {
+            assert!(
+                self.until.is_none(),
+                "new run before residual data was drained"
+            );
+        }
+        self.peer.send_with_timeout(bytes, timeout)
+    }
+
+    fn recv_line(&mut self, timeout: Duration) -> Result<String> {
+        if let Some(until) = self.until {
+            if let Some(left) = until.checked_duration_since(Instant::now()) {
+                std::thread::sleep(left.min(timeout));
+            }
+            if Instant::now() < until {
+                return Err(Error::Timeout);
+            }
+            self.until = None;
+        }
+        self.peer.recv_line(timeout)
+    }
+}
+
+#[test]
+fn second_segment_slow_cancel_fences_the_next_complete_acquisition() {
+    let plan = example_plan(&PointSettings::Spec {
+        cal: Cal::CalOff,
+        rbw: Rbw::R1k,
+        lo: Lo::HighLo,
+        ref_level_dbm: -10,
+    });
+    let mut peer = Peer::new(&plan);
+    let mut following = Peer::new(&plan);
+    for frame in &mut following.frames {
+        for line in frame {
+            if let Some(frequency) = line.strip_suffix(",-10") {
+                *line = format!("{frequency},-20");
+            }
+        }
+    }
+    peer.frames.extend(following.frames);
+    let sent = peer.sent.clone();
+    let mut device = Device::new(DelayedTail { peer, until: None });
+    let cancel = CancellationToken::default();
+    let mut cancelled_at = None;
+    let result = acquire(&mut device, &plan, &cancel, |_, progress| {
+        if progress.index == 1 && progress.segment_points == 0 {
+            assert_eq!(progress.acquired, 1001);
+            cancelled_at = Some(Instant::now());
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(cancelled_at.unwrap().elapsed() >= Duration::from_millis(2200));
+    assert!(!device.requires_reconnect());
+    assert_eq!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(",run,"))
+            .count(),
+        2
+    );
+
+    let (data, metadata) =
+        acquire(&mut device, &plan, &CancellationToken::default(), |_, _| {}).unwrap();
+    metadata.validate(&plan, &data).unwrap();
+    assert_eq!(data.points.len(), 1951);
+    assert!(data.points.iter().all(|point| point.values == [-20.0]));
+    assert_eq!(metadata.received, [1001, 951]);
+    assert_eq!(metadata.origins[1000].segment, 0);
+    assert_eq!(metadata.origins[1001].point, 1);
+    let sent = sent.lock().unwrap();
+    let runs: Vec<_> = sent
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(",run,"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(runs.len(), 4);
+    let abort = sent.iter().position(|line| line == "\x03").unwrap();
+    let identity = sent.iter().position(|line| line == "$device\n").unwrap();
+    assert!(runs[1] < abort && abort < identity && identity < runs[2]);
+}
+
 #[test]
 fn nonuniform_markers_holds_and_recording_use_completed_raw_rows() {
     let first = example_snapshot();
