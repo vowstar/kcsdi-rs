@@ -385,7 +385,7 @@ impl<T: Transport> Device<T> {
                 params.start_hz,
                 Some(params.stop_hz),
             );
-            self.send_controlled(run.as_bytes(), cancel)?;
+            self.send_finite_run(&run, params.points, cancel)?;
             self.collect_controlled(
                 StreamMode::S11,
                 Some(params.format),
@@ -428,7 +428,7 @@ impl<T: Transport> Device<T> {
                 params.start_hz,
                 Some(params.stop_hz),
             );
-            self.send_controlled(run.as_bytes(), cancel)?;
+            self.send_finite_run(&run, params.points, cancel)?;
             self.collect_controlled(
                 StreamMode::S21,
                 Some(params.format),
@@ -474,7 +474,7 @@ impl<T: Transport> Device<T> {
                 Some(params.stop_hz),
                 None,
             );
-            self.send_controlled(run.as_bytes(), cancel)?;
+            self.send_finite_run(&run, params.points, cancel)?;
             self.collect_controlled(
                 StreamMode::Spec,
                 None,
@@ -572,6 +572,18 @@ impl<T: Transport> Device<T> {
         cancel.check()?;
         self.transport.send(data)?;
         cancel.check()
+    }
+
+    fn send_finite_run(
+        &mut self,
+        run: &str,
+        points: u32,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        cancel.check()?;
+        // The device may start before cancellation is observed after the write.
+        self.finite_deadline = Some(Instant::now() + self.sweep_timeout(points));
+        self.send_controlled(run.as_bytes(), cancel)
     }
 
     fn set_rbw(&mut self, rbw: Rbw, cancel: &CancellationToken) -> Result<()> {
@@ -887,7 +899,14 @@ impl<T: Transport> Device<T> {
         mut progress: impl FnMut(SweepProgress<'_>),
     ) -> Result<SweepData> {
         let started = Instant::now();
-        self.finite_deadline = (expected_points > 1).then(|| started + timeout);
+        let timeout = if expected_points > 1 {
+            self.finite_deadline
+                .get_or_insert(started + timeout)
+                .saturating_duration_since(started)
+        } else {
+            self.finite_deadline = None;
+            timeout
+        };
         let expected_format = format.map_or("", Format::as_str);
         let expected_header = format.map_or_else(
             || mode.name().to_string(),
@@ -1549,6 +1568,25 @@ mod tests {
         assert_eq!(dev.sweep_s11(&s11_params(3)).unwrap().points.len(), 3);
         assert!(dev.finite_deadline.is_none());
         assert!(dev.transport.incoming.is_empty());
+    }
+
+    #[test]
+    fn cancellation_on_the_run_write_keeps_the_finite_tail_budget() {
+        let cancel = CancellationToken::default();
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_sweep(StreamMode::S11, 3);
+        mock.queue_identity();
+        mock.cancel_on_send = Some((7, cancel.clone()));
+        mock.read_delay = Duration::from_millis(250);
+        let mut dev = Device::new(mock);
+        let result =
+            dev.sweep_s11_controlled(&s11_params(3), &cancel, |_| panic!("run was cancelled"));
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(dev.transport.sent_text().contains(",run,"));
+        assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+        assert!(dev.transport.incoming.is_empty());
+        assert!(!dev.requires_reconnect());
+        assert!(dev.finite_deadline.is_none());
     }
 
     #[test]
