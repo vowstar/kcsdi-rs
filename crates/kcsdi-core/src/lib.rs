@@ -25,6 +25,7 @@ pub mod discovery;
 pub mod error;
 pub mod model;
 pub mod protocol;
+pub mod segments;
 pub mod source;
 pub mod table;
 pub mod touchstone;
