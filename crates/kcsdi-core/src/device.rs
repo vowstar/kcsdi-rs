@@ -28,8 +28,15 @@ mod source_session;
 /// This is not a documented minimum delay for every command.
 const COMMAND_GAP: Duration = Duration::from_millis(100);
 
-/// One host budget for interrupt synchronization or best-effort close.
+/// Minimum interrupt synchronization budget, also used for best-effort close.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn finite_cleanup_timeout(deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or_default()
+        .max(CLEANUP_TIMEOUT)
+}
 
 fn stop_command(mode: StreamMode) -> &'static str {
     match mode {
@@ -154,6 +161,7 @@ pub struct Device<T: Transport> {
     caps: Capabilities,
     active_mode: Option<StreamMode>,
     last_rbw: Option<Rbw>,
+    finite_deadline: Option<Instant>,
     session_failed: bool,
     source: SourceReport,
     source_kind: Option<SourceKind>,
@@ -206,6 +214,7 @@ impl<T: Transport> Device<T> {
             caps: model.capabilities(),
             active_mode: None,
             last_rbw: None,
+            finite_deadline: None,
             session_failed: false,
             source: SourceReport::default(),
             source_kind: None,
@@ -579,8 +588,11 @@ impl<T: Transport> Device<T> {
     }
 
     fn finish_sweep(&mut self, result: Result<SweepData>) -> Result<SweepData> {
+        let deadline = self.finite_deadline.take();
         if matches!(result, Err(Error::Cancelled)) {
-            self.cancel_sweep(CLEANUP_TIMEOUT)?;
+            // Interrupted finite frames can continue transmitting (section 1.4).
+            // Preserve their original deadline without extending it per reply.
+            self.cancel_sweep(finite_cleanup_timeout(deadline, Instant::now()))?;
             return Err(Error::Cancelled);
         }
         let result = self.record_result(result);
@@ -653,6 +665,7 @@ impl<T: Transport> Device<T> {
     fn reset_measurement(&mut self) {
         self.active_mode = None;
         self.last_rbw = None;
+        self.finite_deadline = None;
         self.packets = PacketParser::new();
         self.streams = StreamParser::new();
     }
@@ -874,6 +887,7 @@ impl<T: Transport> Device<T> {
         mut progress: impl FnMut(SweepProgress<'_>),
     ) -> Result<SweepData> {
         let started = Instant::now();
+        self.finite_deadline = (expected_points > 1).then(|| started + timeout);
         let expected_format = format.map_or("", Format::as_str);
         let expected_header = format.map_or_else(
             || mode.name().to_string(),
@@ -1491,6 +1505,53 @@ mod tests {
     }
 
     #[test]
+    fn finite_cleanup_uses_remaining_frame_budget_or_short_grace() {
+        let now = Instant::now();
+        assert_eq!(finite_cleanup_timeout(None, now), CLEANUP_TIMEOUT);
+        assert_eq!(finite_cleanup_timeout(Some(now), now), CLEANUP_TIMEOUT);
+        assert_eq!(
+            finite_cleanup_timeout(Some(now + Duration::from_secs(1)), now),
+            CLEANUP_TIMEOUT
+        );
+        let deadline = now + Duration::from_secs(12);
+        assert_eq!(
+            finite_cleanup_timeout(Some(deadline), now),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            finite_cleanup_timeout(Some(deadline), now + Duration::from_secs(5)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn cancelled_finite_sweep_drains_a_tail_longer_than_short_cleanup() {
+        let mut mock = MockTransport::with_lines(&[]);
+        mock.queue_sweep(StreamMode::Spec, 3);
+        mock.queue_identity();
+        mock.queue_sweep(StreamMode::S11, 3);
+        mock.read_delay = Duration::from_millis(400);
+        let mut dev = Device::new(mock);
+        let cancel = CancellationToken::default();
+        let mut cancelled_at = None;
+        let result = dev.sweep_spec_controlled(&spec_params(3), &cancel, |prefix| {
+            if prefix.points.len() == 1 {
+                cancelled_at = Some(Instant::now());
+                cancel.cancel();
+            }
+        });
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(cancelled_at.unwrap().elapsed() > CLEANUP_TIMEOUT);
+        assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
+        assert!(!dev.requires_reconnect());
+        assert!(dev.finite_deadline.is_none());
+        dev.transport.read_delay = Duration::ZERO;
+        assert_eq!(dev.sweep_s11(&s11_params(3)).unwrap().points.len(), 3);
+        assert!(dev.finite_deadline.is_none());
+        assert!(dev.transport.incoming.is_empty());
+    }
+
+    #[test]
     fn cancellation_during_setup_does_not_start_a_sweep() {
         for send in 1..=6 {
             let cancel = CancellationToken::default();
@@ -1505,6 +1566,7 @@ mod tests {
             assert!(!dev.transport.sent_text().contains(",run,"));
             assert!(dev.transport.sent.ends_with(b"\x03$device\n"));
             assert!(!dev.requires_reconnect());
+            assert!(dev.finite_deadline.is_none());
         }
     }
 
