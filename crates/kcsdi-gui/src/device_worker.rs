@@ -3109,7 +3109,12 @@ mod tests {
                 line.clear();
                 peer.read_line(&mut line).unwrap();
                 assert_eq!(line, "$local\n");
-                assert_eq!(peer.read(&mut byte).unwrap(), 0);
+                // Closing with an unread status prefix can reset TCP after local.
+                match peer.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("expected socket closure after local, got {result:?}"),
+                }
             });
             let worker = scope.spawn(move || {
                 device_worker(
