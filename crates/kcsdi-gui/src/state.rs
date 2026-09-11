@@ -492,6 +492,7 @@ impl AppState {
         self.function = function;
         self.workspace.editor = None;
         self.workspace.frequency_editor.cancel();
+        self.workspace.segment_editor.cancel();
         self.workspace.run_editor.cancel();
     }
 

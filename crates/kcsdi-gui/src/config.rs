@@ -28,13 +28,13 @@ use crate::desktop::{DesktopConfig, DeviceProfile};
 use crate::i18n::LanguagePreference;
 use crate::state::{AppMode, AppState, S11Display, S21Display};
 use crate::widgets::{plot::PlotView, smith::SmithView};
-use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, TraceState, Workspace};
+use crate::workspace::{SweepMode, SweepRange, TraceDisplay, TraceSettings, TraceState, Workspace};
 
 /// Environment variable that overrides the config file path.
 pub const ENV_CONFIG_PATH: &str = "KCSDI_CONFIG_PATH";
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 9;
+pub const CONFIG_VERSION: u32 = 10;
 
 fn legacy_config_version() -> u32 {
     1
@@ -79,7 +79,11 @@ pub struct WorkspaceConfig {
     pub start_hz: f64,
     pub stop_hz: f64,
     pub points: u32,
+    #[serde(skip_serializing)]
     pub list_mode: bool,
+    #[serde(default)]
+    pub sweep_mode: Option<SweepMode>,
+    pub segments: Vec<kcsdi_core::segments::Segment>,
     pub frequencies_hz: Vec<u64>,
     pub run: crate::run_settings::RunSettings,
     pub log_x: bool,
@@ -177,14 +181,10 @@ impl XViewConfig {
             workspace.log_x,
         );
         if workspace.log_x
-            && workspace.list_mode
             && start <= 0.0
-            && let Some(&positive) = workspace
-                .frequencies_hz
-                .iter()
-                .find(|&&hz| hz > 0 && (hz as f64) < stop)
+            && let Some(positive) = workspace.positive_grid_start().filter(|&hz| hz < stop)
         {
-            view.min = positive as f64;
+            view.min = positive;
         }
         view
     }
@@ -401,7 +401,9 @@ impl WorkspaceConfig {
             start_hz: workspace.range.start_hz,
             stop_hz: workspace.range.stop_hz,
             points: workspace.range.points,
-            list_mode: workspace.list_mode,
+            list_mode: false,
+            sweep_mode: Some(workspace.sweep_mode),
+            segments: workspace.segments.clone(),
             frequencies_hz: workspace.frequencies_hz.clone(),
             run: workspace.run.clone(),
             log_x: workspace.log_x,
@@ -425,7 +427,16 @@ impl WorkspaceConfig {
         let mut workspace =
             Workspace::empty(SweepRange::new(self.start_hz, self.stop_hz, self.points));
         workspace.log_x = self.log_x;
-        workspace.list_mode = self.list_mode;
+        workspace.sweep_mode = self.sweep_mode.unwrap_or(if self.list_mode {
+            SweepMode::List
+        } else {
+            SweepMode::Range
+        });
+        if self.segments.len() <= kcsdi_core::segments::MAX_SEGMENTS {
+            workspace.segments = self.segments.clone();
+        } else {
+            warn!("segment definitions exceed the application limit, edit the plan before running");
+        }
         workspace.frequencies_hz = self.frequencies_hz.clone();
         workspace.run = self.run.clone();
         let x_view = self
@@ -1268,6 +1279,89 @@ path = "/dev/serial/by-id/unavailable"
         assert!(!restarted.any_running());
         assert!(!restarted.source.busy());
         assert!(!restarted.calibration.busy());
+    }
+
+    #[test]
+    fn version_nine_range_and_list_modes_migrate_without_changing_their_grids() {
+        for list in [false, true] {
+            let text = format!(
+                "version = 9\n[workspace]\nlist_mode = {list}\nfrequencies_hz = [5000, 10000, 1000000]\nstart_hz = 1000000.0\nstop_hz = 3000000.0\npoints = 201\n"
+            );
+            let config: AppConfig = toml::from_str(&text).unwrap();
+            assert!(config.workspace.sweep_mode.is_none());
+            let mut state = AppState::default();
+            config.apply_to(&mut state);
+            assert_eq!(
+                state.workspace.sweep_mode,
+                if list {
+                    SweepMode::List
+                } else {
+                    SweepMode::Range
+                }
+            );
+            assert_eq!(state.workspace.frequencies_hz, [5000, 10000, 1000000]);
+            assert_eq!(state.workspace.range, SweepRange::new(1e6, 3e6, 201));
+            assert!(!state.any_running());
+            let encoded = toml::to_string(&AppConfig::from_state(&state)).unwrap();
+            assert!(!encoded.contains("list_mode"));
+            assert!(encoded.contains("sweep_mode"));
+        }
+    }
+
+    #[test]
+    fn segmented_config_keeps_inactive_grids_views_and_invalid_plans_without_running() {
+        let snapshot = crate::segmented::tests::example_snapshot();
+        let crate::acquisition::AcquisitionSettings::Segments(plan) = &snapshot.settings else {
+            unreachable!()
+        };
+        let mut state = AppState::default();
+        state.workspace.sweep_mode = SweepMode::Segments;
+        state.workspace.segments = plan.segments().iter().map(|row| row.definition()).collect();
+        state.workspace.selected_mut().unwrap().settings.display =
+            TraceDisplay::S11(S11Display::Impedance);
+        state.workspace.selected_mut().unwrap().settings.cal = Cal::CalOff;
+        state.workspace.frequencies_hz = vec![5000, 5000, 10000];
+        state.workspace.x_view.x_min = 10e6;
+        state.workspace.x_view.x_max = 70e6;
+        let mut config = AppConfig::from_state(&state);
+        let encoded = toml::to_string(&config).unwrap();
+        let restored: AppConfig = toml::from_str(&encoded).unwrap();
+        let mut restarted = AppState::default();
+        restored.apply_to(&mut restarted);
+        assert_eq!(
+            restarted.workspace.plan().unwrap(),
+            state.workspace.plan().unwrap()
+        );
+        assert_eq!(
+            restarted.workspace.frequencies_hz,
+            state.workspace.frequencies_hz
+        );
+        assert_eq!(restarted.workspace.range, state.workspace.range);
+        assert_eq!(restarted.workspace.x_view.x_min, 10e6);
+        assert_eq!(restarted.workspace.x_view.x_max, 70e6);
+        assert!(!restarted.any_running());
+        assert!(
+            restarted
+                .workspace
+                .traces
+                .iter()
+                .all(|trace| trace.completed.is_none())
+        );
+        for invalid in [
+            Vec::new(),
+            vec![kcsdi_core::segments::Segment {
+                start_hz: 0,
+                stop_hz: 1,
+                max_step_hz: 0,
+            }],
+            vec![plan.segments()[0].definition(); 33],
+        ] {
+            config.workspace.segments = invalid;
+            config.apply_to(&mut restarted);
+            assert_eq!(restarted.workspace.sweep_mode, SweepMode::Segments);
+            assert!(restarted.workspace.plan().is_err());
+            assert!(!restarted.any_running());
+        }
     }
 
     #[test]

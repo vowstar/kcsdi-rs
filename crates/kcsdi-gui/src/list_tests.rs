@@ -12,7 +12,7 @@ use crate::workspace::{SweepRange, TraceDisplay, TraceSettings, Workspace};
 
 fn workspace(display: TraceDisplay, frequencies_hz: Vec<u64>) -> Workspace {
     let mut workspace = Workspace {
-        list_mode: true,
+        sweep_mode: crate::workspace::SweepMode::List,
         frequencies_hz,
         ..Default::default()
     };
@@ -64,7 +64,7 @@ fn range_and_list_definitions_are_independent_and_never_share_a_group() {
     );
     workspace.range = SweepRange::new(1_000_000.0, 2_000_000.0, 3);
     let listed = workspace.plan().unwrap().groups[0].settings.clone();
-    workspace.list_mode = false;
+    workspace.sweep_mode = crate::workspace::SweepMode::Range;
     let ranged = workspace.plan().unwrap().groups[0].settings.clone();
     assert_ne!(listed, ranged);
     assert_eq!(
@@ -77,14 +77,14 @@ fn range_and_list_definitions_are_independent_and_never_share_a_group() {
     let list = workspace.frequencies_hz.clone();
     workspace.range = SweepRange::new(-1.0, f64::NAN, 0);
     assert!(workspace.plan().is_err());
-    workspace.list_mode = true;
+    workspace.sweep_mode = crate::workspace::SweepMode::List;
     assert_eq!(workspace.plan().unwrap().groups[0].settings, listed);
     assert_eq!(workspace.frequencies_hz, list);
-    workspace.list_mode = false;
+    workspace.sweep_mode = crate::workspace::SweepMode::Range;
     workspace.range = SweepRange::new(1_000_000.0, 2_000_000.0, 3);
     workspace.frequencies_hz = vec![u64::MAX, 0];
     assert!(workspace.plan().is_ok());
-    workspace.list_mode = true;
+    workspace.sweep_mode = crate::workspace::SweepMode::List;
     assert!(workspace.plan().is_err());
 }
 
@@ -263,7 +263,11 @@ fn list_and_inactive_range_round_trip_without_resuming_acquisition() {
             ..Default::default()
         };
         original.workspace.range = SweepRange::new(200_000_000.0, 400_000_000.0, 101);
-        original.workspace.list_mode = list_mode;
+        original.workspace.sweep_mode = if list_mode {
+            crate::workspace::SweepMode::List
+        } else {
+            crate::workspace::SweepMode::Range
+        };
         original.workspace.reset_frequency_view();
         original.send(WorkerCommand::RunWorkspace(
             original.workspace.plan().unwrap(),
@@ -273,7 +277,10 @@ fn list_and_inactive_range_round_trip_without_resuming_acquisition() {
         let loaded: AppConfig = toml::from_str(&encoded).unwrap();
         let mut restored = AppState::default();
         loaded.apply_to(&mut restored);
-        assert_eq!(restored.workspace.list_mode, list_mode);
+        assert_eq!(
+            restored.workspace.sweep_mode == crate::workspace::SweepMode::List,
+            list_mode
+        );
         assert_eq!(
             restored.workspace.frequencies_hz,
             original.workspace.frequencies_hz

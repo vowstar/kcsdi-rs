@@ -120,12 +120,13 @@ impl KcsdiApp {
         }
         let range = self.state.workspace.range;
         let list = self.state.workspace.requested_list().map(<[u64]>::to_vec);
+        let segments = self.state.workspace.requested_segments().map(<[_]>::to_vec);
         for trace in &mut self.state.workspace.traces {
             if !trace.settings.visible
                 || !group.members.contains(&trace.id)
                 || trace
                     .settings
-                    .acquisition_for(&range, list.as_deref())
+                    .acquisition_for(&range, list.as_deref(), segments.as_deref())
                     .ok()
                     .as_ref()
                     != Some(&group.settings)
@@ -162,13 +163,14 @@ impl KcsdiApp {
         }
         let range = self.state.workspace.range;
         let list = self.state.workspace.requested_list().map(<[u64]>::to_vec);
+        let segments = self.state.workspace.requested_segments().map(<[_]>::to_vec);
         let preview = Arc::new(preview);
         for trace in &mut self.state.workspace.traces {
             if !trace.settings.visible
                 || !preview.group.members.contains(&trace.id)
                 || trace
                     .settings
-                    .acquisition_for(&range, list.as_deref())
+                    .acquisition_for(&range, list.as_deref(), segments.as_deref())
                     .ok()
                     .as_ref()
                     != Some(&preview.group.settings)
@@ -296,6 +298,7 @@ impl KcsdiApp {
             self.closing = true;
             self.state.export.cancel();
             self.state.workspace.frequency_editor.cancel();
+            self.state.workspace.segment_editor.cancel();
             self.state.workspace.run_editor.cancel();
             self.state.desktop.lookup.cancel();
             self.state.folder_opener.cancel();
@@ -494,8 +497,34 @@ impl eframe::App for KcsdiApp {
             && !self.closing
         {
             self.state.workspace.frequencies_hz = list;
-            self.state.workspace.list_mode = true;
+            self.state.workspace.sweep_mode = crate::workspace::SweepMode::List;
             self.state.workspace.reset_frequency_view();
+        }
+        let receivers: Vec<_> = self
+            .state
+            .workspace
+            .traces
+            .iter()
+            .filter(|trace| trace.settings.visible)
+            .map(|trace| (trace.id, trace.settings.receiver()))
+            .collect();
+        let can_apply = !self.closing
+            && self.state.sweep == SweepState::Idle
+            && self.state.connection != ConnectionState::Disconnecting
+            && !self.state.calibration.busy()
+            && !self.state.source.busy()
+            && !self.state.workspace.frequency_editor.is_pending();
+        if let Some(segments) = self.state.workspace.segment_editor.show(
+            &ctx,
+            self.state.language,
+            allowed,
+            &receivers,
+            can_apply,
+        ) {
+            self.state.workspace.segments = segments;
+            self.state.workspace.sweep_mode = crate::workspace::SweepMode::Segments;
+            self.state.workspace.frequency_editor.cancel();
+            self.state.workspace.clear_previews();
         }
         if let Some(run) = self
             .state
@@ -593,6 +622,7 @@ impl KcsdiApp {
                     {
                         self.state.workspace.editor = None;
                         self.state.workspace.frequency_editor.cancel();
+                        self.state.workspace.segment_editor.cancel();
                         self.state.workspace.run_editor.cancel();
                         self.state.calibration.open();
                     }
@@ -973,7 +1003,8 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .show(ui, |ui| {
                     let editable = state.sweep != SweepState::Stopping
                         && state.connection != ConnectionState::Disconnecting;
-                    let list_mode = state.workspace.list_mode;
+                    let range_mode =
+                        state.workspace.sweep_mode == crate::workspace::SweepMode::Range;
                     let (start, stop) = state.workspace.frequency_bounds();
                     let sweep_center = (start + stop) / 2.0;
                     let mut marker_center = None;
@@ -1009,7 +1040,7 @@ pub(crate) fn parameter_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                     complete.as_deref(),
                                     trace.settings.display.is_smith(),
                                     sweep_center,
-                                    !list_mode,
+                                    range_mode,
                                 );
                             });
                             if trace.completed.is_some() && complete.is_none() {
@@ -1846,6 +1877,75 @@ mod tests {
     }
 
     #[test]
+    fn segmented_delivery_requires_full_provenance_and_preserves_manual_axes() {
+        let mut app = active_impedance_app();
+        let old = app
+            .state
+            .workspace
+            .selected()
+            .unwrap()
+            .completed
+            .clone()
+            .unwrap();
+        let complete = crate::segmented::tests::example_snapshot();
+        let crate::acquisition::AcquisitionSettings::Segments(plan) = &complete.settings else {
+            unreachable!()
+        };
+        app.state.workspace.sweep_mode = crate::workspace::SweepMode::Segments;
+        app.state.workspace.segments = plan.segments().iter().map(|row| row.definition()).collect();
+        app.state.workspace.selected_mut().unwrap().settings.cal =
+            kcsdi_core::commands::Cal::CalOff;
+        app.state.workspace.x_view.x_min = 10e6;
+        app.state.workspace.x_view.x_max = 70e6;
+        app.state.workspace.selected_mut().unwrap().view_locked = true;
+        let y = app.state.workspace.selected().unwrap().view;
+        app.state.reconcile_plan();
+        let members = vec![app.state.workspace.selected.unwrap()];
+        let mut invalid = complete.clone();
+        invalid.segments = None;
+        app.apply_delivery(
+            SweepDelivery {
+                members: members.clone(),
+                snapshot: Arc::new(invalid),
+            },
+            2,
+        );
+        assert!(Arc::ptr_eq(
+            &old,
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+        ));
+        app.apply_delivery(
+            SweepDelivery {
+                members,
+                snapshot: Arc::new(complete),
+            },
+            2,
+        );
+        assert_eq!(
+            app.state
+                .workspace
+                .selected()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+                .data
+                .points
+                .len(),
+            1951
+        );
+        assert_eq!(app.state.workspace.x_view.x_min, 10e6);
+        assert_eq!(app.state.workspace.x_view.x_max, 70e6);
+        assert_eq!(app.state.workspace.selected().unwrap().view, y);
+    }
+
+    #[test]
     fn changing_same_count_list_rejects_old_completions_and_previews() {
         let mut app = active_impedance_app();
         let original = app
@@ -1856,7 +1956,7 @@ mod tests {
             .completed
             .clone()
             .unwrap();
-        app.state.workspace.list_mode = true;
+        app.state.workspace.sweep_mode = crate::workspace::SweepMode::List;
         app.state.workspace.frequencies_hz = vec![1_000_000, 1_500_000, 2_000_000];
         app.state.reconcile_plan();
         let stale = completion(&app, 0, 1);

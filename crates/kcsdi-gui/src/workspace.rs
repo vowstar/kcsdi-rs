@@ -9,7 +9,9 @@ use egui::Color32;
 use kcsdi_core::commands::{Cal, Lo};
 use kcsdi_core::device::{PointSettings, S11Params, S21Params, SpecParams};
 use kcsdi_core::model::{FreqRange, Rbw};
+use kcsdi_core::segments::{Segment, SegmentPlan};
 use kcsdi_core::validation::frequency_hz;
+use serde::{Deserialize, Serialize};
 
 use crate::acquisition::{AcquisitionSettings, CompletedSweep, SweepPlan, TraceId};
 use crate::analysis_tools::AnalysisTools;
@@ -20,6 +22,15 @@ use crate::widgets::plot::{PlotView, YScale};
 use crate::widgets::smith::SmithView;
 
 pub use crate::acquisition::MAX_TRACES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepMode {
+    #[default]
+    Range,
+    List,
+    Segments,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TraceDisplay {
@@ -138,35 +149,45 @@ impl TraceSettings {
         &self,
         range: &SweepRange,
         list: Option<&[u64]>,
+        segments: Option<&[Segment]>,
     ) -> kcsdi_core::Result<AcquisitionSettings> {
+        if let Some(segments) = segments {
+            let plan = SegmentPlan::new(segments, &self.receiver(), &DEVICE_MODEL.capabilities())?;
+            let settings = AcquisitionSettings::from(plan);
+            settings.validate()?;
+            return Ok(settings);
+        }
         if let Some(frequencies_hz) = list {
-            let settings = match self.display {
-                TraceDisplay::Spec => PointSettings::Spec {
-                    cal: self.cal,
-                    lo: self.lo,
-                    rbw: self.rbw,
-                    ref_level_dbm: self.ref_level_dbm,
-                },
-                TraceDisplay::S11(display) => PointSettings::S11 {
-                    cal: self.cal,
-                    format: display.wire_format(),
-                    rbw: Some(self.rbw),
-                },
-                TraceDisplay::S21(display) => PointSettings::S21 {
-                    cal: self.cal,
-                    format: display.wire_format(),
-                    lo: self.lo,
-                    rbw: Some(self.rbw),
-                },
-            };
             let settings = AcquisitionSettings::List {
-                settings,
+                settings: self.receiver(),
                 frequencies_hz: frequencies_hz.to_vec(),
             };
             settings.validate()?;
             return Ok(settings);
         }
         self.acquisition(range)
+    }
+
+    pub fn receiver(&self) -> PointSettings {
+        match self.display {
+            TraceDisplay::Spec => PointSettings::Spec {
+                cal: self.cal,
+                lo: self.lo,
+                rbw: self.rbw,
+                ref_level_dbm: self.ref_level_dbm,
+            },
+            TraceDisplay::S11(display) => PointSettings::S11 {
+                cal: self.cal,
+                format: display.wire_format(),
+                rbw: Some(self.rbw),
+            },
+            TraceDisplay::S21(display) => PointSettings::S21 {
+                cal: self.cal,
+                format: display.wire_format(),
+                lo: self.lo,
+                rbw: Some(self.rbw),
+            },
+        }
     }
 
     pub fn acquisition(&self, range: &SweepRange) -> kcsdi_core::Result<AcquisitionSettings> {
@@ -328,7 +349,9 @@ pub struct TraceEditor {
 
 pub struct Workspace {
     pub range: SweepRange,
-    pub list_mode: bool,
+    pub sweep_mode: SweepMode,
+    pub segments: Vec<Segment>,
+    pub segment_editor: crate::segment_editor::SegmentEditor,
     pub frequencies_hz: Vec<u64>,
     pub frequency_editor: crate::frequency_editor::FrequencyEditor,
     pub run: crate::run_settings::RunSettings,
@@ -378,7 +401,9 @@ impl Workspace {
     pub fn empty(range: SweepRange) -> Self {
         Self {
             range,
-            list_mode: false,
+            sweep_mode: SweepMode::Range,
+            segments: Vec::new(),
+            segment_editor: Default::default(),
             frequencies_hz: Vec::new(),
             frequency_editor: Default::default(),
             run: Default::default(),
@@ -442,7 +467,11 @@ impl Workspace {
             .map(|trace| {
                 trace
                     .settings
-                    .acquisition_for(&self.range, self.requested_list())
+                    .acquisition_for(
+                        &self.range,
+                        self.requested_list(),
+                        self.requested_segments(),
+                    )
                     .map(|settings| (trace.id, settings))
             })
             .collect();
@@ -453,11 +482,21 @@ impl Workspace {
     }
 
     pub fn requested_list(&self) -> Option<&[u64]> {
-        self.list_mode.then_some(&self.frequencies_hz)
+        (self.sweep_mode == SweepMode::List).then_some(&self.frequencies_hz)
+    }
+
+    pub fn requested_segments(&self) -> Option<&[Segment]> {
+        (self.sweep_mode == SweepMode::Segments).then_some(&self.segments)
     }
 
     pub fn frequency_bounds(&self) -> (f64, f64) {
-        if self.list_mode
+        if self.sweep_mode == SweepMode::Segments {
+            return match (self.segments.first(), self.segments.last()) {
+                (Some(first), Some(last)) => (first.start_hz as f64, last.stop_hz as f64),
+                _ => (0.0, 1.0),
+            };
+        }
+        if self.sweep_mode == SweepMode::List
             && let (Some(&first), Some(&last)) =
                 (self.frequencies_hz.first(), self.frequencies_hz.last())
         {
@@ -497,7 +536,7 @@ impl Workspace {
     /// Explicit C=M acquisition edit. Keep the span unless a mode boundary
     /// requires a smaller symmetric sweep around the marker (section 8.3).
     pub fn center_on_marker(&mut self, frequency: f64) -> kcsdi_core::Result<()> {
-        if self.list_mode {
+        if self.sweep_mode != SweepMode::Range {
             return Err(kcsdi_core::Error::InvalidParameter(
                 "marker centering requires a frequency range".into(),
             ));
@@ -540,6 +579,34 @@ impl Workspace {
     }
 
     /// Keep log conversion independent of whichever partial group is visible.
+    pub fn positive_grid_start(&self) -> Option<f64> {
+        let first = match self.sweep_mode {
+            SweepMode::List => self
+                .frequencies_hz
+                .iter()
+                .find(|&&hz| hz > 0)
+                .map(|&hz| hz as f64)?,
+            SweepMode::Segments => {
+                let segment = self.segments.first()?;
+                if segment.start_hz > 0 {
+                    segment.start_hz as f64
+                } else {
+                    let points = segment.points(&DEVICE_MODEL.capabilities()).ok()?;
+                    (segment.stop_hz - segment.start_hz) as f64 / f64::from(points - 1)
+                }
+            }
+            SweepMode::Range => {
+                if self.range.start_hz > 0.0 {
+                    self.range.start_hz
+                } else {
+                    (self.range.stop_hz - self.range.start_hz)
+                        / f64::from(self.range.points.saturating_sub(1).max(1))
+                }
+            }
+        };
+        (first.is_finite() && first > 0.0).then_some(first)
+    }
+
     pub fn ensure_log_x_view(&mut self) {
         if !self.log_x
             || (self.x_view.x_min.is_finite()
@@ -549,7 +616,7 @@ impl Workspace {
         {
             return;
         }
-        let (start, planned_stop) = self.frequency_bounds();
+        let (_, planned_stop) = self.frequency_bounds();
         let stop = if self.x_view.x_max.is_finite() && self.x_view.x_max > 0.0 {
             self.x_view.x_max
         } else if planned_stop.is_finite() && planned_stop > 0.0 {
@@ -566,20 +633,9 @@ impl Workspace {
             .map(|point| point.freq_hz)
             .filter(|frequency| frequency.is_finite() && *frequency > 0.0 && *frequency < stop)
             .min_by(f64::total_cmp);
-        let step = (planned_stop - start) / f64::from(self.range.points.saturating_sub(1).max(1));
-        let grid_start = if self.list_mode {
-            self.frequencies_hz
-                .iter()
-                .map(|&hz| hz as f64)
-                .find(|&hz| hz > 0.0 && hz < stop)
-                .unwrap_or(stop / 10.0)
-        } else if start > 0.0 {
-            start
-        } else {
-            step
-        };
+        let grid_start = self.positive_grid_start().unwrap_or(stop / 10.0);
         self.x_view.x_min = measured_start
-            .filter(|_| !self.list_mode)
+            .filter(|_| self.sweep_mode == SweepMode::Range)
             .unwrap_or_else(|| {
                 if grid_start.is_finite() && grid_start > 0.0 && grid_start < stop {
                     grid_start
@@ -594,6 +650,43 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segmented_grid_controls_fit_and_groups_without_using_inactive_range() {
+        let mut workspace = Workspace {
+            sweep_mode: SweepMode::Segments,
+            segments: vec![
+                Segment {
+                    start_hz: 0,
+                    stop_hz: 1000,
+                    max_step_hz: 500,
+                },
+                Segment {
+                    start_hz: 1000,
+                    stop_hz: 5000,
+                    max_step_hz: 1000,
+                },
+            ],
+            log_x: true,
+            ..Default::default()
+        };
+        workspace.reset_frequency_view();
+        assert_eq!(workspace.x_view.x_min, 500.0);
+        assert_eq!(workspace.x_view.x_max, 5000.0);
+        assert!(workspace.requested_list().is_none());
+        assert_eq!(workspace.frequency_bounds(), (0.0, 5000.0));
+        assert!(workspace.center_on_marker(2000.0).is_err());
+        let settings = workspace.traces[0].settings.clone();
+        workspace.add_trace(settings).unwrap();
+        let plan = workspace.plan().unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].members.len(), 2);
+        assert_eq!(plan.groups[0].settings.points(), 8);
+        workspace.range.start_hz = f64::NAN;
+        assert_eq!(workspace.plan().unwrap(), plan);
+        workspace.traces[1].settings.ref_level_dbm = -20;
+        assert_eq!(workspace.plan().unwrap().groups.len(), 2);
+    }
 
     #[test]
     fn marker_center_keeps_span_and_y_scale_and_shrinks_only_at_limits() {

@@ -44,10 +44,13 @@ fn user_definition_freezes_matching_selected_trace_and_rejects_lists() {
         (1_000_000, 2_000_001)
     );
     assert_eq!(frozen.params.user().unwrap().rbw, Rbw::R3k);
-    state.workspace.list_mode = true;
+    state.workspace.sweep_mode = crate::workspace::SweepMode::List;
     assert!(freeze(&state, CalibrationKind::S11User).is_err());
     assert!(freeze(&state, CalibrationKind::S11System).is_ok());
-    state.workspace.list_mode = false;
+    state.workspace.sweep_mode = crate::workspace::SweepMode::Segments;
+    assert!(freeze(&state, CalibrationKind::S11User).is_err());
+    assert!(freeze(&state, CalibrationKind::S11System).is_ok());
+    state.workspace.sweep_mode = crate::workspace::SweepMode::Range;
     let trace = state.workspace.selected_mut().unwrap();
     trace.settings.display = TraceDisplay::S21(S21Display::Delay);
     trace.settings.lo = Lo::LowLo;

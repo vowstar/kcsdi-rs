@@ -7,7 +7,7 @@ use super::sweep_controls::{self, BUTTON_HEIGHT, SweepEdit, SweepFields, group_h
 use crate::i18n::{Language, Text};
 use crate::state::{AppState, ConnectionState, S11Display, S21Display, SweepState, WorkerCommand};
 use crate::widgets::plot::{self, YScale};
-use crate::workspace::{TraceDisplay, TraceSettings, TraceState};
+use crate::workspace::{SweepMode, TraceDisplay, TraceSettings, TraceState};
 
 pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
     group_heading(ui, state.language.text(Text::FrequencyRangeTab));
@@ -15,22 +15,46 @@ pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
         state.sweep != SweepState::Stopping && state.connection != ConnectionState::Disconnecting,
         |ui| {
             ui.horizontal(|ui| {
-                let previous = state.workspace.list_mode;
-                ui.selectable_value(
-                    &mut state.workspace.list_mode,
-                    false,
-                    state.language.text(Text::FrequencyRange),
-                );
-                ui.selectable_value(
-                    &mut state.workspace.list_mode,
-                    true,
-                    state.language.text(Text::FrequencyListTab),
-                );
-                if previous != state.workspace.list_mode {
+                let previous = state.workspace.sweep_mode;
+                for (mode, label) in [
+                    (SweepMode::Range, Text::FrequencyRange),
+                    (SweepMode::List, Text::FrequencyListTab),
+                    (SweepMode::Segments, Text::SegmentsTab),
+                ] {
+                    let enabled = (mode != SweepMode::Segments && previous != SweepMode::Segments)
+                        || (state.sweep == SweepState::Idle
+                            && !state.calibration.busy()
+                            && !state.source.busy()
+                            && !state.workspace.frequency_editor.is_pending());
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::selectable(previous == mode, state.language.text(label)),
+                        )
+                        .clicked()
+                    {
+                        if mode == SweepMode::Segments && state.workspace.segments.is_empty() {
+                            state
+                                .workspace
+                                .segment_editor
+                                .open(&[], &state.workspace.range);
+                        } else {
+                            state.workspace.sweep_mode = mode;
+                        }
+                    }
+                }
+                if previous != state.workspace.sweep_mode
+                    && previous != SweepMode::Segments
+                    && state.workspace.sweep_mode != SweepMode::Segments
+                {
                     state.workspace.reset_frequency_view();
                 }
             });
-            if state.workspace.list_mode {
+            if state.workspace.sweep_mode == SweepMode::Segments {
+                segment_summary(ui, state);
+                return;
+            }
+            if state.workspace.sweep_mode == SweepMode::List {
                 let list = &state.workspace.frequencies_hz;
                 ui.label(format!(
                     "{}: {}",
@@ -75,10 +99,96 @@ pub fn show_sweep(ui: &mut egui::Ui, state: &mut AppState) {
         },
     );
     if state.any_running()
-        && !state.workspace.list_mode
+        && state.workspace.sweep_mode == SweepMode::Range
         && sweep_controls::invalid_step(ui.ctx(), "workspace")
     {
         state.send(WorkerCommand::StopSweep);
+    }
+}
+
+fn segment_summary(ui: &mut egui::Ui, state: &mut AppState) {
+    let language = state.language;
+    let receivers: Vec<_> = state
+        .workspace
+        .traces
+        .iter()
+        .filter(|trace| trace.settings.visible)
+        .map(|trace| (trace.id, trace.settings.receiver()))
+        .collect();
+    ui.label(format!(
+        "{}: {}",
+        language.text(Text::SegmentCount),
+        state.workspace.segments.len()
+    ));
+    if let (Some(first), Some(last)) = (
+        state.workspace.segments.first(),
+        state.workspace.segments.last(),
+    ) {
+        ui.small(format!(
+            "{} {} {}",
+            plot::format_axis_value(first.start_hz as f64, "Hz"),
+            language.text(Text::RangeTo),
+            plot::format_axis_value(last.stop_hz as f64, "Hz")
+        ));
+    }
+    match crate::segment_editor::validate(
+        &state.workspace.segments,
+        &receivers,
+        state.workspace.visible_range(),
+        language,
+    ) {
+        Ok(points) => {
+            ui.label(format!(
+                "{}: {points}",
+                language.text(Text::SegmentAcquiredPoints)
+            ));
+        }
+        Err(error) => {
+            ui.colored_label(ui.visuals().error_fg_color, error.text);
+        }
+    }
+    if ui.button(language.text(Text::EditSegments)).clicked() {
+        state
+            .workspace
+            .segment_editor
+            .open(&state.workspace.segments, &state.workspace.range);
+    }
+    if let Some((trace, preview)) = state
+        .workspace
+        .traces
+        .iter()
+        .filter(|trace| trace.settings.visible)
+        .filter_map(|trace| trace.preview.as_ref().map(|preview| (trace, preview)))
+        .filter(|(_, preview)| preview.segment.is_some())
+        .max_by_key(|(_, preview)| preview.cycle_id)
+        && let Some(progress) = preview.segment
+    {
+        ui.small(format!(
+            "T{}  {} {}/{}  {}/{}",
+            trace.id.0,
+            language.text(Text::Segment),
+            progress.index + 1,
+            progress.count,
+            progress.acquired,
+            progress.expected
+        ));
+    }
+    if let Some(snapshot) = state
+        .workspace
+        .selected()
+        .and_then(|trace| trace.completed.as_ref())
+        && snapshot.segments.is_some()
+    {
+        ui.small(format!(
+            "{}: {}",
+            language.text(Text::SegmentCompletedPoints),
+            snapshot.data.points.len()
+        ));
+    }
+    if state.workspace.traces.iter().any(|trace| {
+        trace.settings.visible && trace.settings.cal == kcsdi_core::commands::Cal::CalUser
+    }) {
+        ui.small(language.text(Text::SegmentCalWarning));
     }
 }
 
@@ -112,7 +222,7 @@ pub fn run_button(ui: &mut egui::Ui, state: &mut AppState) {
                                 state.send(WorkerCommand::StopSweep);
                             }
                         } else {
-                            let plan = if !state.workspace.list_mode
+                            let plan = if state.workspace.sweep_mode == SweepMode::Range
                                 && sweep_controls::invalid_step(ui.ctx(), "workspace")
                             {
                                 Err(kcsdi_core::Error::InvalidParameter(

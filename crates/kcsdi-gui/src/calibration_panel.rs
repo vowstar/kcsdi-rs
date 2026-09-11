@@ -210,7 +210,7 @@ fn freeze(state: &AppState, kind: CalibrationKind) -> Result<FrozenCalibration, 
         if state.function.kind().is_some() {
             return Err(error(Text::CalibrationMeasurementsOnly));
         }
-        if state.workspace.list_mode {
+        if state.workspace.sweep_mode != crate::workspace::SweepMode::Range {
             return Err(error(Text::CalibrationContinuousOnly));
         }
         let trace = state
@@ -304,7 +304,9 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     calibration.selected = Some(kind);
                 }
             }
-            if state.workspace.list_mode && state.function.kind().is_none() {
+            if state.workspace.sweep_mode != crate::workspace::SweepMode::Range
+                && state.function.kind().is_none()
+            {
                 ui.small(language.text(Text::CalibrationContinuousOnly));
             }
             ui.separator();

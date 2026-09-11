@@ -25,6 +25,7 @@ mod panels;
 mod preview;
 mod recording;
 mod run_settings;
+mod segment_editor;
 mod segmented;
 mod source_panel;
 mod spreadsheet;
